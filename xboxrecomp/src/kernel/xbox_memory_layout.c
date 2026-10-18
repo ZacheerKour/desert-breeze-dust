@@ -1340,6 +1340,7 @@ static int peek_readable(uint32_t va)
 static uint32_t g_watch_va;
 static void    *g_watch_page;
 static uint32_t g_watch_last;
+static uint32_t g_watch_min;
 static void    *g_watch_veh;
 static RECOMP_TLS int s_watch_stepping;
 
@@ -1358,9 +1359,11 @@ static void watch_report(void)
 
     if (now == g_watch_last)
         return;
+    if (g_watch_min && now < g_watch_min) { g_watch_last = now; return; }   /* pd-nre: report only values >= min */
     fprintf(stderr, "[WATCH] [%08X] %08X -> %08X  (esp=%08X)\n",
             g_watch_va, g_watch_last, now, esp);
     g_watch_last = now;
+    fprintf(stderr, "         regs eax=%08X ecx=%08X edx=%08X ebx=%08X esi=%08X edi=%08X ebp=%08X\n", g_eax, g_ecx, g_edx, g_ebx, g_esi, g_edi, g_ebp);
 
     /* Return addresses the recompiled code pushed, innermost first. Values
      * that merely look like code get printed too -- the chain is a lead, not
@@ -1536,6 +1539,20 @@ static int watch_arm(uint32_t va)
                     "(current %08X)\n", g_watch_va, g_watch_last);
     fflush(stderr);
     return 1;
+}
+
+/* pd-nre: re-arm the write watcher on another guest dword at run time (project debug console "dw <hex>"). */
+int xbox_WatchArmRuntime(uint32_t va, uint32_t minv)
+{
+    g_watch_min = minv;
+    DWORD old;
+    if (g_watch_page) {
+        VirtualProtect(g_watch_page, 4096, PAGE_READWRITE, &old);
+        g_watch_page = NULL;
+    }
+    if (va == 0)
+        return 1;                              /* disarm only */
+    return watch_arm(va);
 }
 
 /* Print the RECOMP_PEEK globals. Shared, because the two moments worth

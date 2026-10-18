@@ -681,6 +681,7 @@ static int ohci_walk_eds(OhciController *hc, uint32_t ed, uint32_t *done_head)
         uint32_t ed0  = rd32(ed);
         uint32_t tail = rd32(ed + 4) & ED_PTR_MASK;
         uint32_t head = rd32(ed + 8);
+        uint32_t head0 = head;
         int tguard = 0;
 
         if (s_trace) {
@@ -699,7 +700,24 @@ static int ohci_walk_eds(OhciController *hc, uint32_t ed, uint32_t *done_head)
             && guest_ok(head & ED_PTR_MASK, 16) && ++tguard < 64) {
             uint32_t td = head & ED_PTR_MASK;
             uint32_t next = rd32(td + 8) & ED_PTR_MASK;
-            uint32_t cc = ohci_do_td(hc, ed0, td);
+            uint32_t cc;
+
+            /* pd-nre/pd-dz0: the XPP driver marks a TD that is not chained with NextTD = 0xFFFFFFFF. A queued
+             * TD before the tail should never carry it; it does when the walk sees a TD the driver has not
+             * finished building (or has already recycled). Taking that as the next head wrote HeadP =
+             * 0xFFFFFFF0 into the ED: the pad's polling stopped for good (input dead after a few minutes) and
+             * the driver later followed the pointer (write to guest 0xFFFFFFFF in sub_0025C825). Leave the
+             * TD for the next pass instead. */
+            if (next == ED_PTR_MASK) {
+                static unsigned bad;
+                if (bad++ < 12) {
+                    fprintf(stderr, "  [OHCI%d] ED %08X: TD %08X (head %08X tail %08X) has NextTD 0xFFFFFFFF; "
+                                    "left for the next pass (#%u)\n", hc->index, ed, td, head, tail, bad);
+                    fflush(stderr);
+                }
+                break;
+            }
+            cc = ohci_do_td(hc, ed0, td);
 
             /* Report the outcome where the driver reads it, then put the
              * descriptor on the done queue, newest first. */
@@ -714,7 +732,21 @@ static int ohci_walk_eds(OhciController *hc, uint32_t ed, uint32_t *done_head)
                 break;
             }
         }
-        wr32(ed + 8, head);
+        /* Write HeadP back only if this pass moved it, and only if the driver has not changed it since it was read
+         * (compare-and-swap on the guest dword): an unconditional store put a stale head over the driver's. */
+        if (head != head0) {
+            uint32_t *hp = (uint32_t *)guest_ptr(ed + 8, 4);
+            if (hp) {
+                if ((uint32_t)InterlockedCompareExchange((volatile LONG *)hp, (LONG)head, (LONG)head0) != head0) {
+                    static unsigned lost;
+                    if (lost++ < 12) {
+                        fprintf(stderr, "  [OHCI%d] ED %08X: HeadP changed under the walk (was %08X, now %08X); "
+                                        "not overwritten (#%u)\n", hc->index, ed, head0, *hp, lost);
+                        fflush(stderr);
+                    }
+                }
+            }
+        }
         ed = rd32(ed + 12) & ED_PTR_MASK;
     }
 

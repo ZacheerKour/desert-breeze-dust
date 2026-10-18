@@ -230,6 +230,53 @@ void sub_0024D446(void)
     esp += 4;                              /* ret */
 }
 
+
+/* -- pd-1ml: bounded wait for a stolen sound stream to stop -------------------------------------
+ * sub_001BB745 is IDirectSoundStream::GetStatus (a this-adjusting thunk into sub_001BAB52). The game's sound-slot
+ * allocator sub_00167BC0 steals a busy slot, calls FlushEx and then spins `while (GetStatus(stream, &st), st & 3)`.
+ * In the quest001 tutorial that stream's state word ([[this-0x1C+0x20]+0x12]) stayed 0xFFFF, status never became 0
+ * and the game froze (~25 M RtlEnter/LeaveCriticalSection calls per second, nothing else running). Poking the word
+ * to 0 ended the freeze at once. Why the word was not updated is not established (bead pd-1ml); this override keeps
+ * the original behaviour (same call, same stack handling) and only intervenes when one thread has polled the same
+ * stream, with every call within 2 ms of the previous one, more than 300000 times and it still reports busy: that
+ * is ~1 s of pure spinning, far beyond any real stream drain; normal per-frame polling is spaced ~3 ms apart.
+ * Then it clears the stream's state word and returns "stopped" (status 0), exactly what the experiment did. */
+#include <windows.h>
+void sub_001BB745(void)
+{
+    uint32_t self = MEM32(esp + 4), st = MEM32(esp + 8);
+    uint32_t arg1 = self ? self - 0x1C : 0;
+    static uint32_t s_obj, s_n; static DWORD s_tid; static LONGLONG s_last, s_freq; static uint32_t s_forced;
+    LARGE_INTEGER now;
+
+    PUSH32(esp, st);
+    PUSH32(esp, arg1);
+    PUSH32(esp, 0x001BB75Eu);                 /* the thunk's own return address inside this function */
+    sub_001BAB52();
+    esp += 12;                                /* original epilogue: ret 8 */
+
+    if (!s_freq) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); s_freq = f.QuadPart; }
+    QueryPerformanceCounter(&now);
+    if (eax == 0 && (MEM8(st) & 3)) {
+        if (s_obj == self && s_tid == GetCurrentThreadId() && (now.QuadPart - s_last) * 1000 < 2 * s_freq) {
+            if (++s_n > 300000u) {
+                uint32_t impl = MEM32(arg1 + 0x20);
+                if (s_forced++ < 20)
+                    fprintf(stderr, "[AUDIO] pd-1ml: stream %08X still busy after %u back-to-back GetStatus polls (state word %04X): forcing stopped\n",
+                            self, s_n, (unsigned)MEM16(impl + 0x12));
+                MEM16(impl + 0x12) = 0;
+                MEM32(st) = 0;
+                s_n = 0; s_obj = 0;
+            }
+        } else {
+            s_obj = self; s_tid = GetCurrentThreadId(); s_n = 1;
+        }
+        s_last = now.QuadPart;
+    } else {
+        s_obj = 0; s_n = 0;
+    }
+}
+
 /* Debug: start story stage <stage> from the game thread, the way the scenario menu does
  * (sub_000B8570 -> sub_000DEA90 with EAX = stage). Called from the function-entry hook at the
  * per-frame state machine (sub_000DEB50), so the guest is between instructions of a known
@@ -278,9 +325,13 @@ extern void sub_000EB850(void);
 extern void sub_000EB930(void);
 extern void sub_000EB890(void);
 volatile int g_pd_quest_phase = 0;
+static int pd_quest_calls, pd_quest_seen5, pd_quest_lastst = -1;   /* file scope so a second quest can reset them */
 void pd_quest_step(int req)
 {
     uint32_t se = g_esp, sa = g_eax, sc = g_ecx, sd = g_edx, sb = g_ebx, ss = g_esi, sdi = g_edi, sbp = g_ebp;
+    if (req >= 0 && g_pd_quest_phase == 2) {   /* pd-nre: a new quest request after one has run (win -> hub -> next quest) */
+        g_pd_quest_phase = 0; pd_quest_calls = 0; pd_quest_seen5 = 0; pd_quest_lastst = -1;
+    }
     if (req >= 0 && g_pd_quest_phase == 0) {
         uint32_t src = MEM32(0x0039E754) + (uint32_t)req * 0x520u, i, p;
         fprintf(stderr, "[QUEST] id %d record@%08X stage_field=%d\n", req, src, (int)(int16_t)(MEM32(src + 0x504) & 0xFFFF));
@@ -292,19 +343,17 @@ void pd_quest_step(int req)
         g_pd_quest_phase = 1;
     }
     if (g_pd_quest_phase == 1) {
-        static int calls;
         uint32_t obj = MEM32(0x0037BE54);
         unsigned st = MEM32(obj + 0x28) & 0xFF;
-        if (calls == 0) {            /* end the hub stage once (state -> 5, counts to 0 by itself) */
+        if (pd_quest_calls == 0) {            /* end the hub stage once (state -> 5, counts to 0 by itself) */
             PUSH32(g_esp, 0); PUSH32(g_esp, 0);
             sub_000EB850();
-            calls = 1;
+            pd_quest_calls = 1;
             fprintf(stderr, "[QUEST] end-stage native called, state=%u%c", (unsigned)(MEM32(obj + 0x28) & 0xFF), 10);
         } else {
-            static int seen5, lastst = -1;
-            if ((int)st != lastst) { fprintf(stderr, "[QUEST] mode state -> %u%c", st, 10); lastst = (int)st; }
-            if (st == 5) seen5 = 1;
-            if (seen5 && st == 0) {
+            if ((int)st != pd_quest_lastst) { fprintf(stderr, "[QUEST] mode state -> %u%c", st, 10); pd_quest_lastst = (int)st; }
+            if (st == 5) pd_quest_seen5 = 1;
+            if (pd_quest_seen5 && st == 0) {
                 fprintf(stderr, "[QUEST] stage torn down; starting quest%c", 10);
                 g_esp = se; PUSH32(g_esp, 0); PUSH32(g_esp, 0);
                 sub_000EB930();

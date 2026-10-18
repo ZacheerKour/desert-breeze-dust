@@ -75,3 +75,6 @@ __pycache__/
 /run_out.txt
 /run_err.txt
 !/pd-game-v2/CMakeLists.txt
+*.snap
+/audio_cast.txt
+/bak-profile-*/

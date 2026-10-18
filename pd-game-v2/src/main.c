@@ -99,6 +99,7 @@ static BOOL load_xbe(const char *path, void **out_data, size_t *out_size);
 volatile int g_fn_watch_on;
 volatile int g_fn_watch_arm;
 volatile int g_pd_stage_req = -1;
+volatile DWORD g_fncount_ms = 1000;
 volatile int g_pd_quest_req = -1;
 extern volatile int g_pd_quest_phase;
 static struct { uint32_t va; unsigned n; } s_fnw[4096];
@@ -113,6 +114,27 @@ void recomp_fn_watch_hit(uint32_t va)
 {
     int i;
     static DWORD last;
+    if (g_fn_watch_on == 6) {
+        /* Mode 6 (console "fncount <ms>"): count calls of every guest function for a window, then print the busiest
+         * 70 and return to mode 5. Shows what a stuck scene is polling. */
+        static uint32_t cnt[0x262000 >> 2]; static DWORD t0, win;
+        extern volatile DWORD g_fncount_ms;
+        if (va >= 0x11000u && va < 0x262000u) cnt[va >> 2]++;
+        if (!t0) { t0 = GetTickCount(); win = g_fncount_ms; }
+        if (GetTickCount() - t0 > win) {
+            int k, i; static uint32_t top_v[4000], top_c[4000];
+            memset(top_c, 0, sizeof top_c);
+            for (i = 0; i < (int)(0x262000 >> 2); i++) if (cnt[i] > top_c[3999]) {
+                k = 3999; while (k > 0 && cnt[i] > top_c[k - 1]) { top_c[k] = top_c[k - 1]; top_v[k] = top_v[k - 1]; k--; }
+                top_c[k] = cnt[i]; top_v[k] = (uint32_t)i << 2;
+            }
+            fprintf(stderr, "[FNCOUNT] %lu ms, busiest:", (unsigned long)win);
+            for (k = 0; k < 4000 && top_c[k]; k++) fprintf(stderr, " %06X=%u", (unsigned)top_v[k], (unsigned)top_c[k]);
+            fprintf(stderr, "%c", 10);
+            memset(cnt, 0, sizeof cnt); t0 = 0; g_fn_watch_on = 5;
+        }
+        return;
+    }
     if (g_fn_watch_on == 5) {
         /* Mode 5: stage injection. "stage <n>" in the RECOMP_MEM_LIVE file queues a request that is
          * carried out at the next entry of the per-frame state machine sub_000DEB50. */
@@ -292,6 +314,15 @@ static DWORD WINAPI pd_mem_live(LPVOID unused)
                     fprintf(stderr, "[SCAN] %X: %u candidates:", a, ncand);
                     for (i = 0; i < ncand && i < 80; i++) fprintf(stderr, " %X", cand[i]);
                     fprintf(stderr, "%c", 10);
+                } else if (sscanf(line, "dw %x %x", &a, &v) >= 1) {
+                    /* pd-nre: page-protect write watch on the guest dword at <hex> (0 = off): prints old/new value,
+                     * registers and the guest return chain of the writer (RECOMP_WATCH machinery, armed at run time) */
+                    extern int xbox_WatchArmRuntime(uint32_t va, uint32_t minv);
+                    fprintf(stderr, "[MEM] dw %08X -> %s%c", a, xbox_WatchArmRuntime(a, (sscanf(line, "dw %x %x", &a, &v) >= 2) ? v : 0) ? "armed" : "FAILED", 10);
+                } else if (sscanf(line, "fncount %d", &sz) == 1) {
+                    extern volatile DWORD g_fncount_ms;
+                    g_fncount_ms = (DWORD)sz; g_fn_watch_on = 6;
+                    fprintf(stderr, "[MEM] fncount %d ms started%c", sz, 10);
                 } else if (sscanf(line, "fnwatch %d", &sz) == 1) {
                     /* switch the per-call function hook off (0) after the quest has started, so profiling is not
                      * distorted by it (the RECOMP_ABI_CHECK call macro still tests the flag) */
