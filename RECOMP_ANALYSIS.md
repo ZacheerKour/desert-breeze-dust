@@ -420,3 +420,12 @@ Test: `git clone` to `%TEMP%\pd-install-test`, then the not-yet-committed files 
 **pd-1h2 README:** rewritten (backup `README.md.bak-20261018c`). Content is from the docs and sources, not from a fresh run; keys/switches should be re-checked on resume.
 
 Open: installer idempotency and end-to-end link unproven; PM must commit the new untracked files; the Ghidra extents and seeds are now required inputs (document if they change); NAS-free but ~20 GB disk needed.
+
+## 2026-10-18 - installer test 2
+Test clone `%TEMP%\pd-install-test` pulled to `b2098ff` (stale run-1 edits to README.md, build_env.bat, pd_extend_ends.py and untracked installer copies backed up to `%TEMP%\pd-install-test-backup-run1\`, not deleted).
+
+- Step 1 (install from the 7z, `-Jobs 4`): PASSED. Log `%TEMP%\pd-install-test-run2.log`, exit 0, "Install complete". Extraction skipped (SHA ok). Step 6 did not skip: `pd_pipeline.py` in the run-1 copy differed from the committed one, so the `.pd_stamp` check forced a full regeneration. The regenerated `gen/` matches `pd-game-v2/src/recomp/gen` in the main repo byte-for-byte (only `.pd_stamp` and the main repo's `.bak-20261016` files differ).
+- Step 2: PASSED. `pd-game-v2\build\pd_recomp.exe`, 43.5 MB, written 00:43 on 2026-10-18 (cmake build 73/74 link step).
+- Step 3 (smoke): PASSED. Title screen ("Press START") captured about 90 s after launch: `%TEMP%\pd-install-test-smoke-title-20261018.png`. Stderr `%TEMP%\pd-install-test-smoke-stderr2.txt` (29k lines of GPU "unhandled methods" notices, no fatal/crash lines). Stopped by PID 47656 only.
+- Step 4 (idempotency re-run): PASSED. Exit 0 in 4 s, extraction and generation skipped, `ninja: no work to do`. Log `%TEMP%\pd-install-test-run3-idempotent.log`.
+- README: controls and env switches checked against `run_game.bat`, `xinput_device.c`, `fb_present.c`; Backspace/Shift rows added and the boot-time claim qualified (see main README.md, backup `README.md.bak-20261018d`).

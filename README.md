@@ -53,7 +53,7 @@ generation.
 pd-game-v2\run_game.bat
 ```
 
-Boot to the title takes about 20 seconds. The game reads its data from `extracted\`, so do not move it.
+On the developer PC, boot to the title takes about 20 seconds once the caches are warm; the first run after install is slower (in the clean-install test the title screen was showing when checked about 90 seconds after launch). The game reads its data from `extracted\`, so do not move it.
 
 ### Controls
 
@@ -63,6 +63,8 @@ Boot to the title takes about 20 seconds. The game reads its data from `extracte
 | Z | A (confirm) |
 | X | B (cancel) |
 | Arrow keys | D-pad |
+| Backspace | Back |
+| Shift | Left stick press |
 
 Xbox-style USB/XInput pads are also supported. Alt+Enter or F11 toggles borderless fullscreen; Alt+F4 or closing the
 window quits.
