@@ -1,0 +1,77 @@
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+
+# ---- Game data: never commit (user supplies their own disc) ----
+/extracted/
+/_downloads/
+*.xbe
+*.iso
+*.xiso
+*.7z
+*.zip
+/bak-profile-*/
+UDATA/
+TDATA/
+
+# ---- Generated from the game binary (regenerated locally by the installer) ----
+/pd-game-v2/src/recomp/gen/
+/recomp-analysis/
+/ghidra-projects/
+/ghidra-projects.*/
+/out/
+/xboxrecomp/tools/*/output/
+/recomp_0*.c*
+
+# ---- Build output ----
+/pd-game-v2/build/
+build/
+*.exe
+*.pdb
+*.obj
+*.lib
+*.ilk
+compile_commands.json
+
+# ---- Third-party binaries / clones (fetched by the installer) ----
+/tools/ghidra/
+/tools/jdk/
+/tools/xemu/
+/tools/xdvdfs/
+/_external/
+/.venv-recomp/
+__pycache__/
+*.pyc
+
+# ---- Nested upstream git metadata of the vendored toolkit ----
+/xboxrecomp/.git.upstream/
+
+# ---- Backups, logs, captures, debug dumps ----
+*.bak
+*.bak[0-9]*
+*.bak-*
+*.bak[0-9]-*
+*.orig
+*.clearfix-notworking
+/_port_bak-*/
+*.log
+*.err
+*.out
+*.png
+*.bmp
+*.wav
+*.mp4
+/pd-game-v2/dumps/
+/pd-game-v2/fbdump*/
+/pd-game-v2/trace_*.json
+/pd-game-v2/*.txt
+/pd-game-v2/presdbg.flag
+/pd-game-v2/fn_arm.flag
+/iterate_stdout*.txt
+/watch_*.txt
+/run_out.txt
+/run_err.txt
+!/pd-game-v2/CMakeLists.txt
