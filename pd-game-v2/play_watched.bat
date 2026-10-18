@@ -12,7 +12,7 @@ set RECOMP_APU_DSP_ACK=0x83050810
 set RECOMP_USB=1
 set RECOMP_USB_PADS=1
 set RECOMP_KEYBOARD=1
-rem MMO layout for keyboards without a numpad: WASD move, Q/E R/F camera, Space jump, Tab or right mouse = lock on,
+rem MMO layout for keyboards without a numpad: WASD move, Q/E R/F camera, Space jump (left stick click), Shift = left trigger, Tab or right mouse = lock on,
 rem 1-4 = A B X Y (skills; 1 or left mouse also confirms), Enter/Esc = Start, Backspace = back, arrows = menus.
 rem Remove this line for the original layout listed above.
 set RECOMP_KEYS=mmo

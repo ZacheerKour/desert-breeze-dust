@@ -72,6 +72,12 @@ extern int xbox_FramebufferKeyDown(int vk);
 
 static BOOL key_down(int vk)
 {
+    /* The window records Shift/Ctrl by side (fb_vk_sided), never the generic
+     * code, so a generic query has to ask for either side. */
+    if (vk == VK_SHIFT)
+        return (xbox_FramebufferKeyDown(VK_LSHIFT) || xbox_FramebufferKeyDown(VK_RSHIFT)) ? TRUE : FALSE;
+    if (vk == VK_CONTROL)
+        return (xbox_FramebufferKeyDown(VK_LCONTROL) || xbox_FramebufferKeyDown(VK_RCONTROL)) ? TRUE : FALSE;
     return xbox_FramebufferKeyDown(vk) ? TRUE : FALSE;
 }
 
@@ -88,11 +94,13 @@ static SHORT axis_from_keys(int negative, int positive)
  * modelled on the usual MMO bindings so nothing has to be learned:
  *
  *   W A S D       left thumb (move)       Q E / R F  right thumb (camera turn / tilt)
- *   Space         left trigger (jump)     Tab        right trigger (lock on)
+ *   Space         left thumb click (jump) Tab        right trigger (lock on)
  *   1 2 3 4       A B X Y (skill slots)   left / right mouse button  A / lock on
  *   Enter, Esc    START                   Backspace  B (back)
  *   arrows        d-pad (menus)           Z C        white black
- *   Shift Ctrl    left / right thumb click */
+ *   Shift         left trigger            Ctrl       right thumb click
+ *   (Phantom Dust jumps on the left thumb click: quest001.ssb "Click the
+ *   left thumbstick to jump", so that goes on Space.) */
 static BOOL keyboard_mmo(void)
 {
     static int on = -1;
@@ -112,7 +120,7 @@ static void keyboard_state_mmo(XBOX_INPUT_STATE *pState)
     if (key_down(VK_LEFT))   b |= XBOX_GAMEPAD_DPAD_LEFT;
     if (key_down(VK_RIGHT))  b |= XBOX_GAMEPAD_DPAD_RIGHT;
     if (key_down(VK_RETURN) || key_down(VK_ESCAPE)) b |= XBOX_GAMEPAD_START;
-    if (key_down(VK_SHIFT))  b |= XBOX_GAMEPAD_LEFT_THUMB;
+    if (key_down(VK_SPACE))  b |= XBOX_GAMEPAD_LEFT_THUMB;
     if (key_down(VK_CONTROL))b |= XBOX_GAMEPAD_RIGHT_THUMB;
     pState->Gamepad.wButtons = b;
 
@@ -122,7 +130,7 @@ static void keyboard_state_mmo(XBOX_INPUT_STATE *pState)
     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y]        = key_down('4') ? 255 : 0;
     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE]    = key_down('Z') ? 255 : 0;
     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK]    = key_down('C') ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = key_down(VK_SPACE) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = key_down(VK_SHIFT) ? 255 : 0;
     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] = (key_down(VK_TAB) || key_down(VK_RBUTTON)) ? 255 : 0;
 
     pState->Gamepad.sThumbLX = axis_from_keys('A', 'D');
