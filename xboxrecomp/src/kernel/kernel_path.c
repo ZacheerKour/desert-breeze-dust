@@ -437,6 +437,9 @@ translate:
     if (g_xbox_path_hook)
         g_xbox_path_hook(xbox_path);
     fprintf(stderr, "  [PATH] %s\n", xbox_path);
+    { extern void xbox_KernelLogWindow(int n);
+      if (getenv("RECOMP_XMV_KLOG") && strstr(xbox_path, ".xmv")) xbox_KernelLogWindow(12000);
+      { extern volatile int g_fn_watch_arm; if (getenv("RECOMP_FN_WATCH") && strstr(xbox_path, ".xmv")) g_fn_watch_arm = 1; } }
     fflush(stderr);
     {
         WCHAR remainder_wide[MAX_PATH];

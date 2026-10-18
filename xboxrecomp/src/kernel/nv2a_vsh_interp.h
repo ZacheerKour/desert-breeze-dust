@@ -58,4 +58,13 @@ const float *nv2a_vsh_constant(uint32_t index);   /* for traces */
 void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word);
 void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4]);
 
+/* RE-SoT: for the Direct3D 11 path, which runs the program on the host GPU.
+ * See the translation section at the end of nv2a_vsh_interp.c. */
+#include <stddef.h>
+uint32_t nv2a_vsh_program_generation(void);
+uint32_t nv2a_vsh_constant_generation(void);
+uint32_t nv2a_vsh_program_key(int *gpu_ok);
+size_t   nv2a_vsh_emit_hlsl(char *dst, size_t cap);
+const float *nv2a_vsh_constants(void);        /* c[0..191], 4 floats each */
+
 #endif

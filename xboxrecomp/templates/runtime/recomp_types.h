@@ -930,8 +930,11 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 #ifdef RECOMP_ABI_CHECK
 void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
                               uint32_t edi0, uint32_t esp0);
+extern volatile int g_fn_watch_on;
+void recomp_fn_watch_hit(uint32_t va);
 #define RECOMP_ABI_CALL(va, fn) do { \
     uint32_t _ab = g_ebx, _as = g_esi, _ad = g_edi, _ap = g_esp; \
+    if (g_fn_watch_on) recomp_fn_watch_hit(va); \
     (fn)(); \
     if (g_ebx != _ab || g_esi != _as || g_edi != _ad || g_esp < _ap + 4) \
         recomp_abi_violation_log((va), _ab, _as, _ad, _ap); \
@@ -1433,5 +1436,10 @@ static inline RecompMmx MMX_PSADBW(RecompMmx a, RecompMmx b) {
  * enumerates every site whether or not it is ever reached. */
 void recomp_unimpl(const char *text, uint32_t va);
 #define RECOMP_UNIMPL(_text, _va) recomp_unimpl((_text), (_va))
+
+/* Port input (lifted `in`), implemented by the kernel layer. */
+uint32_t xbox_IoIn(uint16_t port, int width);
+void xbox_IoOut(uint16_t port, uint32_t value, int width);
+void xbox_Cpuid(uint32_t leaf, uint32_t sub, uint32_t *a, uint32_t *b, uint32_t *c, uint32_t *d);
 
 #endif /* RECOMP_TYPES_H */

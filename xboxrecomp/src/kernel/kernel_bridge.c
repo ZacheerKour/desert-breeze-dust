@@ -30,6 +30,8 @@
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
 #include <stdio.h>
+#include <mmsystem.h>
+#pragma comment(lib, "winmm.lib")
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
  * makes malloc return `int`, so bridge_spawn_thread truncated its heap pointer
  * to 32 bits and sign-extended it into a `struct bridge_thread_start *`. Every
@@ -396,7 +398,9 @@ static long kernel_log_budget(void)
     return budget;
 }
 
-#define KERNEL_LOG_ON()      (g_kernel_call_count <= kernel_log_budget())
+static long long g_log_force_until;   /* bring-up trigger: log a window of calls after an event */
+void xbox_KernelLogWindow(int n);
+#define KERNEL_LOG_ON()      (g_kernel_call_count <= kernel_log_budget() || g_kernel_call_count <= g_log_force_until)
 /* Some sites logged at a tighter cap than the rest; keep them proportional. */
 #define KERNEL_LOG_ON_HALF() (g_kernel_call_count <= kernel_log_budget() / 2)
 
@@ -457,7 +461,47 @@ static RECOMP_TLS uint32_t g_thread_stack_top = 0;
 struct bridge_thread_start {
     recomp_func_t fn;
     uint32_t ctx1, ctx2, stack_top;
+    uint32_t eth;                 /* fake ETHREAD for this thread, or 0 */
 };
+
+/* Fake ETHREAD blocks. XAPI's GetExitCodeThread does
+ *   ObReferenceObjectByHandle(h, PsThreadObjectType, &t);
+ *   code = t->Header.SignalState ? *(DWORD*)(t + 0x120) : STILL_ACTIVE;
+ * and the stub answered with a NULL object, so every thread read as still
+ * running forever and any UI waiting on a worker (profile save/load) hung. Each
+ * spawned thread gets a small guest block: SignalState at +4 goes to 1 and the
+ * exit status lands at +0x120 when the thread ends. */
+#define BRIDGE_THREAD_OBJS 64
+static struct { HANDLE h; uint32_t eth; } s_thread_objs[BRIDGE_THREAD_OBJS];
+static RECOMP_TLS uint32_t g_cur_eth = 0;
+
+static uint32_t bridge_thread_obj_for(HANDLE h)
+{
+    int i;
+    for (i = 0; i < BRIDGE_THREAD_OBJS; i++)
+        if (s_thread_objs[i].h == h && h)
+            return s_thread_objs[i].eth;
+    return 0;
+}
+
+static void bridge_thread_finish(uint32_t status)
+{
+    if (g_cur_eth) {
+        BRIDGE_MEM32(g_cur_eth + 0x120) = status;
+        BRIDGE_MEM8(g_cur_eth + 4) = 1;           /* Header.SignalState */
+    }
+}
+
+static uint32_t bridge_new_thread_obj(void)
+{
+    uint32_t eth = xbox_HeapAlloc(0x200, 16);
+    if (eth) {
+        memset(XBOX_TO_NATIVE(eth), 0, 0x200);
+        BRIDGE_MEM8(eth + 0) = 6;           /* Header.Type = ThreadObject */
+        BRIDGE_MEM8(eth + 2) = 0x70;        /* Header.Size (dwords) */
+    }
+    return eth;
+}
 
 static void bridge_write_handle(uint32_t handle_va, HANDLE h);
 
@@ -488,6 +532,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
      * for every thread, which is how two of them ended up inside _lock() each
      * holding the lock the other wanted. */
     g_is_spawned_thread = 1;
+    g_cur_eth = s->eth;
     g_esp = s->stack_top;
     g_thread_stack_top = s->stack_top;
     {
@@ -506,6 +551,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
 
     fprintf(stderr, "  [KERNEL] worker thread returned (eax=0x%08X)\n", g_eax);
     fflush(stderr);
+    bridge_thread_finish(g_eax);
     /* The routine returned instead of calling PsTerminateSystemThread; the
      * stack is still ours to give back. */
     xbox_FreeThreadStack(g_thread_stack_top);
@@ -516,18 +562,24 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
 static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
                                   uint32_t ctx2, uint32_t stack_top)
 {
+    uint32_t eth = bridge_new_thread_obj();
     struct bridge_thread_start *s = malloc(sizeof(*s));
     HANDLE th;
 
     if (!s) return NULL;
-    s->fn = fn; s->ctx1 = ctx1; s->ctx2 = ctx2; s->stack_top = stack_top;
+    s->fn = fn; s->ctx1 = ctx1; s->ctx2 = ctx2; s->stack_top = stack_top; s->eth = eth;
 
     th = CreateThread(NULL, 0, bridge_thread_main, s, 0, NULL);
     if (!th) free(s);
     /* Record the game thread so a host-tick-driven title's watchdog can sample
      * it via xbox_thread_debug_handle. Harmless for default-model titles: they
      * spawn workers too, but never read it back. See kernel_thread.c. */
-    else xbox_set_game_thread(th);
+    else {
+        int i;
+        xbox_set_game_thread(th);
+        for (i = 0; i < BRIDGE_THREAD_OBJS; i++)
+            if (!s_thread_objs[i].h) { s_thread_objs[i].h = th; s_thread_objs[i].eth = eth; break; }
+    }
     return th;
 }
 
@@ -704,6 +756,7 @@ static void bridge_MmAllocateContiguousMemory(void)
      * is how a driver converts between the address it holds and the one it
      * hands the hardware. See xbox_ContiguousAlloc. */
     uint32_t xbox_va = xbox_ContiguousAlloc(size, 4096);
+    if (getenv("RECOMP_CONTIG_LOG")) fprintf(stderr, "  [CONTIG] by-caller size=0x%X -> 0x%08X from=%08X\n", size, xbox_va, g_xbox_kernel_caller);
 
     if (KERNEL_LOG_ON_HALF()) {
         fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemory: size=%u → Xbox VA 0x%08X\n",
@@ -802,6 +855,7 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
 
     if (align < 4096) align = 4096;
     xbox_va = xbox_ContiguousAlloc(size, align);
+    if (getenv("RECOMP_CONTIG_LOG")) fprintf(stderr, "  [CONTIG] by-caller size=0x%X -> 0x%08X from=%08X\n", size, xbox_va, g_xbox_kernel_caller);
 
     if (KERNEL_LOG_ON_HALF()) {
         fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemoryEx: size=%u align=%u → Xbox VA 0x%08X\n",
@@ -821,6 +875,7 @@ static void bridge_MmFreeContiguousMemory(void)
     uint32_t addr = STACK_ARG(0);
     /* Contiguous blocks come from their own arena, not the heap: passing
      * them to xbox_HeapFree found nothing, so none ever came back. */
+    if (getenv("RECOMP_CONTIG_LOG")) fprintf(stderr, "  [CONTIG] free 0x%08X from=%08X\n", addr, g_xbox_kernel_caller);
     if (!xbox_ContiguousFree(addr))
         xbox_HeapFree(addr);
     g_eax = 0;
@@ -843,6 +898,8 @@ static void bridge_NtAllocateVirtualMemory(void)
     /* Read the base address hint (0 = let kernel choose) */
     uint32_t base_hint = base_ptr ? BRIDGE_MEM32(base_ptr) : 0;
 
+    { static int vml = -1; if (vml < 0) vml = getenv("RECOMP_VM_LOG") ? 1 : 0;
+      if (vml) fprintf(stderr, "  [VM] alloc base=0x%08X size=0x%X type=0x%X prot=0x%X from=%08X\n", base_hint, size, alloc_type, protect, g_xbox_kernel_caller); }
     if (KERNEL_LOG_ON()) {
         fprintf(stderr, "  [KERNEL] NtAllocateVirtualMemory: base=0x%08X size=%u type=0x%X prot=0x%X\n",
                 base_hint, size, alloc_type, protect);
@@ -993,6 +1050,7 @@ static void bridge_NtAllocateVirtualMemory(void)
         }
     }
     if (!xbox_va) {
+        fprintf(stderr, "  [VM] FAILED size=0x%X type=0x%X base=0x%08X (heap cannot back it)\n", size, alloc_type, base_hint);
         g_eax = 0xC0000017u; /* STATUS_NO_MEMORY */
         return;
     }
@@ -1856,6 +1914,16 @@ static void bridge_MmGetPhysicalAddress(void)
      * are static and driven by guest CPU state, and nothing in tests/ can
      * reach them. */
     g_eax = (uint32_t)xbox_MmGetPhysicalAddress((PVOID)(uintptr_t)addr);
+    /* DirectSound hands buffers to the APU by physical address. A buffer in the
+     * ordinary guest heap has no physical address of its own here (the
+     * contiguous window is separate storage), so MmGetPhysicalAddress returns
+     * the heap VA, which the APU then reads as if it were a CONTIGUOUS offset
+     * -- different memory, all zeros. WMA custom-soundtrack output is such a
+     * buffer. Tag heap buffers asked about from inside DSOUND (0x1BA180-0x1C41E0)
+     * with 0x0B000000 + VA; mcpx_apu_phys maps that range back to guest RAM. */
+    if (addr >= 0x10000u && addr < 0x04000000u
+            && g_xbox_kernel_caller >= 0x001BA180u && g_xbox_kernel_caller < 0x001C41E0u)
+        g_eax = 0x0B000000u + addr;
 }
 
 /* ── MmSetAddressProtect (ordinal 182) ───────────────────── */
@@ -1937,6 +2005,7 @@ static void bridge_PsTerminateSystemThread(void)
             exit_status, g_is_spawned_thread ? " (worker)" : " (main)");
     fflush(stderr);
 
+    g_log_force_until = g_kernel_call_count + 1500;   /* bring-up: what does the game do next? */
     g_eax = exit_status;
 
     /*
@@ -1954,6 +2023,7 @@ static void bridge_PsTerminateSystemThread(void)
         /* The normal exit for a worker, and therefore the one that has to
          * return the stack -- ExitThread never comes back to bridge_thread_main
          * to do it. */
+        bridge_thread_finish(exit_status);
         xbox_FreeThreadStack(g_thread_stack_top);
         g_thread_stack_top = 0;
         ExitThread(exit_status);
@@ -2251,6 +2321,28 @@ static int kernel_raise_interrupt(uint32_t vector)
 #define NV2A_PCRTC_INTR_VBLANK (1u << 0)
 #define NV2A_VECTOR            3u
 
+/* How long a raised vblank stays pending before the NV2A acknowledge thread may clear
+ * it (see xbox_memory_layout.c). RECOMP_VBLANK_HOLD_MS overrides the 3 ms default. */
+static volatile LONGLONG g_vb_hold_until;
+static LONGLONG g_vb_hold_ticks(void)
+{
+    static LONGLONG t = -1;
+    if (t < 0) {
+        LARGE_INTEGER f; const char *e = getenv("RECOMP_VBLANK_HOLD_MS");
+        double ms = e ? atof(e) : 1.5;
+        QueryPerformanceFrequency(&f);
+        t = (LONGLONG)(ms * (double)f.QuadPart / 1000.0);
+    }
+    return t;
+}
+int xbox_VblankHoldActive(void)
+{
+    LARGE_INTEGER q;
+    QueryPerformanceCounter(&q);
+    return q.QuadPart < g_vb_hold_until;
+}
+
+static unsigned g_vb_isr, g_vb_early, g_vb_noint;
 static void kernel_vblank_tick(void)
 {
     static int enabled = -1;
@@ -2262,14 +2354,22 @@ static void kernel_vblank_tick(void)
     if (!enabled)
         return;
 
-    now = (long long)GetTickCount64();
-    if (now < next_ms)
-        return;
-    next_ms = now + 16;                       /* ~60 Hz */
+    {   /* QPC, not GetTickCount64: that advances in 15.6 ms steps and capped vblank near 40 Hz. */
+        static LARGE_INTEGER qf; static double next_d;
+        LARGE_INTEGER q; double nowd;
+        if (!qf.QuadPart) QueryPerformanceFrequency(&qf);
+        QueryPerformanceCounter(&q);
+        nowd = (double)q.QuadPart * 1000.0 / (double)qf.QuadPart;
+        if (nowd < next_d) { g_vb_early++; return; }
+        next_d += 1000.0 / 60.0;                 /* 60 Hz, drift-free */
+        if (next_d < nowd - 50.0) next_d = nowd + 1000.0 / 60.0;
+        now = (long long)nowd; (void)now;
+    }
 
-    if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
-        return;
+    if (!xbox_GetConnectedInterrupt(NV2A_VECTOR)) { g_vb_noint++; return; }
+    g_vb_isr++;
 
+    { LARGE_INTEGER q; QueryPerformanceCounter(&q); g_vb_hold_until = q.QuadPart + g_vb_hold_ticks(); }
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |= NV2A_PCRTC_INTR_VBLANK;
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
 
@@ -2566,13 +2666,33 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         g_fs_base = tib;
     }
 
+    timeBeginPeriod(1);        /* 1 ms timer resolution: Sleep(10) was ~15.6 ms, capping vblank near 40 Hz */
     for (;;) {
         long long now;
         int i;
 
         Sleep(10);
-        kernel_vblank_tick();  /* the GPU's frame clock */
-        kernel_drain_dpcs();   /* deferred work, before due timers */
+        {   /* bring-up: where the timer thread's time goes (RECOMP_TT_STATS=1) */
+            static int tt = -1;
+            static LARGE_INTEGER f, last, a0, a1;
+            static double vb_ms, dpc_ms, tot_ms; static unsigned loops;
+            LARGE_INTEGER t0, t1, t2;
+            if (tt < 0) { tt = getenv("RECOMP_TT_STATS") != NULL; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&last); }
+            if (tt) QueryPerformanceCounter(&t0);
+            kernel_vblank_tick();  /* the GPU's frame clock */
+            if (tt) QueryPerformanceCounter(&t1);
+            kernel_drain_dpcs();   /* deferred work, before due timers */
+            if (tt) {
+                QueryPerformanceCounter(&t2);
+                vb_ms += (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart;
+                dpc_ms += (double)(t2.QuadPart - t1.QuadPart) * 1000.0 / f.QuadPart;
+                loops++;
+                if ((t2.QuadPart - last.QuadPart) > 5 * f.QuadPart) {
+                    fprintf(stderr, "  [TT] %.1fs: loops %u, vblank_tick %.0f ms (isr %u early %u noint %u), drain_dpcs %.0f ms%c", (double)(t2.QuadPart - last.QuadPart) / f.QuadPart, loops, vb_ms, g_vb_isr, g_vb_early, g_vb_noint, dpc_ms, 10); g_vb_isr = g_vb_early = g_vb_noint = 0;
+                    fflush(stderr); vb_ms = dpc_ms = 0; loops = 0; last = t2;
+                }
+            }
+        }
         now = (long long)GetTickCount64();
 
         for (i = 0; i < XBOX_MAX_TIMERS; i++) {
@@ -3500,6 +3620,17 @@ static void bridge_NtWriteFile(void)
     g_eax = (uint32_t)xbox_NtWriteFile(handle, NULL, NULL, NULL, &ios,
                 XBOX_TO_NATIVE(buffer_va), length, poff);
     bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
+    {
+        static unsigned wl;
+        if (length == 60 && g_xbox_kernel_caller == 0x00142032u) g_log_force_until = g_kernel_call_count + 600;
+        if ((g_xbox_kernel_caller != 0x00147135u && g_xbox_kernel_caller != 0x001470A0u && g_xbox_kernel_caller != 0x001424E8u && g_xbox_kernel_caller != 0x00147183u && wl++ < 200) || (g_kernel_call_count <= g_log_force_until && wl++ < 600)) {
+            const uint8_t *wp = (const uint8_t *)XBOX_TO_NATIVE(buffer_va);
+            fprintf(stderr, "  [WRITE] from=0x%08X @%lld len=%u wrote=%u st=0x%08X  %02X %02X %02X %02X%c",
+                    g_xbox_kernel_caller, poff ? (long long)off.QuadPart : -1LL, length,
+                    (uint32_t)ios.Information, (uint32_t)g_eax, wp[0], wp[1], wp[2], wp[3], 10);
+            fflush(stderr);
+        }
+    }
     bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),
                             iostatus);
 }
@@ -3943,7 +4074,14 @@ static void bridge_ObReferenceObjectByHandle(void)
     uint32_t handle = STACK_ARG(0);
     uint32_t obj_type = STACK_ARG(1);
     uint32_t object_ptr = STACK_ARG(2);
-    if (object_ptr) BRIDGE_MEM32(object_ptr) = 0;
+    uint32_t eth = 0;
+    (void)obj_type;
+    {
+        HANDLE h = bridge_resolve_handle(handle);
+        if (h)
+            eth = bridge_thread_obj_for(h);
+    }
+    if (object_ptr) BRIDGE_MEM32(object_ptr) = eth;
     g_eax = 0;  /* STATUS_SUCCESS */
 }
 
@@ -4593,9 +4731,11 @@ static void bridge_RtlTimeToTimeFields(void)
 }
 
 /* ── XcSHAInit / XcSHAUpdate / XcSHAFinal (ordinals 335-337) */
+static unsigned g_sha_log;
 static void bridge_XcSHAInit(void)
 {
     xbox_XcSHAInit((PXBOX_SHA_CONTEXT)XBOX_TO_NATIVE(STACK_ARG(0)));
+    if (g_sha_log++ < 600) fprintf(stderr, "  [SHA] init ctx=%08X from=%08X%c", STACK_ARG(0), g_xbox_kernel_caller, 10);
     g_eax = 0;
 }
 
@@ -4604,6 +4744,13 @@ static void bridge_XcSHAUpdate(void)
     xbox_XcSHAUpdate((PXBOX_SHA_CONTEXT)XBOX_TO_NATIVE(STACK_ARG(0)),
                      (const UCHAR*)XBOX_TO_NATIVE(STACK_ARG(1)),
                      STACK_ARG(2));
+    if (g_sha_log++ < 600) {
+        const uint8_t *q = (const uint8_t *)XBOX_TO_NATIVE(STACK_ARG(1));
+        uint32_t n = STACK_ARG(2), k; uint32_t sum = 0;
+        for (k = 0; k < n; k++) sum = sum * 131u + q[k];
+        if (n == 492 && getenv("RECOMP_SHA_DUMP")) { char hx[1100]; for (k = 0; k < n; k++) sprintf(hx + k * 2, "%02X", q[k]); fprintf(stderr, "  [SHA492] %s%c", hx, 10); }
+        fprintf(stderr, "  [SHA] update ctx=%08X len=%u hash=%08X first=%02X%02X%02X%02X from=%08X%c", STACK_ARG(0), n, sum, n>0?q[0]:0, n>1?q[1]:0, n>2?q[2]:0, n>3?q[3]:0, g_xbox_kernel_caller, 10);
+    }
     g_eax = 0;
 }
 
@@ -4611,6 +4758,10 @@ static void bridge_XcSHAFinal(void)
 {
     xbox_XcSHAFinal((PXBOX_SHA_CONTEXT)XBOX_TO_NATIVE(STACK_ARG(0)),
                     (UCHAR*)XBOX_TO_NATIVE(STACK_ARG(1)));
+    if (g_sha_log++ < 600) {
+        const uint8_t *q = (const uint8_t *)XBOX_TO_NATIVE(STACK_ARG(1));
+        fprintf(stderr, "  [SHA] final ctx=%08X digest=%02X%02X%02X%02X%02X%02X%02X%02X from=%08X%c", STACK_ARG(0), q[0],q[1],q[2],q[3],q[4],q[5],q[6],q[7], g_xbox_kernel_caller, 10);
+    }
     g_eax = 0;
 }
 
@@ -7625,18 +7776,70 @@ static void bridge_NtQueryTimer(void)
     g_eax = 0;
 }
 
+/* Scatter reads and gather writes (NtReadFileScatter 220 / NtWriteFileGather 237).
+ *
+ * They were empty stubs that returned success, so every gather write -- the way
+ * XAPI writes a save's data -- reported done and wrote nothing: a created
+ * profile.dat stayed all zeros. SegmentArray is an array of 8-byte elements,
+ * each the address of one 4 KB page; Length is a multiple of the page size.
+ * Done as a run of ordinary reads/writes, one page at a time, in order. */
+static void bridge_file_segments(int is_write)
+{
+    HANDLE   handle    = bridge_resolve_handle(STACK_ARG(0));
+    uint32_t iostatus  = STACK_ARG(4);
+    uint32_t seg_va    = STACK_ARG(5);
+    uint32_t length    = STACK_ARG(6);
+    uint32_t offset_va = STACK_ARG(7);
+    LARGE_INTEGER cur = {0};
+    int have_off = 0;
+    uint32_t done = 0, i;
+    NTSTATUS st = 0;
+
+    if (offset_va) {
+        cur.LowPart  = BRIDGE_MEM32(offset_va);
+        cur.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
+        have_off = 1;
+    }
+    for (i = 0; done < length; i++) {
+        XBOX_IO_STATUS_BLOCK ios;
+        uint32_t page = BRIDGE_MEM32(seg_va + i * 8);
+        uint32_t n = length - done < 4096u ? length - done : 4096u;
+
+        memset(&ios, 0, sizeof(ios));
+        if (!bridge_buf_ok(page, n, is_write ? "NtWriteFileGather" : "NtReadFileScatter")) {
+            st = (NTSTATUS)0xC0000005;
+            break;
+        }
+        if (is_write)
+            st = xbox_NtWriteFile(handle, NULL, NULL, NULL, &ios,
+                                  XBOX_TO_NATIVE(page), n, have_off ? &cur : NULL);
+        else
+            st = xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
+                                 XBOX_TO_NATIVE(page), n, have_off ? &cur : NULL);
+        done += (uint32_t)ios.Information;
+        if (st < 0 || (uint32_t)ios.Information < n)
+            break;
+        if (have_off)
+            cur.QuadPart += n;
+    }
+    {
+        static unsigned logged;
+        if (logged++ < 20) {
+            fprintf(stderr, "  [%s] from=0x%08X len=%u done=%u st=0x%08X%c",
+                    is_write ? "GATHER" : "SCATTER", g_xbox_kernel_caller,
+                    length, done, (uint32_t)st, 10);
+            fflush(stderr);
+        }
+    }
+    bridge_write_iostatus(iostatus, st, done);
+    bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3), iostatus);
+    g_eax = (uint32_t)st;
+}
+
 /* --- NtReadFileScatter (ordinal 220, 8 args = 32 bytes) --- */
 static void bridge_NtReadFileScatter(void)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
-    (void)STACK_ARG(5);
-    (void)STACK_ARG(6);
-    (void)STACK_ARG(7);
-    g_eax = 0;
+    bridge_file_segments(0);
 }
 
 /* --- NtRemoveIoCompletion (ordinal 223, 5 args = 20 bytes) --- */
@@ -7689,15 +7892,7 @@ static void bridge_NtSignalAndWaitForSingleObjectEx(void)
 /* --- NtWriteFileGather (ordinal 237, 8 args = 32 bytes) --- */
 static void bridge_NtWriteFileGather(void)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
-    (void)STACK_ARG(5);
-    (void)STACK_ARG(6);
-    (void)STACK_ARG(7);
-    g_eax = 0;
+    bridge_file_segments(1);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -9795,4 +9990,46 @@ void xbox_kernel_bridge_init(void)
     fprintf(stderr, "  Synthetic VA range: 0x%08X-0x%08X\n",
             KERNEL_VA_BASE, KERNEL_VA_BASE + (resolved - 1) * 4);
 
+}
+
+/* Open a window of kernel-call logging (RECOMP_XMV_KLOG: around an XMV open). */
+void xbox_KernelLogWindow(int n)
+{
+    g_log_force_until = g_kernel_call_count + n;
+}
+
+/* Port input for lifted `in` instructions.
+ *
+ * Port 0x80C0 is read by the D3D vblank DPC to learn which field is being
+ * scanned out: bit 5 clear = odd, set = even (the DPC stores ~(al >> 5) & 1 in
+ * the miniport, which GetDisplayFieldStatus reports). The console's encoder
+ * alternates it every vblank, and XMV playback waits for a non-odd field before
+ * it starts. Derive the parity from the same 60 Hz clock the vblank tick uses,
+ * so it alternates once per display refresh. Every other port reads 0. */
+uint32_t xbox_IoIn(uint16_t port, int width)
+{
+    (void)width;
+    if (port == 0x80C0) {
+        LARGE_INTEGER f, c;
+        QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&c);
+        return (((c.QuadPart * 60) / f.QuadPart) & 1) ? 0x20u : 0u;
+    }
+    return 0;
+}
+
+/* Port output: nothing here models a device on these ports yet. */
+void xbox_IoOut(uint16_t port, uint32_t value, int width)
+{
+    (void)port; (void)value; (void)width;
+}
+
+/* CPUID as the console CPU: GenuineIntel, family 6 model 8 stepping 6, with
+ * FPU TSC MSR CX8 MTRR PGE MCA CMOV PAT MMX FXSR SSE. */
+void xbox_Cpuid(uint32_t leaf, uint32_t sub, uint32_t *a, uint32_t *b, uint32_t *c, uint32_t *d)
+{
+    (void)sub;
+    if (leaf == 0) { *a = 2; *b = 0x756E6547u; *d = 0x49656E69u; *c = 0x6C65746Eu; return; }
+    if (leaf == 1) { *a = 0x00000686u; *b = 0x00000800u; *c = 0; *d = 0x0381F131u; return; }
+    *a = *b = *c = *d = 0;
 }

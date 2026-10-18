@@ -131,7 +131,7 @@ static void wr32(uint32_t va, uint32_t v);
  * on a half-built structure. Two seconds is still not forever -- a guest that
  * genuinely never lowers is still not allowed to switch the device off -- but
  * it is long enough that a slow critical section is not mistaken for one. */
-#define OHCI_IRQ_HOLDOFF        500
+#define OHCI_IRQ_HOLDOFF        125
 
 /* Milliseconds per pass of the controller thread, which is also how many USB
  * frames a pass is worth.
@@ -143,7 +143,7 @@ static void wr32(uint32_t va, uint32_t v);
  * with nothing to tell the two apart but how many register reads happened.
  * Four is close enough to a real frame to stop losing that race and still
  * cheap -- this thread does nothing but read a few guest dwords per pass. */
-#define OHCI_TICK_MS            4u
+#define OHCI_TICK_MS            16u
 
 typedef struct {
     uint32_t base;                      /* Xbox VA of the register block   */
@@ -208,7 +208,7 @@ static uint64_t ohci_read(void *dev, uint32_t off, int size)
 
     if (s_trace) {
         static unsigned n;
-        if (n++ < 600)
+        if (n++ < 30000)
             fprintf(stderr, "  [OHCI%d] read  +0x%02X = %08X\n",
                     hc->index, off, (uint32_t)v);
     }
@@ -228,7 +228,7 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
 
     if (s_trace) {
         static unsigned n;
-        if (n++ < 600)
+        if (n++ < 30000)
             fprintf(stderr, "  [OHCI%d] write +0x%02X = %08X\n",
                     hc->index, off, v);
     }

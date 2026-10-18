@@ -39,6 +39,9 @@ static float    s_const[NV2A_VSH_CONSTANTS][4];
 static uint32_t s_load_slot, s_load_word, s_start_slot;
 static uint32_t s_const_load, s_const_word;
 static uint32_t s_cxt_write;
+/* RE-SoT: bumped whenever the program memory or the start slot, respectively
+ * a constant, changes -- so the hardware path can tell without rehashing. */
+static uint32_t s_prog_gen = 1, s_const_gen = 1;
 
 static uint32_t field(const uint32_t *ins, int dw, int lo, int width)
 {
@@ -55,15 +58,24 @@ void nv2a_vsh_set_load_slot(uint32_t slot)
 
 void nv2a_vsh_program_word(uint32_t word)
 {
-    if (s_load_slot < NV2A_VSH_SLOTS)
+    if (s_load_slot < NV2A_VSH_SLOTS
+        && s_program[s_load_slot][s_load_word] != word) {
         s_program[s_load_slot][s_load_word] = word;
+        s_prog_gen++;
+    }
     if (++s_load_word == 4) {
         s_load_word = 0;
         s_load_slot++;
     }
 }
 
-void nv2a_vsh_set_start_slot(uint32_t slot) { s_start_slot = slot; }
+void nv2a_vsh_set_start_slot(uint32_t slot)
+{
+    if (s_start_slot != slot) {
+        s_start_slot = slot;
+        s_prog_gen++;
+    }
+}
 void nv2a_vsh_set_cxt_write(uint32_t enable) { s_cxt_write = enable; }
 
 void nv2a_vsh_set_constant_load(uint32_t index)
@@ -74,8 +86,10 @@ void nv2a_vsh_set_constant_load(uint32_t index)
 
 void nv2a_vsh_constant_word(uint32_t word)
 {
-    if (s_const_load < NV2A_VSH_CONSTANTS)
+    if (s_const_load < NV2A_VSH_CONSTANTS) {
         memcpy(&s_const[s_const_load][s_const_word], &word, 4);
+        s_const_gen++;
+    }
     if (++s_const_word == 4) {
         s_const_word = 0;
         s_const_load++;
@@ -84,14 +98,18 @@ void nv2a_vsh_constant_word(uint32_t word)
 
 void nv2a_vsh_set_constant(uint32_t index, const float v[4])
 {
-    if (index < NV2A_VSH_CONSTANTS)
+    if (index < NV2A_VSH_CONSTANTS) {
         memcpy(s_const[index], v, sizeof s_const[index]);
+        s_const_gen++;
+    }
 }
 
 void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4])
 {
-    if (slot < NV2A_VSH_SLOTS)
+    if (slot < NV2A_VSH_SLOTS) {
         memcpy(s_program[slot], words, sizeof s_program[slot]);
+        s_prog_gen++;
+    }
 }
 
 /* ---- disassembly (RECOMP_VSH_DUMP) --------------------------------------- */
@@ -166,8 +184,10 @@ const float *nv2a_vsh_constant(uint32_t index)
 
 void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word)
 {
-    if (index < NV2A_VSH_CONSTANTS && comp < 4)
+    if (index < NV2A_VSH_CONSTANTS && comp < 4) {
         memcpy(&s_const[index][comp], &word, 4);
+        s_const_gen++;
+    }
 }
 
 /* ---- execution ----------------------------------------------------------- */
@@ -377,8 +397,10 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
         if (omask) {
             const vec4 *src = field(ins, 3, 2, 1) ? &ires : &mres;
             if (!field(ins, 3, 11, 1)) {                  /* to c[] */
-                if (s_cxt_write && oaddr < NV2A_VSH_CONSTANTS)
+                if (s_cxt_write && oaddr < NV2A_VSH_CONSTANTS) {
                     write_masked(s_const[oaddr], src, omask);
+                    s_const_gen++;
+                }
             } else if (oaddr == 0) {
                 write_masked(opos.v, src, omask);
             } else if (oaddr < 13) {
@@ -397,5 +419,159 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
             return 1;
         }
     }
+    return 0;
+}
+
+/* ---- RE-SoT: translation to HLSL ------------------------------------------
+ *
+ * The interpreter above was the executor's largest cost in a 3D scene (9-16 ms
+ * a frame in the PoP demo's levels). The Direct3D 11 path runs the same
+ * program on the host GPU instead: the text emitted here is the body of a
+ * vertex shader, one block per instruction, with the semantics of
+ * nv2a_vsh_run kept line for line -- sources read before either unit writes,
+ * the paired ILU result going to R1, masks as swizzles.
+ *
+ * Names the body expects from its caller: float4 v[16] (inputs), R[13]
+ * (temps, R[12] is oPos), o[13] (outputs), c[192] (constants), int a0, and
+ * the helpers vsh_rcp, vsh_rcc, vsh_log, vsh_lit, vsh_cidx. */
+
+uint32_t nv2a_vsh_program_generation(void) { return s_prog_gen; }
+uint32_t nv2a_vsh_constant_generation(void) { return s_const_gen; }
+const float *nv2a_vsh_constants(void) { return &s_const[0][0]; }
+
+/* Hash of the program that would run now. *gpu_ok is cleared when it cannot
+ * be translated: no FINAL instruction, or it writes constants. */
+uint32_t nv2a_vsh_program_key(int *gpu_ok)
+{
+    uint32_t h = 2166136261u, s;
+    int i, ok = 0;
+
+    for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++) {
+        const uint32_t *ins = s_program[s];
+        for (i = 1; i < 4; i++)
+            h = (h ^ ins[i]) * 16777619u;
+        if (field(ins, 3, 12, 4) && !field(ins, 3, 11, 1) && s_cxt_write) {
+            ok = 0;                                  /* writes c[] */
+            break;
+        }
+        if (field(ins, 3, 0, 1)) {
+            ok = 1;
+            break;
+        }
+    }
+    *gpu_ok = ok;
+    return h;
+}
+
+static void hl_mask(char *b, uint32_t mask)
+{
+    int n = 0;
+    if (mask & 8) b[n++] = 'x';
+    if (mask & 4) b[n++] = 'y';
+    if (mask & 2) b[n++] = 'z';
+    if (mask & 1) b[n++] = 'w';
+    b[n] = 0;
+}
+
+static void hl_src(char *b, size_t n, const uint32_t *ins, int which)
+{
+    static const char sw[] = "xyzw";
+    uint32_t neg, swz, mux, reg;
+    char r[48];
+
+    if (which == 0) {
+        neg = field(ins, 1, 8, 1); swz = field(ins, 1, 0, 8);
+        mux = field(ins, 2, 26, 2); reg = field(ins, 2, 28, 4);
+    } else if (which == 1) {
+        neg = field(ins, 2, 25, 1); swz = field(ins, 2, 17, 8);
+        mux = field(ins, 2, 11, 2); reg = field(ins, 2, 13, 4);
+    } else {
+        neg = field(ins, 2, 10, 1); swz = field(ins, 2, 2, 8);
+        mux = field(ins, 3, 28, 2);
+        reg = (field(ins, 2, 0, 2) << 2) | field(ins, 3, 30, 2);
+    }
+    if (mux == 1)
+        snprintf(r, sizeof r, "R[%u]", reg <= 12 ? reg : 0u);
+    else if (mux == 2)
+        snprintf(r, sizeof r, "v[%u]", field(ins, 1, 9, 4));
+    else if (field(ins, 3, 1, 1))
+        snprintf(r, sizeof r, "c[vsh_cidx(a0 + %u)]", field(ins, 1, 13, 8));
+    else {
+        uint32_t ci = field(ins, 1, 13, 8);
+        snprintf(r, sizeof r, "c[%u]", ci < NV2A_VSH_CONSTANTS ? ci : 0u);
+    }
+    snprintf(b, n, "(%s%s.%c%c%c%c)", neg ? "-" : "", r, sw[(swz >> 6) & 3],
+             sw[(swz >> 4) & 3], sw[(swz >> 2) & 3], sw[swz & 3]);
+}
+
+/* Returns the number of bytes written, or 0 if the program does not fit or
+ * has no end. */
+size_t nv2a_vsh_emit_hlsl(char *dst, size_t cap)
+{
+    static const char *const mac_expr[16] = {
+        "0", "a", "a * b", "a + cc", "a * b + cc",
+        "dot(a.xyz, b.xyz).xxxx", "(dot(a.xyz, b.xyz) + b.w).xxxx",
+        "dot(a, b).xxxx", "float4(1.0, a.y * b.y, a.z, b.w)",
+        "float4(a.x < b.x ? a.x : b.x, a.y < b.y ? a.y : b.y,"
+        " a.z < b.z ? a.z : b.z, a.w < b.w ? a.w : b.w)",
+        "float4(a.x >= b.x ? a.x : b.x, a.y >= b.y ? a.y : b.y,"
+        " a.z >= b.z ? a.z : b.z, a.w >= b.w ? a.w : b.w)",
+        "float4(a.x < b.x ? 1.0 : 0.0, a.y < b.y ? 1.0 : 0.0,"
+        " a.z < b.z ? 1.0 : 0.0, a.w < b.w ? 1.0 : 0.0)",
+        "float4(a.x >= b.x ? 1.0 : 0.0, a.y >= b.y ? 1.0 : 0.0,"
+        " a.z >= b.z ? 1.0 : 0.0, a.w >= b.w ? 1.0 : 0.0)",
+        "a", "a", "a"
+    };
+    static const char *const ilu_expr[8] = {
+        "0", "cc", "vsh_rcp(cc.x).xxxx", "vsh_rcc(cc.x).xxxx",
+        "(1.0 / sqrt(abs(cc.x))).xxxx",
+        "float4(exp2(floor(cc.x)), cc.x - floor(cc.x), exp2(cc.x), 1.0)",
+        "vsh_log(cc)", "vsh_lit(cc)"
+    };
+    size_t len = 0;
+    uint32_t s;
+
+#define HL(...) do { int w_ = snprintf(dst + len, cap - len, __VA_ARGS__); \
+        if (w_ < 0 || (size_t)w_ >= cap - len) return 0; \
+        len += (size_t)w_; } while (0)
+    for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++) {
+        const uint32_t *ins = s_program[s];
+        uint32_t mac = field(ins, 1, 21, 4), ilu = field(ins, 1, 25, 3);
+        uint32_t mac_mask = field(ins, 3, 24, 4), ilu_mask = field(ins, 3, 16, 4);
+        uint32_t tdst = field(ins, 3, 20, 4);
+        uint32_t omask = field(ins, 3, 12, 4), oaddr = field(ins, 3, 3, 8);
+        char a[64], b[64], c[64], m[8];
+
+        hl_src(a, sizeof a, ins, 0);
+        hl_src(b, sizeof b, ins, 1);
+        hl_src(c, sizeof c, ins, 2);
+        HL(" { float4 a = %s, b = %s, cc = %s;\n", a, b, c);
+        HL("   float4 m = %s; float4 l = %s;\n", mac_expr[mac], ilu_expr[ilu]);
+        if (mac == 13)
+            HL("   a0 = (int)floor(a.x + 0.001);\n");
+        if (mac && mac != 13 && mac_mask && tdst <= 12) {
+            hl_mask(m, mac_mask);
+            HL("   R[%u].%s = m.%s;\n", tdst, m, m);
+        }
+        if (ilu && ilu_mask) {
+            uint32_t it = mac ? 1u : tdst;
+            if (it <= 12) {
+                hl_mask(m, ilu_mask);
+                HL("   R[%u].%s = l.%s;\n", it, m, m);
+            }
+        }
+        if (omask && field(ins, 3, 11, 1) && oaddr < 13) {
+            hl_mask(m, omask);
+            if (oaddr == 0)
+                HL("   R[12].%s = %s.%s;\n", m, field(ins, 3, 2, 1) ? "l" : "m", m);
+            else
+                HL("   o[%u].%s = %s.%s;\n", oaddr, m,
+                   field(ins, 3, 2, 1) ? "l" : "m", m);
+        }
+        HL(" }\n");
+        if (field(ins, 3, 0, 1))
+            return len;
+    }
+#undef HL
     return 0;
 }

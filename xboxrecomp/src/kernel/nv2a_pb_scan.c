@@ -50,8 +50,17 @@ extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 extern void nv2a_pb_exec_report(void);
 static int s_exec_enabled = -1;
 
+/* RE-SoT: the inventory is a linear search per method word -- tens of
+ * millions of compares a frame once a title draws. Only kept when the
+ * survey itself was asked for. */
+static int s_survey = -1;
+
 static void note(uint32_t subch, uint32_t method)
 {
+    if (s_survey < 0)
+        s_survey = getenv("RECOMP_PB_SCAN") != NULL;
+    if (!s_survey)
+        return;
     for (int i = 0; i < s_seen_count; i++) {
         if (s_seen[i].method == method && s_seen[i].subch == subch) {
             s_seen[i].count++;
@@ -170,7 +179,10 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
     uint32_t words = 0;
 
     while (va < end_va && words < 0x100000u) {
-        uint32_t w = *(const uint32_t *)(mem + va);
+        uint32_t w;
+        if (va < XBOX_CONTIG_BASE || va >= XBOX_CONTIG_BASE + 0x04000000u - 4)
+            break;                               /* left physical memory */
+        w = *(const uint32_t *)(mem + va);
         va += 4;
         words++;
 
@@ -180,6 +192,10 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
             (*jumps)++;
             if (!in_call)
                 break;                        /* the ring: a jump ends it */
+            if ((target & 0x0FFFFFFFu) >= 0x04000000u) {   /* not RAM: stale or non-command data */
+                (*unknown)++;
+                break;
+            }
             va = XBOX_CONTIG_BASE | (target & 0x0FFFFFFFu);
             end_va = va + 0x400000u;
             continue;
@@ -192,6 +208,10 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
         if ((w & 3u) == 2u) {                    /* CALL */
             if (!in_call) {
                 uint32_t sub = XBOX_CONTIG_BASE | ((w & 0xFFFFFFFCu) & 0x0FFFFFFFu);
+                if ((w & 0x0FFFFFFCu) >= 0x04000000u) {         /* not RAM */
+                    (*unknown)++;
+                    continue;
+                }
                 s_tot_calls++;
                 words += pb_walk(sub, sub + 0x400000u, 1, jumps, unknown);
             }
@@ -220,6 +240,89 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
         (*unknown)++;
     }
     return words;
+}
+
+/* RE-SoT: walk from one PUT to the next, following JUMPs like the GPU.
+ *
+ * A PUT is always on a command boundary, so the stream from the previous PUT
+ * reaches the new one exactly; a JUMP on the way (the ring's wrap, or a hop
+ * over space the title reserved) just moves the read position. The budget is
+ * what stops a corrupt stream rather than an address comparison. */
+#if defined(_WIN32)
+#include <windows.h>
+#endif
+uint64_t g_nv2a_exec_ticks;     /* RE-SoT: QPC ticks spent in nv2a_pb_scan_to */
+
+static void pb_scan_to(uint32_t start_va, uint32_t put_va);
+
+void nv2a_pb_scan_to(uint32_t start_va, uint32_t put_va)
+{
+#if defined(_WIN32)
+    LARGE_INTEGER t0, t1;
+    QueryPerformanceCounter(&t0);
+    pb_scan_to(start_va, put_va);
+    QueryPerformanceCounter(&t1);
+    g_nv2a_exec_ticks += (uint64_t)(t1.QuadPart - t0.QuadPart);
+#else
+    pb_scan_to(start_va, put_va);
+#endif
+}
+
+static void pb_scan_to(uint32_t start_va, uint32_t put_va)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    uint32_t va = start_va, words = 0, jumps = 0, unknown = 0;
+
+    if (s_exec_enabled < 0)
+        s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
+    if (!s_exec_enabled && !getenv("RECOMP_PB_SCAN"))
+        return;
+    while (va != put_va && words < 0x100000u) {
+        uint32_t w;
+
+        if (va < XBOX_CONTIG_BASE || va >= XBOX_CONTIG_BASE + 0x04000000u - 4)
+            break;                               /* left physical memory */
+        w = *(const uint32_t *)(mem + va);
+        va += 4;
+        words++;
+        if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {    /* JUMP */
+            uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu)
+                                             : (w & 0x1FFFFFFCu);
+            va = XBOX_CONTIG_BASE | (target & 0x0FFFFFFFu);
+            jumps++;
+            continue;
+        }
+        if ((w & 0xFFFF0003u) == 0x00020000u)                        /* RETURN */
+            continue;
+        if ((w & 3u) == 2u) {                                        /* CALL */
+            uint32_t sub = XBOX_CONTIG_BASE | ((w & 0xFFFFFFFCu) & 0x0FFFFFFFu);
+            s_tot_calls++;
+            words += pb_walk(sub, sub + 0x400000u, 1, &jumps, &unknown);
+            continue;
+        }
+        if ((w & 0x00030003u) == 0u) {
+            uint32_t count  = (w >> 18) & 0x7FFu;
+            uint32_t subch  = (w >> 13) & 7u;
+            uint32_t method =  w & 0x1FFCu;
+            int noninc = (w & 0xE0000000u) == 0x40000000u;
+            uint32_t i;
+
+            for (i = 0; i < count && va != put_va; i++) {
+                uint32_t m = noninc ? method : method + i * 4;
+                note(subch, m);
+                if (s_exec_enabled)
+                    nv2a_pb_exec_method(subch, m, *(const uint32_t *)(mem + va));
+                va += 4;
+                words++;
+            }
+            continue;
+        }
+        unknown++;
+    }
+    s_tot_words += words;
+    s_tot_unknown += unknown;
+    s_tot_jumps += jumps;
+    s_tot_segments++;
 }
 
 void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)

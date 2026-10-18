@@ -1483,6 +1483,9 @@ class Lifter:
             return ["eax = SX16(eax); /* cwde */"]
         if m == "cbw":
             return ["SET_LO16(eax, SX8(eax)); /* cbw */"]
+        if m == "cwd":
+            # DX = sign of AX. Found by tools/../audit_narrow.py: it was left to RECOMP_UNIMPL.
+            return ["SET_LO16(edx, ((int16_t)LO16(eax) < 0) ? 0xFFFFu : 0u); /* cwd */"]
         if m == "bswap" and nops >= 1 and ops[0].type == "reg":
             r = _fmt_reg(ops[0].reg)
             return [f"{r} = BSWAP32({r}); /* bswap */"]
@@ -1662,6 +1665,32 @@ class Lifter:
                 return [f"/* {m}: no adc/sbb in this function consumes CF */"]
             expr = {"stc": "1", "clc": "0", "cmc": "!_cf"}[m]
             return [f"_cf = {expr}; /* {m} */"]
+
+        # ── Port input ──
+        # `in al/ax/eax, dx` used to fall to RECOMP_UNIMPL and leave the register
+        # as it was. Phantom Dust reads port 0x80C0 in its vblank DPC for the
+        # display field (odd/even); with the register untouched the field never
+        # alternated, GetDisplayFieldStatus stayed "odd" forever, and the XMV
+        # decoder -- which starts playback on a non-odd field -- never began.
+        if m == "in" and len(ops) == 2 and "dx" in str(insn.op_str).split(",")[1]:
+            w = _operand_width(ops[0]) or 1
+            return [_fmt_operand_write(ops[0], f"(uint32_t)xbox_IoIn((uint16_t)LO16(edx), {w})") + f"; /* in {insn.op_str} */"]
+
+        # ── Port output, CPUID, MXCSR ──
+        # `out dx, al/eax` goes to the runtime so it can be logged or modelled (the
+        # D3D vblank code writes port 0x80C0); `cpuid` answers as the console CPU
+        # (a 733 MHz Pentium III-class part); stmxcsr/ldmxcsr model a control word
+        # that nothing here depends on.
+        if m == "out" and len(ops) == 2:
+            w = _operand_width(ops[1]) or 1
+            return [f"xbox_IoOut((uint16_t)({_fmt_operand_read(ops[0])}), (uint32_t)({_fmt_operand_read(ops[1])}), {w}); /* out {insn.op_str} */"]
+        if m == "cpuid" and not ops:
+            return ["{ uint32_t _ca, _cb, _cc, _cd; xbox_Cpuid(eax, ecx, &_ca, &_cb, &_cc, &_cd);",
+                    "  eax = _ca; ebx = _cb; ecx = _cc; edx = _cd; } /* cpuid */"]
+        if m == "stmxcsr" and len(ops) == 1:
+            return [_fmt_operand_write(ops[0], "0x1F80u") + "; /* stmxcsr: default control word */"]
+        if m == "ldmxcsr" and len(ops) == 1:
+            return [f"(void)({_fmt_operand_read(ops[0])}); /* ldmxcsr: control word not modelled */"]
 
         # ── Time stamp counter ──
         #
@@ -2050,6 +2079,20 @@ class Lifter:
         if nops == 1:
             # One operand: edx:eax = eax * ops[0]
             src = _fmt_operand_read(ops[0])
+            w = _operand_width(ops[0]) or 4
+            if w == 1:
+                # AX = AL * r/m8 (signed). EDX is not touched: a 32-bit lowering
+                # clobbered DL and zeroed Phantom Dust's save obfuscation.
+                return [
+                    f"{{ int16_t _r = (int16_t)((int16_t)(int8_t)LO8(eax) * (int16_t)(int8_t)({src}));",
+                    f"  SET_LO16(eax, (uint16_t)_r); }}"
+                ]
+            if w == 2:
+                # DX:AX = AX * r/m16 (signed)
+                return [
+                    f"{{ int32_t _r = (int32_t)(int16_t)LO16(eax) * (int32_t)(int16_t)({src});",
+                    f"  SET_LO16(eax, (uint16_t)_r); SET_LO16(edx, (uint16_t)((uint32_t)_r >> 16)); }}"
+                ]
             return [
                 f"{{ int64_t _r = (int64_t)(int32_t)eax * (int64_t)(int32_t){src};",
                 f"  eax = (uint32_t)_r; edx = (uint32_t)(_r >> 32); }}"
@@ -2070,6 +2113,21 @@ class Lifter:
         if len(ops) < 1:
             return [f"/* {m}: no operand */"]
         src = _fmt_operand_read(ops[0])
+        w = _operand_width(ops[0]) or 4
+        if w == 1:
+            if m == "mul":
+                return [f"{{ uint16_t _r = (uint16_t)((uint16_t)LO8(eax) * (uint16_t)(uint8_t)({src})); SET_LO16(eax, _r); }}"]
+            if m == "div":
+                return [f"{{ uint16_t _d = LO16(eax); uint8_t _s = (uint8_t)({src}); SET_LO8(eax, (uint8_t)(_d / _s)); SET_HI8(eax, (uint8_t)(_d % _s)); }}"]
+            if m == "idiv":
+                return [f"{{ int16_t _d = (int16_t)LO16(eax); int8_t _s = (int8_t)({src}); SET_LO8(eax, (uint8_t)(int8_t)(_d / _s)); SET_HI8(eax, (uint8_t)(int8_t)(_d % _s)); }}"]
+        if w == 2:
+            if m == "mul":
+                return [f"{{ uint32_t _r = (uint32_t)LO16(eax) * (uint32_t)(uint16_t)({src}); SET_LO16(eax, (uint16_t)_r); SET_LO16(edx, (uint16_t)(_r >> 16)); }}"]
+            if m == "div":
+                return [f"{{ uint32_t _d = ((uint32_t)LO16(edx) << 16) | LO16(eax); uint16_t _s = (uint16_t)({src}); SET_LO16(eax, (uint16_t)(_d / _s)); SET_LO16(edx, (uint16_t)(_d % _s)); }}"]
+            if m == "idiv":
+                return [f"{{ int32_t _d = (int32_t)(((uint32_t)LO16(edx) << 16) | LO16(eax)); int16_t _s = (int16_t)({src}); SET_LO16(eax, (uint16_t)(int16_t)(_d / _s)); SET_LO16(edx, (uint16_t)(int16_t)(_d % _s)); }}"]
         if m == "mul":
             return [
                 f"{{ uint64_t _r = (uint64_t)eax * (uint64_t){src};",

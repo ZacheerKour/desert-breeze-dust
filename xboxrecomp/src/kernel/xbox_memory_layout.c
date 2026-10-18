@@ -873,6 +873,7 @@ static void framebuffer_probe_tick(void)
     fflush(stderr);
 }
 
+extern int xbox_VblankHoldActive(void);   /* kernel_bridge.c */
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
@@ -880,6 +881,14 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
             volatile uint32_t *r =
                 (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
+            /* A vblank the timer thread has just raised must stay pending
+             * long enough for the D3D ISR and its DPC to read it. Clearing it
+             * within microseconds, as this loop spins, meant the DPC usually
+             * saw no vblank and skipped its callback, so the title's frame
+             * counter advanced 5-10 times a second instead of 60. */
+            if ((NV2A_ACK[i].offset == 0x000100 || NV2A_ACK[i].offset == 0x600100)
+                && xbox_VblankHoldActive())
+                continue;
             if (*r & NV2A_ACK[i].busy_mask) {
                 *r &= ~NV2A_ACK[i].busy_mask;
             }
@@ -3094,10 +3103,27 @@ static void contig_insert(int at, uint32_t addr, uint32_t size, int is_free)
     g_contig_block_count++;
 }
 
+/* The contiguous arena can be reclaimed without the rest of RECOMP_HEAP_RECLAIM:
+ * RECOMP_CONTIG_RECLAIM reuses freed blocks here only. Phantom Dust frees whole scenes'
+ * worth of GPU memory and runs a 64 MB window dry on the bump allocator. */
+extern uint32_t g_xbox_kernel_caller;
+static int contig_reclaim(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_CONTIG_RECLAIM");
+        /* On by default: titles that re-create their frame buffers (Phantom Dust does on every
+         * video-mode change) leak 3.6 MB each time otherwise and run the 64 MB window dry.
+         * RECOMP_CONTIG_RECLAIM=0 turns it off. */
+        on = (e && e[0] == '0') ? 0 : 1;
+    }
+    return on;
+}
+
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
 {
     uint32_t result = 0;
-    int reclaim = xbox_HeapReclaimEnabled();
+    int reclaim = contig_reclaim();
     int i;
 
     if (alignment < 4096) alignment = 4096;
@@ -3143,9 +3169,8 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
             return 0;
         }
         if (reclaim) {
-            if (result > g_contig_next)    /* the alignment gap stays usable */
-                contig_insert(g_contig_block_count, g_contig_next,
-                              result - g_contig_next, 1);
+            /* The alignment gap is not offered for reuse: only blocks the title has freed
+             * are. Reusing gaps broke boot in Phantom Dust (cause not found). */
             contig_insert(g_contig_block_count, result, size, 0);
         }
         g_contig_next = result + size;
@@ -3153,6 +3178,8 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
     if (reclaim)
         ReleaseSRWLockExclusive(&g_contig_lock);
 
+    { static int lg = -1; if (lg < 0) lg = getenv("RECOMP_CONTIG_LOG") ? 1 : 0;
+      if (lg) fprintf(stderr, "  [CONTIG] alloc size=0x%X align=0x%X -> 0x%08X next=0x%08X%c", size, alignment, result, g_contig_next, 10); }
     memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
     return result;
 }
@@ -3163,12 +3190,20 @@ int xbox_ContiguousFree(uint32_t addr)
 {
     int i, found = 0;
 
-    if (!xbox_HeapReclaimEnabled())
+    if (!contig_reclaim())
         return 0;
     AcquireSRWLockExclusive(&g_contig_lock);
     for (i = 0; i < g_contig_block_count; i++) {
         if (g_contig_blocks[i].addr != addr || g_contig_blocks[i].free)
             continue;
+        /* Only large blocks (frame buffers) go back. Small ones can still be named by
+         * queued GPU commands when the title frees them; reusing those scrambled
+         * pushbuffer calls and vertex pointers. RECOMP_CONTIG_MIN overrides (hex). */
+        {
+            static uint32_t minsz = 0xFFFFFFFFu;
+            if (minsz == 0xFFFFFFFFu) { const char *e = getenv("RECOMP_CONTIG_MIN"); minsz = e ? (uint32_t)strtoul(e, NULL, 16) : 0x100000u; }
+            if (g_contig_blocks[i].size < minsz) { found = 1; break; }
+        }
         g_contig_blocks[i].free = 1;
         found = 1;
         if (i + 1 < g_contig_block_count && g_contig_blocks[i + 1].free
@@ -3197,7 +3232,7 @@ uint32_t xbox_ContiguousBlockSize(uint32_t addr)
     uint32_t r = 0;
     int i;
 
-    if (!xbox_HeapReclaimEnabled())
+    if (!contig_reclaim())
         return 0;
     AcquireSRWLockShared(&g_contig_lock);
     for (i = 0; i < g_contig_block_count; i++)

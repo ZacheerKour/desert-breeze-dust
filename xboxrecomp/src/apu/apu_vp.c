@@ -19,6 +19,8 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <stdio.h>
+#include <stdlib.h>
 #include "apu_state.h"
 #include "fpconv.h"
 
@@ -57,6 +59,12 @@ static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
     stb_phys(address_space_memory, notify_offset, (uint8_t)status);
     stb_phys(address_space_memory, notify_offset - 1, 1);
 
+    {
+        static unsigned nn;
+        nn++;
+        if (getenv("RECOMP_APU_DIAG") && (nn <= 10 || nn % 200 == 0))
+            fprintf(stderr, "[APU] notify #%u voice 0x%X notifier %d status %d at phys 0x%X\n", nn, (unsigned)v, notifier, status, (unsigned)notify_offset);
+    }
     qatomic_or(&d->regs[NV_PAPU_ISTS],
                NV_PAPU_ISTS_FEVINTSTS | NV_PAPU_ISTS_FENINTSTS);
     d->set_irq = true;
@@ -186,6 +194,15 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     d->regs[NV_PAPU_FEDECPARAM] = argument;
     unsigned int selected_handle, list;
 
+    if (getenv("RECOMP_APU_DIAG") && (method == NV1BA0_PIO_VOICE_ON || method == NV1BA0_PIO_VOICE_OFF
+            || method == NV1BA0_PIO_VOICE_PAUSE || method == NV1BA0_PIO_VOICE_RELEASE)) {
+        static unsigned mn;
+        if (mn++ < 600)
+            fprintf(stderr, "[APU] fe %s arg 0x%X (voice 0x%X) list %u\n",
+                    method == NV1BA0_PIO_VOICE_ON ? "ON" : method == NV1BA0_PIO_VOICE_OFF ? "OFF" :
+                    method == NV1BA0_PIO_VOICE_PAUSE ? "PAUSE" : "RELEASE",
+                    (unsigned)argument, (unsigned)(argument & 0xFFFF), (unsigned)GET_MASK(d->regs[NV_PAPU_FEAV], NV_PAPU_FEAV_LST));
+    }
     switch (method) {
     case NV1BA0_PIO_VOICE_LOCK:
         voice_lock(d, (uint16_t)d->regs[NV_PAPU_FECV], argument & 1);
@@ -272,6 +289,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                            NV_PAVS_VOICE_CUR_ECNT_EFCOUNT, hold_time * 16);
         }
 
+        { static int vn; if (vn++ < 1500) fprintf(stderr, "[APU] voice 0x%04X ON (#%d)\n", (unsigned)selected_handle, vn); }
         voice_reset_filters(d, (uint16_t)selected_handle);
         voice_set_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_PAR_STATE,
                        NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 1);
@@ -312,6 +330,9 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         break;
 
     case NV1BA0_PIO_VOICE_PAUSE:
+        /* RECOMP_APU_NOPAUSE=1: experiment -- ignore pause requests. */
+        if ((argument & NV1BA0_PIO_VOICE_PAUSE_ACTION) && getenv("RECOMP_APU_NOPAUSE"))
+            break;
         voice_set_mask(d, (uint16_t)(argument & NV1BA0_PIO_VOICE_PAUSE_HANDLE),
                        NV_PAVS_VOICE_PAR_STATE, NV_PAVS_VOICE_PAR_STATE_PAUSED,
                        (argument & NV1BA0_PIO_VOICE_PAUSE_ACTION) != 0);
@@ -760,6 +781,20 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
     bool persist = voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_CFG_FMT,
                                   NV_PAVS_VOICE_CFG_FMT_PERSIST) != 0;
 
+    {
+        static unsigned seen[8]; static unsigned last_cbo[MCPX_HW_MAX_VOICES]; static int ln;
+        if (getenv("RECOMP_APU_DIAG") && v < MCPX_HW_MAX_VOICES) {
+            int first = !(seen[v >> 5] & (1u << (v & 31)));
+            if (first || (cbo != last_cbo[v] && (cbo == 0 || cbo >= ebo) && ln < 400)) {
+                ln++;
+                fprintf(stderr, "[APU] vcfg voice 0x%X %s stream %d loop %d persist %d paused %d ebo %u cbo %u lbo %u ba 0x%X stereo %d csz %u ssz %u\n",
+                        (unsigned)v, first ? "first" : "edge", (int)stream, (int)loop, (int)persist, (int)paused,
+                        ebo, cbo, lbo, ba, (int)stereo, container_size, sample_size);
+                seen[v >> 5] |= (1u << (v & 31));
+            }
+            last_cbo[v] = cbo;
+        }
+    }
     int ssl_index = 0, ssl_seg = 0, page = 0, count = 0;
     int seg_len = 0, seg_cs = 0, seg_spb = 0, seg_s = 0;
     hwaddr segment_offset = 0;
@@ -773,13 +808,17 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
     voice_set_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_STATE,
                    NV_PAVS_VOICE_PAR_STATE_NEW_VOICE, 0);
 
-    if (paused) return -1;
+    if (paused) {
+        { static unsigned pn; if (getenv("RECOMP_APU_DIAG") && pn++ < 20) fprintf(stderr, "[APU] vdbg paused voice 0x%X\n", (unsigned)v); }
+        return -1;
+    }
 
     if (stream) {
         if (!persist) {
             int eacur = voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_STATE,
                                        NV_PAVS_VOICE_PAR_STATE_EACUR);
             if (eacur < NV_PAVS_VOICE_PAR_STATE_EFCUR_RELEASE) {
+        { static unsigned dn; if (getenv("RECOMP_APU_DIAG") && dn++ < 60) fprintf(stderr, "[APU] vdbg %s voice 0x%X ssl_index %d seg %d count %d persist %d\n", "eacur-off", (unsigned)v, d->vp.ssl[v].ssl_index, d->vp.ssl[v].ssl_seg, d->vp.ssl[v].count[d->vp.ssl[v].ssl_index], (int)persist); }
                 voice_off(d, (uint16_t)v);
                 return -1;
             }
@@ -790,6 +829,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         ssl_seg = d->vp.ssl[v].ssl_seg;
         page = d->vp.ssl[v].base[ssl_index] + ssl_seg;
         count = d->vp.ssl[v].count[ssl_index];
+        { static unsigned dn; if (getenv("RECOMP_APU_DIAG") && dn++ < 60 && count == 0) fprintf(stderr, "[APU] vdbg count0 voice 0x%X ssl_index %d persist %d\n", (unsigned)v, ssl_index, (int)persist); }
 
         if (count == 0) {
             voice_set_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_OFFSET,
@@ -811,6 +851,17 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         segment_length = ldl_le_phys(address_space_memory, addr + 4);
         assert(segment_offset != 0);
         assert(segment_length != 0);
+        if (getenv("RECOMP_APU_DIAG")) {
+            static unsigned sn;
+            if (sn++ < 24 || sn % 2000 == 0) {
+                uint32_t w0 = ldl_le_phys(address_space_memory, segment_offset);
+                uint32_t w1 = ldl_le_phys(address_space_memory, segment_offset + 4);
+                uint32_t w2 = ldl_le_phys(address_space_memory, segment_offset + 8);
+                uint32_t w3 = ldl_le_phys(address_space_memory, segment_offset + 64);
+                fprintf(stderr, "[APU] stream seg #%u voice 0x%X off 0x%X len 0x%X first words %08X %08X %08X ... +64: %08X\n",
+                        sn, (unsigned)v, (unsigned)segment_offset, (unsigned)segment_length, w0, w1, w2, w3);
+            }
+        }
         seg_len = (segment_length >> 0) & 0xffff;
         seg_cs = (segment_length >> 16) & 3;
         seg_spb = (segment_length >> 18) & 0x1f;
@@ -921,6 +972,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 int next_index = (ssl_index + 1) % 2;
                 d->vp.ssl[v].ssl_index = next_index;
                 d->vp.ssl[v].ssl_seg = 0;
+        { static unsigned dn; if (getenv("RECOMP_APU_DIAG") && dn++ < 60) fprintf(stderr, "[APU] vdbg %s voice 0x%X ssl_index %d seg %d count %d persist %d\n", "list-done", (unsigned)v, d->vp.ssl[v].ssl_index, d->vp.ssl[v].ssl_seg, d->vp.ssl[v].count[d->vp.ssl[v].ssl_index], (int)persist); }
                 set_notify_status(d, v, MCPX_HW_NOTIFIER_SSLA_DONE + ssl_index,
                                   NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS);
             }
@@ -934,6 +986,21 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         }
     }
 
+    if (stream && getenv("RECOMP_APU_DIAG")) {
+        static unsigned frames, nz; static float peak;
+        int k;
+        for (k = 0; k < sample_count; k++) {
+            float a = samples[k][0] < 0 ? -samples[k][0] : samples[k][0];
+            if (a > peak) peak = a;
+        }
+        frames++;
+        if (frames % 4000 == 0) {
+            fprintf(stderr, "[APU] stream voice 0x%X fetched samples: peak %.4f over %u fetches (sample_count %d, container %u, ssz %u)\n",
+                    (unsigned)v, peak, frames, sample_count, container_size, sample_size);
+            peak = 0;
+        }
+        (void)nz;
+    }
     voice_set_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_OFFSET,
                    NV_PAVS_VOICE_PAR_OFFSET_CBO, cbo);
     return sample_count;

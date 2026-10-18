@@ -107,7 +107,11 @@ static DWORD xbox_access_to_win32(ACCESS_MASK Access)
 /* Convert Xbox share access to Win32 */
 static DWORD xbox_share_to_win32(ULONG Share)
 {
-    DWORD result = 0;
+    /* The host always shares fully. The recompiled title re-opened
+     * bgm_Title.stx thousands of times and got ERROR_SHARING_VIOLATION
+     * (the game then shows its disc-error screen); strict sharing on the
+     * host adds no safety for a read-only game directory. */
+    DWORD result = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
     if (Share & 0x01) result |= FILE_SHARE_READ;
     if (Share & 0x02) result |= FILE_SHARE_WRITE;
     if (Share & 0x04) result |= FILE_SHARE_DELETE;
@@ -521,11 +525,19 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
                 info->TotalAllocationUnits.QuadPart = total_bytes.QuadPart / cs;
                 info->AvailableAllocationUnits.QuadPart = free_bytes.QuadPart / cs;
+                /* Titles multiply units by the cluster size in 32 bits. A host
+                 * drive with hundreds of GB wraps that to garbage, and Phantom
+                 * Dust's save worker then retries its free-space check
+                 * forever. Report an original-Xbox-sized volume (under 4 GiB). */
+                if (info->TotalAllocationUnits.QuadPart > 250000)
+                    info->TotalAllocationUnits.QuadPart = 250000;       /* ~3.8 GiB */
+                if (info->AvailableAllocationUnits.QuadPart > 150000)
+                    info->AvailableAllocationUnits.QuadPart = 150000;   /* ~2.3 GiB */
             } else {
                 info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
                 info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
-                info->TotalAllocationUnits.QuadPart = 1048576;
-                info->AvailableAllocationUnits.QuadPart = 524288;
+                info->TotalAllocationUnits.QuadPart = 250000;
+                info->AvailableAllocationUnits.QuadPart = 150000;
             }
             IoStatusBlock->Status = STATUS_SUCCESS;
             IoStatusBlock->Information = sizeof(XBOX_FILE_FS_SIZE_INFORMATION);

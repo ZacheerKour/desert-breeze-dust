@@ -266,7 +266,7 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
      * wait. */
     if (getenv("RECOMP_APU_TRACE")) {
         static unsigned n;
-        if (n++ < 400) {
+        if (mmio_offset != 0x20010 && (mmio_offset < 0x202F8 || mmio_offset > 0x203FF) && n++ < 6000) {
             /* The value as well as the offset: finding which register carries
              * the command-block address means recognising the address when it
              * goes past, and an offset alone never shows it. */

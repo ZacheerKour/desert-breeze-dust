@@ -8,6 +8,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "apu_xaudio2.h"
 
@@ -25,7 +26,7 @@
 #define XA2_SAMPLE_RATE   48000
 #define XA2_CHANNELS      2
 #define XA2_BUF_SAMPLES   1024   /* ~21ms per submission */
-#define XA2_NUM_BUFS      3
+#define XA2_NUM_BUFS      6   /* ring: lead of 2-3 buffers plus room to catch up */
 
 static IXAudio2               *g_xa2 = NULL;
 static IXAudio2MasteringVoice *g_xa2_master = NULL;
@@ -137,8 +138,48 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
 
     if (!g_xa2_initialized || !g_xa2_source) return 0;
 
+    {   /* RECOMP_APU_DIAG: spacing between submissions (21.3 ms nominal) */
+        static LARGE_INTEGER lastq, fq; static unsigned cnt, over32, over43, over64; static double mx;
+        LARGE_INTEGER nq;
+        if (!fq.QuadPart) QueryPerformanceFrequency(&fq);
+        QueryPerformanceCounter(&nq);
+        if (lastq.QuadPart) {
+            double ms = (double)(nq.QuadPart - lastq.QuadPart) * 1000.0 / (double)fq.QuadPart;
+            cnt++; if (ms > 32) over32++; if (ms > 43) over43++; if (ms > 64) over64++; if (ms > mx) mx = ms;
+            if (cnt % 400 == 0 && getenv("RECOMP_APU_DIAG"))
+                fprintf(stderr, "[XA2] submit spacing over %u: >32ms %u, >43ms %u, >64ms %u, max %.0f ms%c", cnt, over32, over43, over64, mx, 10);
+        }
+        lastq = nq;
+    }
     IXAudio2SourceVoice_GetState(g_xa2_source, &state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
     if ((int)state.BuffersQueued >= XA2_NUM_BUFS) return 0;
+    {
+        static long n, empty, hist[8];
+        n++;
+        if (state.BuffersQueued < 8) hist[state.BuffersQueued]++;
+        if (state.BuffersQueued == 0) empty++;
+        if (n % 400 == 0 && getenv("RECOMP_APU_DIAG"))
+            fprintf(stderr, "[XA2] queue depth at submit: 0:%ld 1:%ld 2:%ld 3:%ld (underruns %ld of %ld)\n",
+                    hist[0], hist[1], hist[2], hist[3], empty, n);
+    }
+
+    /* Keep one buffer of lead. The producer runs at exactly real time, so the
+     * queue sat at depth 1 on every submit and any host scheduling hiccup
+     * emptied it (audible as a gap). When the queue is empty, prime it with a
+     * silent buffer first: ~21 ms of latency in exchange for jitter margin. */
+    if (state.BuffersQueued == 0) {
+        int prime;
+        for (prime = 0; prime < 2; prime++) {   /* ~43 ms of lead */
+            XAUDIO2_BUFFER sb;
+            int si = g_xa2_next_buf;
+            memset(g_xa2_bufs[si], 0, sizeof(g_xa2_bufs[si]));
+            memset(&sb, 0, sizeof(sb));
+            sb.AudioBytes = XA2_BUF_SAMPLES * XA2_CHANNELS * sizeof(int16_t);
+            sb.pAudioData = (const BYTE *)g_xa2_bufs[si];
+            if (SUCCEEDED(IXAudio2SourceVoice_SubmitSourceBuffer(g_xa2_source, &sb, NULL)))
+                g_xa2_next_buf = (si + 1) % XA2_NUM_BUFS;
+        }
+    }
 
     idx = g_xa2_next_buf;
     copy_samples = (num_samples > XA2_BUF_SAMPLES) ? XA2_BUF_SAMPLES : num_samples;

@@ -19,6 +19,7 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <stdlib.h>
 #include "apu_state.h"
 #include "apu.h"
 #include "apu_xaudio2.h"
@@ -76,6 +77,10 @@ extern uint32_t xbox_ContiguousAllocatedBytes(void);
 uint8_t *mcpx_apu_phys(uint64_t addr)
 {
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
+    /* 0x0B000000 + VA: a guest-heap buffer DirectSound addressed (see
+     * bridge_MmGetPhysicalAddress). */
+    if (a >= 0x0B000000u && a < 0x0F000000u)
+        return g_apu_ram_ptr + (a - 0x0B000000u);
     if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
         return g_apu_ram_ptr + a;
     if (a < xbox_ContiguousAllocatedBytes())
@@ -176,7 +181,10 @@ static void apu_deliver_irq(MCPXAPUState *d)
     qemu_mutex_lock(&d->lock);
 
     {
-        static unsigned n;
+        static unsigned n, total;
+        total++;
+        if (getenv("RECOMP_APU_DIAG") && total % 100 == 0)
+            { fprintf(stderr, "[APU] irq deliveries: %u\n", total); fflush(stderr); }
         if (n++ < 3) {
             fprintf(stderr, "[APU] interrupt delivered to 0x%08X -> %s\n",
                     routine, (g_eax & 1) ? "claimed" : "declined");
@@ -383,37 +391,82 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         return;
     }
 
-    /* XAudio2 path: render and submit a buffer */
+    /* XAudio2 path.
+     *
+     * frame_buf already holds this monitor period's 256 samples, written by
+     * the DSP stage for each of the eight 32-sample sub-frames. It used to be
+     * cleared here and refilled from the software mixer alone, which threw
+     * the voice processor's whole output away, and then 1024 samples were
+     * submitted per 256 produced. Now the period is kept, the software mixer
+     * and test tone are added on top, and the XAudio2 buffer is filled
+     * from successive periods. */
     if (xa2_is_active()) {
+        static int16_t stage[1024][2];
+        static int staged;
+        static int peak, nonsilent, total;
         int buf_size = xa2_get_buffer_size();
-        int16_t xa2_tmp[1024][2];  /* matches XA2_BUF_SAMPLES max */
-        int remaining = buf_size;
-        int out_offset = 0;
+        int n = MIXER_FRAME_SAMPLES;
 
-        while (remaining > 0) {
-            int chunk = (remaining < MIXER_FRAME_SAMPLES) ? remaining : MIXER_FRAME_SAMPLES;
+        if (g_test_tone.active && !g_audio_muted) {
+            for (int i = 0; i < n; i++) {
+                int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
+                d->monitor.frame_buf[i][0] = s;
+                d->monitor.frame_buf[i][1] = s;
+                g_test_tone.phase += g_test_tone.phase_inc;
+                if (g_test_tone.phase >= 2.0 * M_PI)
+                    g_test_tone.phase -= 2.0 * M_PI;
+            }
+        }
+        if (!g_audio_muted)
+            mixer_render(d->monitor.frame_buf, n);
+        else
             memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
 
-            if (g_test_tone.active && !g_audio_muted) {
-                for (int i = 0; i < chunk; i++) {
-                    int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
-                    d->monitor.frame_buf[i][0] = s;
-                    d->monitor.frame_buf[i][1] = s;
-                    g_test_tone.phase += g_test_tone.phase_inc;
-                    if (g_test_tone.phase >= 2.0 * M_PI)
-                        g_test_tone.phase -= 2.0 * M_PI;
-                }
-            }
-
-            if (!g_audio_muted)
-                mixer_render(d->monitor.frame_buf, chunk);
-
-            memcpy(xa2_tmp + out_offset, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
-            out_offset += chunk;
-            remaining -= chunk;
+        for (int i = 0; i < n; i++) {
+            int a = d->monitor.frame_buf[i][0];
+            if (a < 0) a = -a;
+            if (a > peak) peak = a;
+            if (a) { nonsilent++; break; }
+        }
+        total++;
+        if (total >= 400) {
+            if (getenv("RECOMP_APU_DIAG"))
+                fprintf(stderr, "[APU] output: %d/%d periods non-silent, peak %d\n",
+                        nonsilent, total, peak);
+            total = nonsilent = peak = 0;
         }
 
-        xa2_submit_samples((const int16_t *)xa2_tmp, buf_size);
+        if (staged + n > buf_size) n = buf_size - staged;
+        memcpy(&stage[staged][0], d->monitor.frame_buf, n * 2 * sizeof(int16_t));
+        staged += n;
+        if (staged >= buf_size) {
+            /* A full queue refuses the buffer; dropping it keeps the guest
+             * clock, not the host's, in charge of pacing. */
+            static long sub_ok, sub_drop, produced;
+            static LARGE_INTEGER q0, qf;
+            static FILE *wav;
+            static unsigned wav_bytes;
+            int ok = xa2_submit_samples(&stage[0][0], buf_size);
+            if (ok) sub_ok++; else sub_drop++;
+            produced += buf_size;
+            if (!qf.QuadPart) { QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&q0); }
+            if (getenv("RECOMP_APU_WAV") && (!wav || wav_bytes < 48000u*4*60)) {
+                if (!wav) {
+                    unsigned char h[44] = {'R','I','F','F',0,0,0,0,'W','A','V','E','f','m','t',' ',16,0,0,0,1,0,2,0,
+                        0x80,0xBB,0,0,0,0x70,0x02,0,4,0,16,0,'d','a','t','a',0,0,0,0};
+                    wav = fopen(getenv("RECOMP_APU_WAV"), "wb");
+                    if (wav) fwrite(h, 1, 44, wav);
+                }
+                if (wav) { fwrite(stage, 4, buf_size, wav); wav_bytes += buf_size * 4; fflush(wav); }
+            }
+            if ((sub_ok + sub_drop) % 200 == 0 && getenv("RECOMP_APU_DIAG")) {
+                LARGE_INTEGER qn; QueryPerformanceCounter(&qn);
+                double sec = (double)(qn.QuadPart - q0.QuadPart) / (double)qf.QuadPart;
+                fprintf(stderr, "[APU] rate: produced %.0f samples/s (48000 = real time), submitted %ld dropped %ld\n",
+                        sec > 0 ? produced / sec : 0.0, sub_ok, sub_drop);
+            }
+            staged = 0;
+        }
         return;
     }
 
@@ -483,8 +536,11 @@ static void throttle(MCPXAPUState *d)
 
     int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
 
+    /* Catch up when the thread was delayed: re-anchoring to 'now' after every late wake
+     * threw away the samples of the delay, heard as stutter whenever the host was busy.
+     * Only re-anchor after a long stall (~250 ms), when catching up would flood the queue. */
     if (d->next_frame_time_us == 0 ||
-        now_us - d->next_frame_time_us > EP_FRAME_US) {
+        now_us - d->next_frame_time_us > 6 * EP_FRAME_US) {
         d->next_frame_time_us = now_us;
     }
 
@@ -544,6 +600,11 @@ static void se_frame(MCPXAPUState *d)
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+#if defined(_WIN32)
+    /* Audio must not wait behind the renderer: finer timer ticks and a higher priority. */
+    timeBeginPeriod(1);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#endif
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {
@@ -579,6 +640,7 @@ static void *mcpx_apu_frame_thread(void *arg)
             se_frame(d);
         } else {
             /* Lightweight: just monitor frame (test tone + software mixer) */
+            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
             mcpx_apu_monitor_frame(d);
             d->ep_frame_div++;
         }

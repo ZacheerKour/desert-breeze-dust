@@ -3181,11 +3181,21 @@ class BatchTranslator:
             stub_lines.append(
                 " * esp off by N on every call. */")
             stub_lines.append("")
+            # A stub silently skips whatever the guest meant to run there, so say so
+            # the first time each one is reached.
+            stub_lines.append("#include <stdio.h>")
+            stub_lines.append("static void recomp_stub_reached(uint32_t va)")
+            stub_lines.append("{")
+            stub_lines.append("    static uint32_t seen[256]; static int n; int i;")
+            stub_lines.append("    for (i = 0; i < n; i++) if (seen[i] == va) return;")
+            stub_lines.append("    if (n < 256) { seen[n++] = va; fprintf(stderr, \"[STUB] unresolved call target 0x%08X reached\\n\", (unsigned)va); }")
+            stub_lines.append("}")
+            stub_lines.append("")
             for addr in sorted(unresolved):
                 popped = self.translator._stub_ret_bytes(addr)
                 note = (f"ret {popped}" if popped else "not detected")
                 stub_lines.append(
-                    f"void {unresolved[addr]}(void) {{ g_esp += {4 + popped}; "
+                    f"void {unresolved[addr]}(void) {{ recomp_stub_reached(0x{addr:08X}u); g_esp += {4 + popped}; "
                     f"/* 0x{addr:08X}: {note} */ }}"
                 )
             stub_lines.append("")
