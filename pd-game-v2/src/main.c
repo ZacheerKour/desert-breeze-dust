@@ -109,6 +109,8 @@ static int s_fnw_n;
 volatile uint32_t g_wfn_va[4];
 volatile uint32_t g_wfn_last[4];
 volatile int g_wfn_n;
+volatile uint32_t g_fl_va[16]; volatile int g_fl_n;
+volatile DWORD g_fo_until; volatile uint32_t g_fo_dst, g_fo_src; volatile float g_fo_d[3];
 static uint32_t s_wfn_ring[16]; static unsigned s_wfn_rp;
 void recomp_fn_watch_hit(uint32_t va)
 {
@@ -143,6 +145,26 @@ void recomp_fn_watch_hit(uint32_t va)
         if (g_pd_quest_phase == 2) {
             static uint8_t seen[0x400000]; static unsigned nq;
             if (va < 0x400000 && !seen[va]) { seen[va] = 1; if (nq++ < 6000) fprintf(stderr, "[QF] %06X%c", (unsigned)va, 10); }
+        }
+        if (g_fo_until) {
+            /* pd-nre: "follow <dst> <src> <dx> <dy> <dz> <ms>": for <ms> milliseconds every guest function entry rewrites the
+             * position of actor <dst> (+0x90/+0xD0) to <src>'s position plus an offset, so an enemy can be held at a known spot */
+            if ((int)(GetTickCount() - g_fo_until) < 0) {
+                int j; float p[3];
+                memcpy(p, (uint8_t *)g_xbox_mem_offset + g_fo_src + 0x90, 12);
+                for (j = 0; j < 3; j++) p[j] += g_fo_d[j];
+                memcpy((uint8_t *)g_xbox_mem_offset + g_fo_dst + 0x90, p, 12);
+                memcpy((uint8_t *)g_xbox_mem_offset + g_fo_dst + 0xD0, p, 12);
+            } else g_fo_until = 0;
+        }
+        if (g_fl_n) {
+            /* pd-nre: "fnlog <hex>" console command: log every entry of up to 16 guest functions with the first stack args */
+            int k; static unsigned nfl;
+            for (k = 0; k < g_fl_n; k++) if (va == g_fl_va[k] && nfl < 6000) {
+                uint32_t w[6]; int j; nfl++;
+                for (j = 0; j < 6; j++) memcpy(&w[j], (uint8_t *)g_xbox_mem_offset + g_esp + j * 4u, 4);
+                fprintf(stderr, "[FL] %06X t=%lu esp=%08X ret=%08X a=%08X %08X %08X %08X %08X%c", (unsigned)va, (unsigned long)GetTickCount(), (unsigned)g_esp, (unsigned)w[0], (unsigned)w[1], (unsigned)w[2], (unsigned)w[3], (unsigned)w[4], (unsigned)w[5], 10);
+            }
         }
         if (g_wfn_n) {
             int k;
@@ -284,7 +306,7 @@ static DWORD WINAPI pd_mem_live(LPVOID unused)
             fseek(f, consumed, SEEK_SET);
             while (fgets(line, sizeof line, f)) {
                 size_t n = strlen(line);
-                unsigned a = 0, v = 0; int sz = 4, k;
+                unsigned a = 0, v = 0; int sz = 4, k; float fd[3];
                 if (n == 0 || line[n - 1] != '\n') break;      /* incomplete line: read it next time */
                 consumed += (long)n;
                 if (sscanf(line, "poke %x %x %d", &a, &v, &sz) >= 2 && (sz == 1 || sz == 2 || sz == 4)) {
@@ -328,6 +350,15 @@ static DWORD WINAPI pd_mem_live(LPVOID unused)
                      * distorted by it (the RECOMP_ABI_CHECK call macro still tests the flag) */
                     g_fn_watch_on = sz;
                     fprintf(stderr, "[MEM] fn watch mode -> %d%c", sz, 10);
+                } else if (sscanf(line, "follow %x %x %f %f %f %d", &a, &v, &fd[0], &fd[1], &fd[2], &sz) == 6) {
+                    extern volatile DWORD g_fo_until; extern volatile uint32_t g_fo_dst, g_fo_src; extern volatile float g_fo_d[3];
+                    g_fo_dst = a; g_fo_src = v; g_fo_d[0] = fd[0]; g_fo_d[1] = fd[1]; g_fo_d[2] = fd[2];
+                    g_fo_until = GetTickCount() + (DWORD)sz; if (!g_fo_until) g_fo_until = 1;
+                    fprintf(stderr, "[MEM] follow dst=%08X src=%08X d=%.1f,%.1f,%.1f for %d ms%c", a, v, fd[0], fd[1], fd[2], sz, 10);
+                } else if (sscanf(line, "fnlog %x", &a) == 1) {
+                    extern volatile uint32_t g_fl_va[16]; extern volatile int g_fl_n;
+                    if (a == 0) g_fl_n = 0; else if (g_fl_n < 16) g_fl_va[g_fl_n++] = a;
+                    fprintf(stderr, "[MEM] fnlog %08X (n=%d)%c", a, g_fl_n, 10);
                 } else if (sscanf(line, "wfn %x", &a) == 1 && g_wfn_n < 4) {
                     memcpy((void *)&g_wfn_last[g_wfn_n], (uint8_t *)g_xbox_mem_offset + a, 4);
                     g_wfn_va[g_wfn_n] = a; g_wfn_n++;

@@ -2638,6 +2638,24 @@ class Lifter:
             self._read_jump_table_backward(table_va - 4))
         if len(below) >= 2:
             return below
+        # pd-nre: last resort, after every multi-arm reading above failed. A
+        # one-arm `jmp [reg*4 + table]` whose only arm is inside this function
+        # is a switch, not a function-pointer tail call. MSVC emits a
+        # byte-indexed two-level dispatch even when every case maps to one
+        # label:
+        #
+        #     movzx ecx, byte [eax + IdxTbl]   ; IdxTbl = 00 00 00 00 00 00
+        #     jmp   [ecx*4 + ArmTbl]           ; ArmTbl = { LabelInsideThisFunc }
+        #
+        # The two-arm rule turned the jmp into RECOMP_ITAIL(<interior
+        # address>) + return, so everything after the label never ran.
+        # Phantom Dust's skill-effect setup (sub_00133DB0) lost its collision
+        # flag bits (0x200..0x8000) that way and no player attack ever hit an
+        # actor. A tail call to an address inside the caller (other than its
+        # own entry) cannot be a real call, so the single arm is a goto.
+        if (len(inside) == 1 and op.mem_index and op.mem_scale == 4
+                and not op.mem_base and inside[0] != self.func_start):
+            return inside
         return []
 
     def _leading_arms(self, targets):
