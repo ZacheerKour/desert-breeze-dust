@@ -92,6 +92,101 @@ int xbox_IrqlRaisedCount(void)
     return (int)InterlockedCompareExchange(&g_irql_raised_count, 0, 0);
 }
 
+
+/* pd-ojl (2026-10-18): raising IRQL to DISPATCH_LEVEL must exclude every other thread that is raised, and the ISRs.
+ *
+ * On the Xbox's single CPU, KeRaiseIrql(DISPATCH) is the lock: no other thread is scheduled and no DPC/ISR of a
+ * lower level runs until the level drops. The XPP USB driver relies on exactly that -- its transfer-descriptor
+ * free list (alloc: sub_0025C75B, free: sub_0025B489) and the ED queues are edited with nothing but a raised
+ * IRQL. Here every guest thread, the DPC thread and the OHCI ISR thread are real host threads running in parallel,
+ * and raising IRQL only changed a per-thread number. Two of them in the driver at once popped the same free TD
+ * (captured: one TD was the dummy tail of both the pad's interrupt ED and the control ED, then the ED head
+ * followed a freed TD's NextTD = 0xFFFFFFFF: pad polling dead, or a write to guest 0xFFFFFFFF, "pd-dz0").
+ *
+ * Fix: a single recursive "CPU" lock taken when a thread crosses PASSIVE/APC -> DISPATCH+ (guest raise, DPC, ISR)
+ * and released when it crosses back. A thread that cannot get it for 200 ms gives up and runs unguarded (counted),
+ * so a leaked raise cannot freeze the title the way the hold-off logic was written to survive.
+ * RECOMP_IRQL_LOCK=0 disables it (the contention is still counted) for A/B tests. */
+static CRITICAL_SECTION g_cpu_cs;
+static volatile LONG g_cpu_cs_init = 0;          /* 0 = no, 1 = initialising, 2 = ready */
+static XBOX_THREAD_LOCAL int t_cpu_held = 0;     /* this thread's lock acquisitions through irql_track */
+static XBOX_THREAD_LOCAL int t_isr_owner = 0;
+static volatile LONG g_isr_overlaps = 0, g_isr_waits = 0, g_isr_giveups = 0, g_isr_begins = 0, g_isr_deferred = 0;
+static int s_cpu_lock_on = -1;
+
+static void cpu_lock_init(void)
+{
+    if (InterlockedCompareExchange(&g_cpu_cs_init, 1, 0) == 0) {
+        const char *e = getenv("RECOMP_IRQL_LOCK");
+        s_cpu_lock_on = (e && e[0] == '0') ? 0 : 1;
+        InitializeCriticalSection(&g_cpu_cs);
+        InterlockedExchange(&g_cpu_cs_init, 2);
+    }
+    while (InterlockedCompareExchange(&g_cpu_cs_init, 0, 0) != 2)
+        SwitchToThread();
+}
+
+/* Thread crosses up to DISPATCH_LEVEL or above. */
+static void cpu_lock_enter(void)
+{
+    DWORD t0 = 0;
+    int contended = 0;
+
+    cpu_lock_init();
+    for (;;) {
+        if (TryEnterCriticalSection(&g_cpu_cs)) {
+            if (!s_cpu_lock_on) { LeaveCriticalSection(&g_cpu_cs); return; }
+            t_cpu_held++;
+            return;
+        }
+        if (!contended) { contended = 1; InterlockedIncrement(&g_isr_overlaps); }
+        if (!s_cpu_lock_on)
+            return;
+        if (!t0) { t0 = GetTickCount(); if (!t0) t0 = 1; InterlockedIncrement(&g_isr_waits); }
+        if (GetTickCount() - t0 > 200) {
+            InterlockedIncrement(&g_isr_giveups);
+            return;                                   /* run unguarded rather than wedge the guest */
+        }
+        SwitchToThread();
+    }
+}
+
+static void cpu_lock_leave(void)
+{
+    if (t_cpu_held > 0) {
+        t_cpu_held--;
+        LeaveCriticalSection(&g_cpu_cs);
+    }
+}
+
+/* Called by the controller thread right before it runs the guest ISR. Returns 0 if another thread is raised (try
+ * again on the next tick), unless force is set (the old "deliver anyway after the hold-off" escape). */
+int xbox_IrqlTryBeginIsr(int force)
+{
+    cpu_lock_init();
+    if (s_cpu_lock_on && TryEnterCriticalSection(&g_cpu_cs)) {
+        t_cpu_held++;
+    } else if (!force && (s_cpu_lock_on || xbox_IrqlBlocksInterrupts())) {
+        InterlockedIncrement(&g_isr_deferred);
+        return 0;
+    }
+    t_isr_owner = 1;
+    InterlockedIncrement(&g_isr_begins);
+    return 1;
+}
+
+void xbox_IrqlEndIsr(void)
+{
+    t_isr_owner = 0;
+    cpu_lock_leave();
+}
+
+void xbox_IrqlGateStats(long *begins, long *deferred, long *overlaps, long *waits, long *giveups)
+{
+    *begins = (long)g_isr_begins; *deferred = (long)g_isr_deferred; *overlaps = (long)g_isr_overlaps;
+    *waits = (long)g_isr_waits; *giveups = (long)g_isr_giveups;
+}
+
 static int  s_trace = -1;
 static volatile LONG s_traced = 0;
 
@@ -176,8 +271,8 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
     if (now == was)
         return;
 
-    d = now ? InterlockedIncrement(&g_irql_raised_count)
-            : InterlockedDecrement(&g_irql_raised_count);
+    if (now) { cpu_lock_enter(); d = InterlockedIncrement(&g_irql_raised_count); }
+    else { d = InterlockedDecrement(&g_irql_raised_count); cpu_lock_leave(); }
     InterlockedIncrement(&s_transitions);
     if (now)
         irql_holder_add(ra);

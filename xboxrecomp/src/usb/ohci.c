@@ -666,6 +666,41 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
     return TD_CC_NOERROR;
 }
 
+
+/* pd-ojl diagnostics (2026-10-18): a ring of the last controller-side events on the interrupt EDs, dumped with a
+ * guest TD pool snapshot the first times a queued TD whose NextTD is 0xFFFFFFFF (a TD the XPP driver has freed)
+ * is found at the head of an ED. The anomaly is recorded at the moment it first appears, not minutes later. */
+typedef struct { unsigned long tick; unsigned char kind; uint32_t ed, a, b, c, d; } OhciEv;
+#define OHCI_EV_N 1024
+static OhciEv s_ev[OHCI_EV_N];
+static uint32_t s_diag_ed;
+static volatile unsigned long s_last_pad_retire;
+static unsigned s_ev_n;
+static void ev_add(unsigned char kind, uint32_t ed, uint32_t a, uint32_t b, uint32_t c, uint32_t d)
+{
+    OhciEv *e = &s_ev[s_ev_n++ % OHCI_EV_N];
+    e->tick = (unsigned long)GetTickCount(); e->kind = kind; e->ed = ed; e->a = a; e->b = b; e->c = c; e->d = d;
+}
+static void ev_dump(const char *why, uint32_t ed)
+{
+    static unsigned dumps;
+    unsigned i, n = s_ev_n < OHCI_EV_N ? s_ev_n : OHCI_EV_N;
+    uint32_t t;
+    if (dumps++ >= 8) return;
+    fprintf(stderr, "  [OHCIDIAG] ==== %s ED %08X (#%u, %u events) ====%c", why, ed, dumps, n, 10);
+    { long b, d, o, w, g; xbox_IrqlGateStats(&b, &d, &o, &w, &g);
+      fprintf(stderr, "  [OHCIDIAG] isr gate: begins=%ld deferred=%ld guest-raise-overlaps=%ld waits=%ld giveups=%ld%c", b, d, o, w, g, 10); }
+    fprintf(stderr, "  [OHCIDIAG] ED words: %08X %08X %08X %08X%c", rd32(ed), rd32(ed + 4), rd32(ed + 8), rd32(ed + 12), 10);
+    for (i = 0; i < n; i++) {
+        OhciEv *e = &s_ev[(s_ev_n - n + i) % OHCI_EV_N];
+        fprintf(stderr, "  [OHCIDIAG] t=%lu k=%c ed=%08X %08X %08X %08X %08X%c", e->tick, e->kind, e->ed, e->a, e->b, e->c, e->d, 10);
+    }
+    for (t = 0x2E00; t < 0x3000; t += 0x20)
+        fprintf(stderr, "  [OHCIDIAG] TD %04X: %08X %08X %08X %08X | %08X %08X %08X %08X%c", t, rd32(t), rd32(t + 4),
+                rd32(t + 8), rd32(t + 12), rd32(t + 16), rd32(t + 20), rd32(t + 24), rd32(t + 28), 10);
+    fflush(stderr);
+}
+
 /* Walk the control list once. Returns 1 if anything completed. */
 /* Walk one list of endpoint descriptors, moving whatever is queued on each.
  *
@@ -693,6 +728,8 @@ static int ohci_walk_eds(OhciController *hc, uint32_t ed, uint32_t *done_head)
                 fflush(stderr);
             }
         }
+        if (head != tail && (head & ED_PTR_MASK) != tail)
+            ev_add('V', ed, head, tail, rd32((head & ED_PTR_MASK) + 8), ed0);
         if (ed0 & ED_SKIP) { ed = rd32(ed + 12) & ED_PTR_MASK; continue; }
         if (head & ED_HEAD_HALT) { ed = rd32(ed + 12) & ED_PTR_MASK; continue; }
 
@@ -710,6 +747,8 @@ static int ohci_walk_eds(OhciController *hc, uint32_t ed, uint32_t *done_head)
              * TD for the next pass instead. */
             if (next == ED_PTR_MASK) {
                 static unsigned bad;
+                ev_add('G', ed, td, head, tail, next);
+                ev_dump("NextTD 0xFFFFFFFF at head", ed);
                 if (bad++ < 12) {
                     fprintf(stderr, "  [OHCI%d] ED %08X: TD %08X (head %08X tail %08X) has NextTD 0xFFFFFFFF; "
                                     "left for the next pass (#%u)\n", hc->index, ed, td, head, tail, bad);
@@ -718,6 +757,8 @@ static int ohci_walk_eds(OhciController *hc, uint32_t ed, uint32_t *done_head)
                 break;
             }
             cc = ohci_do_td(hc, ed0, td);
+            ev_add('R', ed, td, next, cc, rd32(td));
+            if (((ed0 >> 7) & 0xFu) != 0) s_last_pad_retire = (unsigned long)GetTickCount();
 
             /* Report the outcome where the driver reads it, then put the
              * descriptor on the done queue, newest first. */
@@ -735,6 +776,7 @@ static int ohci_walk_eds(OhciController *hc, uint32_t ed, uint32_t *done_head)
         /* Write HeadP back only if this pass moved it, and only if the driver has not changed it since it was read
          * (compare-and-swap on the guest dword): an unconditional store put a stale head over the driver's. */
         if (head != head0) {
+            ev_add('H', ed, head0, head, tail, rd32(ed + 8));
             uint32_t *hp = (uint32_t *)guest_ptr(ed + 8, 4);
             if (hp) {
                 if ((uint32_t)InterlockedCompareExchange((volatile LONG *)hp, (LONG)head, (LONG)head0) != head0) {
@@ -758,6 +800,10 @@ static void ohci_publish_done(OhciController *hc, uint32_t done_head)
 {
     uint32_t hcca = hc->reg[HcHCCA / 4];
 
+    {
+        uint32_t t = done_head; int k = 0;
+        while (t && k < 8) { ev_add('D', 0, t, rd32(t + 8), 0, 0); t = rd32(t + 8) & ED_PTR_MASK; k++; }
+    }
     if (hcca)
         wr32(hcca + HCCA_DONE_HEAD, done_head);
     hc->reg[HcDoneHead / 4] = done_head;
@@ -809,6 +855,7 @@ static int ohci_run_periodic_list(OhciController *hc, uint32_t *done_head)
                     "info=%08X\n", hc->index, slot, ed, rd32(ed));
             fflush(stderr);
         }
+        s_diag_ed = ed;
         completed += ohci_walk_eds(hc, ed, done_head);
     }
 
@@ -950,7 +997,22 @@ static void ohci_raise(OhciController *hc, uint32_t source)
     if (!(enable & INTR_MIE) || !(enable & source))
         return;
 
+    {
+        uint32_t e = s_diag_ed;
+        if (e) ev_add('i', e, rd32(e + 8), rd32(e + 4), rd32((rd32(e + 8) & ED_PTR_MASK) + 8), source);
+    }
     claimed = ohci_call_isr(hc);
+    {
+        uint32_t e = s_diag_ed;
+        if (e) {
+            uint32_t h = rd32(e + 8), t = rd32(e + 4) & ED_PTR_MASK, n = rd32((h & ED_PTR_MASK) + 8);
+            ev_add('I', e, h, t, n, source);
+            if ((h & ED_PTR_MASK) != t && n == 0xFFFFFFFFu) {
+                ev_add('A', e, h, t, n, source);
+                ev_dump("after ISR: head TD freed but ED head not advanced", e);
+            }
+        }
+    }
     if (s_trace || claimed >= 0) {
         static unsigned n;
         if (n++ < 20) {
@@ -1065,8 +1127,46 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
         uint32_t pass_done = 0;     /* this pass's done queue, newest first */
 
         Sleep(OHCI_TICK_MS);
+        {   /* pd-ojl: one line a minute with the ISR-gate counters, so a long run records how often a guest thread tried
+             * to raise IRQL while the ISR was running. */
+            static unsigned long last_gate;
+            unsigned long now_g = (unsigned long)GetTickCount();
+            if (now_g - last_gate >= 60000ul) {
+                long b, d, o, w, g;
+                if (last_gate) {
+                    xbox_IrqlGateStats(&b, &d, &o, &w, &g);
+                    fprintf(stderr, "  [OHCIGATE] t=%lu begins=%ld deferred=%ld guest-raise-overlaps=%ld waits=%ld giveups=%ld%c",
+                            now_g, b, d, o, w, g, 10);
+                    fflush(stderr);
+                }
+                last_gate = now_g;
+            }
+        }
         control = hc->reg[HcControl / 4];
         enable  = hc->reg[HcInterruptEnable / 4];
+        {   /* pd-ojl watchdog: the pad was plugged and its interrupt endpoint has retired nothing for 3 s. Print the
+             * whole controller state once (then every 60 s, five times) so a dead pad is diagnosed on the spot. */
+            static unsigned long last_dump;
+            static unsigned ndead;
+            unsigned long nw = (unsigned long)GetTickCount();
+            if (plugged && s_last_pad_retire && nw - s_last_pad_retire > 3000ul && ndead < 5
+                    && (!last_dump || nw - last_dump > 60000ul)) {
+                uint32_t hcca = hc->reg[HcHCCA / 4], e = s_diag_ed;
+                long b, d, o, w, g;
+                xbox_IrqlGateStats(&b, &d, &o, &w, &g);
+                ndead++; last_dump = nw;
+                fprintf(stderr, "  [OHCIDEAD] #%u no pad TD retired for %lu ms: HcControl=%08X IntStatus=%08X IntEnable=%08X "
+                        "DoneHead=%08X HCCA.done=%08X irql_depth=%d gate begins=%ld deferred=%ld overlaps=%ld waits=%ld giveups=%ld%c",
+                        ndead, nw - s_last_pad_retire, control, hc->reg[HcInterruptStatus / 4], enable,
+                        hc->reg[HcDoneHead / 4], hcca ? rd32(hcca + HCCA_DONE_HEAD) : 0, xbox_IrqlRaisedCount(), b, d, o, w, g, 10);
+                if (e) {
+                    uint32_t h = rd32(e + 8) & ED_PTR_MASK;
+                    fprintf(stderr, "  [OHCIDEAD] pad ED %08X: %08X %08X %08X %08X; head TD %08X: %08X %08X %08X %08X%c", e,
+                            rd32(e), rd32(e + 4), rd32(e + 8), rd32(e + 12), h, rd32(h), rd32(h + 4), rd32(h + 8), rd32(h + 12), 10);
+                }
+                ev_dump("watchdog: pad dead", e);
+            }
+        }
 
         /* Operational is HCFS == 10b in bits 7:6. Interrupting a controller
          * the driver has not started yet is not a test of anything. */
@@ -1226,7 +1326,10 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * asserted anyway. The common case still holds the ISR out of the
          * guest's critical section; the pathological case costs a delay
          * instead of the device. */
-        if (xbox_IrqlBlocksInterrupts() && ++held_off <= OHCI_IRQ_HOLDOFF) {
+        /* pd-ojl: the check and the delivery are one atomic step (xbox_IrqlTryBeginIsr), and a guest thread that wants
+         * to raise IRQL while the ISR runs waits for it (see kernel_hal.c). */
+        if (!xbox_IrqlTryBeginIsr(held_off > OHCI_IRQ_HOLDOFF)) {
+            ++held_off;
             if (!held_off_warned) {
                 held_off_warned = 1;
                 fprintf(stderr, "  [OHCI%d] irq held off by guest IRQL "
@@ -1263,6 +1366,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
                                 "with no acknowledgement; stopping\n",
                         hc->index, status);
                 fflush(stderr);
+                xbox_IrqlEndIsr();
                 break;
             }
         } else {
@@ -1271,6 +1375,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             repeats     = 0;
         }
         ohci_raise(hc, status);
+        xbox_IrqlEndIsr();
     }
     return 0;
 }
@@ -1410,5 +1515,7 @@ void xbox_OhciReport(void)
                 s_hc[i].reg[HcControl / 4],
                 s_hc[i].reg[HcInterruptStatus / 4],
                 s_hc[i].reg[HcRhPortStatus1 / 4]);
+    { long b, d, o, w, g; xbox_IrqlGateStats(&b, &d, &o, &w, &g);
+      fprintf(stderr, "  [OHCI] isr gate: begins=%ld deferred=%ld guest-raise-overlaps=%ld waits=%ld giveups=%ld%c", b, d, o, w, g, 10); }
     fflush(stderr);
 }
