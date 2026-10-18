@@ -99,6 +99,8 @@ static BOOL load_xbe(const char *path, void **out_data, size_t *out_size);
 volatile int g_fn_watch_on;
 volatile int g_fn_watch_arm;
 volatile int g_pd_stage_req = -1;
+volatile int g_pd_quest_req = -1;
+extern volatile int g_pd_quest_phase;
 static struct { uint32_t va; unsigned n; } s_fnw[4096];
 static int s_fnw_n;
 void recomp_fn_watch_hit(uint32_t va)
@@ -110,6 +112,15 @@ void recomp_fn_watch_hit(uint32_t va)
          * carried out at the next entry of the per-frame state machine sub_000DEB50. */
         extern void pd_inject_stage(int stage);
         extern volatile int g_pd_stage_req;
+        if (g_pd_quest_phase == 2) {
+            static uint8_t seen[0x400000]; static unsigned nq;
+            if (va < 0x400000 && !seen[va]) { seen[va] = 1; if (nq++ < 6000) fprintf(stderr, "[QF] %06X%c", (unsigned)va, 10); }
+        }
+        if ((va == 0xDE980u || va == 0xB83B0u) && (g_pd_quest_req >= 0 || g_pd_quest_phase >= 1)) {
+            extern void pd_quest_step(int req);
+            int q = g_pd_quest_req; g_pd_quest_req = -1;
+            pd_quest_step(q);
+        }
         if (va == 0xDE980u && g_pd_stage_req >= 0) {
             int n = g_pd_stage_req; g_pd_stage_req = -1;
             fprintf(stderr, "[STAGE] injecting stage %d%c", n, 10);
@@ -236,6 +247,9 @@ static DWORD WINAPI pd_mem_live(LPVOID unused)
                     fprintf(stderr, "[MEM] peek %08X:", a);
                     for (k = 0; k < sz; k++) fprintf(stderr, " %08X", m[k]);
                     fprintf(stderr, "\n");
+                } else if (sscanf(line, "quest %d", &sz) == 1) {
+                    g_pd_quest_req = sz;
+                    fprintf(stderr, "[MEM] quest request %d%c", sz, 10);
                 } else if (sscanf(line, "stage %d", &sz) == 1) {
                     g_pd_stage_req = sz;
                     fprintf(stderr, "[MEM] stage request %d%c", sz, 10);
@@ -440,6 +454,17 @@ extern void xbox_OhciReport(void);
 
 static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
 {
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION
+            && (ep->ExceptionRecord->ExceptionCode & 0xF0000000u) == 0xC0000000u
+            && ep->ExceptionRecord->ExceptionCode != 0xC0000194u) {
+        /* pd-ab1: non-AV fatal exceptions used to kill the process silently */
+        fprintf(stderr, "[CRASH2] exception 0x%08lX at RIP=0x%llX (module+0x%llX) eax=%08X ecx=%08X edx=%08X ebx=%08X esi=%08X edi=%08X esp=%08X%c",
+            ep->ExceptionRecord->ExceptionCode, (unsigned long long)ep->ContextRecord->Rip,
+            (unsigned long long)(ep->ContextRecord->Rip - (uintptr_t)GetModuleHandleA(NULL)),
+            g_eax, g_ecx, g_edx, g_ebx, g_esi, g_edi, g_esp, 10);
+        fflush(stderr);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
     if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
         uintptr_t fault_addr = ep->ExceptionRecord->ExceptionInformation[1];
 

@@ -268,3 +268,57 @@ void pd_inject_stage_b(int stage)
     sub_000B8380();
     g_esp = se; g_eax = sa; g_ecx = sc; g_edx = sd; g_ebx = sb; g_esi = ss; g_edi = sdi; g_ebp = sbp;
 }
+
+/* Debug (pd-ab1/pd-2ns): start quest <id> (a battle) from the hub the way the script natives do.
+ * Phase 0->1: replicate sub_0001F7D0's tail (copy the 0x520-byte quest record, set [0x2D99B8]) and call the
+ * "end stage" native sub_000EB850 (sets [0x37BE74]=0x7777 and ends the stage via sub_000B86C0).
+ * Phase 1: each frame call sub_000EB850 until it returns 0 (mode state == 5), then the "start quest" native
+ * sub_000EB930 (-> sub_00045F80 with record 0x399B58). Driven from the sub_000DE980 hook (FN_WATCH=5). */
+extern void sub_000EB850(void);
+extern void sub_000EB930(void);
+extern void sub_000EB890(void);
+volatile int g_pd_quest_phase = 0;
+void pd_quest_step(int req)
+{
+    uint32_t se = g_esp, sa = g_eax, sc = g_ecx, sd = g_edx, sb = g_ebx, ss = g_esi, sdi = g_edi, sbp = g_ebp;
+    if (req >= 0 && g_pd_quest_phase == 0) {
+        uint32_t src = MEM32(0x0039E754) + (uint32_t)req * 0x520u, i, p;
+        fprintf(stderr, "[QUEST] id %d record@%08X stage_field=%d\n", req, src, (int)(int16_t)(MEM32(src + 0x504) & 0xFFFF));
+        for (i = 0; i < 0x148; i++) MEM32(0x00399B58 + i * 4) = MEM32(src + i * 4);
+        MEM32(0x002D99B8) = (MEM32(0x002D99B8) & 0xFFFF0000u) | (uint32_t)req;
+        MEM32(0x00399B48) = 0x00399340u + (uint32_t)req * 8;
+        p = MEM32(0x0032FC9C);
+        MEM32(p + 0x54) = (uint32_t)req;
+        g_pd_quest_phase = 1;
+    }
+    if (g_pd_quest_phase == 1) {
+        static int calls;
+        uint32_t obj = MEM32(0x0037BE54);
+        unsigned st = MEM32(obj + 0x28) & 0xFF;
+        if (calls == 0) {            /* end the hub stage once (state -> 5, counts to 0 by itself) */
+            PUSH32(g_esp, 0); PUSH32(g_esp, 0);
+            sub_000EB850();
+            calls = 1;
+            fprintf(stderr, "[QUEST] end-stage native called, state=%u%c", (unsigned)(MEM32(obj + 0x28) & 0xFF), 10);
+        } else {
+            static int seen5, lastst = -1;
+            if ((int)st != lastst) { fprintf(stderr, "[QUEST] mode state -> %u%c", st, 10); lastst = (int)st; }
+            if (st == 5) seen5 = 1;
+            if (seen5 && st == 0) {
+                fprintf(stderr, "[QUEST] stage torn down; starting quest%c", 10);
+                g_esp = se; PUSH32(g_esp, 0); PUSH32(g_esp, 0);
+                sub_000EB930();
+                g_pd_quest_phase = 2;
+            }
+        }
+    }
+    if (g_pd_quest_phase == 2) {
+        static int n; uint32_t obj = MEM32(0x0037BE54);
+        if (n++ < 400 && (n < 20 || n % 10 == 0))
+            fprintf(stderr, "[QSTATE %d] 37BE74=%X 2CA4B8=%X 33094C=%X 33028C=%X modestate=%u/%u 39E890=%X 39EA54=%X 39E8A0=%X 39E854=%X 39E100=%X%c", n,
+                MEM32(0x37BE74), MEM32(0x2CA4B8), MEM32(0x33094C), MEM32(0x33028C), MEM32(obj + 0x28) & 0xFF, (MEM32(obj + 0x28) >> 8) & 0xFF,
+                MEM32(0x39E890), MEM32(0x39EA54), MEM32(0x39E8A0), MEM32(0x39E854), MEM32(0x39E100), 10);
+    }
+done:
+    g_esp = se; g_eax = sa; g_ecx = sc; g_edx = sd; g_ebx = sb; g_esi = ss; g_edi = sdi; g_ebp = sbp;
+}
