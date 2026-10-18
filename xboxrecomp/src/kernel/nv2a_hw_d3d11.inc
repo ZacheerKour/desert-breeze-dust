@@ -70,6 +70,19 @@ typedef struct {
     uint32_t drawn_frame;
 } HwSurface;
 
+/* pd-js7 diagnostic table (see RECOMP_HW_CLIPDBG) */
+static struct { uint32_t off, sw, sh, cx, cy, cw, ch; unsigned n; } s_hw_clip[64];
+static int s_hw_clip_n;
+
+/* pd-js7 / pd-42q: Phantom Dust draws everything inside a 592x456+24+12 window of its 640x480 display
+ * (the console's overscan margin) and never touches the margin again, so whatever an earlier scene
+ * left there (sky blocks, a red gradient, a white "F" glyph) stays in the frame we present. The
+ * console showed it only where the TV's overscan hid it. Track which clip the frame's draws use
+ * and black out the margin at present. */
+static struct { uint32_t cx, cy, cw, ch; unsigned n; } s_hw_vc[8];
+static int s_hw_vc_n;
+static uint32_t s_hw_view[4];           /* chosen view clip (x, y, w, h); w == 0: none yet */
+
 typedef struct {
     uint32_t offset, w, h;
     ID3D11Texture2D *tex;
@@ -1241,6 +1254,38 @@ static HwSurface *hw_bind_draw_state(const HwVsp *prog)
     sc.right = (LONG)hw_px(s_gpu.clip_x + s_gpu.clip_w, s->sc);
     sc.bottom = (LONG)((s_gpu.clip_y + s_gpu.clip_h) * s->sc);
     ID3D11DeviceContext_RSSetScissorRects(s_hw.ctx, 1, &sc);
+    {
+        /* pd-js7/pd-42q diagnostic (RECOMP_HW_CLIPDBG=1): histogram of the (surface, clip) pairs draws use,
+         * printed with the five-second report, to find what draws into the margin outside the game's view. */
+        static int on = -1;
+        if (on < 0) on = getenv("RECOMP_HW_CLIPDBG") ? 1 : 0;
+        if (on) {
+            int k;
+            for (k = 0; k < s_hw_clip_n; k++)
+                if (s_hw_clip[k].off == s->offset && s_hw_clip[k].sw == s->w && s_hw_clip[k].sh == s->h
+                    && s_hw_clip[k].cx == s_gpu.clip_x && s_hw_clip[k].cy == s_gpu.clip_y
+                    && s_hw_clip[k].cw == s_gpu.clip_w && s_hw_clip[k].ch == s_gpu.clip_h) break;
+            if (k == s_hw_clip_n && k < 64) {
+                s_hw_clip[k].off = s->offset; s_hw_clip[k].sw = s->w; s_hw_clip[k].sh = s->h;
+                s_hw_clip[k].cx = s_gpu.clip_x; s_hw_clip[k].cy = s_gpu.clip_y;
+                s_hw_clip[k].cw = s_gpu.clip_w; s_hw_clip[k].ch = s_gpu.clip_h; s_hw_clip[k].n = 0;
+                s_hw_clip_n++;
+            }
+            if (k < 64) s_hw_clip[k].n++;
+        }
+    }
+    if (s->w == 640 && s_gpu.clip_w && s_gpu.clip_h) {
+        int k;
+        for (k = 0; k < s_hw_vc_n; k++)
+            if (s_hw_vc[k].cx == s_gpu.clip_x && s_hw_vc[k].cy == s_gpu.clip_y
+                && s_hw_vc[k].cw == s_gpu.clip_w && s_hw_vc[k].ch == s_gpu.clip_h) break;
+        if (k == s_hw_vc_n && k < 8) {
+            s_hw_vc[k].cx = s_gpu.clip_x; s_hw_vc[k].cy = s_gpu.clip_y;
+            s_hw_vc[k].cw = s_gpu.clip_w; s_hw_vc[k].ch = s_gpu.clip_h; s_hw_vc[k].n = 0;
+            s_hw_vc_n++;
+        }
+        if (k < 8) s_hw_vc[k].n++;
+    }
 
     {
         int mode = 0;
@@ -2262,6 +2307,7 @@ static void hw_present_locked(int vsync)
     const uint32_t *opx;
     uint32_t ow, oh, orect[4], oserial;
     float px, py, pw, ph;
+    int ovl_active = 0;
     LARGE_INTEGER t0, t1;
     static const float black[4] = {0, 0, 0, 1}, bf[4] = {0, 0, 0, 0};
     ID3D11ShaderResourceView *none[4] = {NULL, NULL, NULL, NULL};
@@ -2304,6 +2350,7 @@ static void hw_present_locked(int vsync)
         ID3D11DeviceContext_Draw(s_hw.ctx, 3, 0);
     }
     if (xbox_FramebufferOverlayGet(&opx, &ow, &oh, orect, &oserial) && ow && oh) {
+        ovl_active = 1;
         if (!s_hw.ovl_tex || s_hw.ovl_w != ow || s_hw.ovl_h != oh) {
             D3D11_TEXTURE2D_DESC td;
             if (s_hw.ovl_srv) ID3D11ShaderResourceView_Release(s_hw.ovl_srv);
@@ -2334,6 +2381,42 @@ static void hw_present_locked(int vsync)
             vp.Height = (float)orect[3] * ph / 480.0f;
             ID3D11DeviceContext_RSSetViewports(s_hw.ctx, 1, &vp);
             ID3D11DeviceContext_PSSetShaderResources(s_hw.ctx, 0, 1, &s_hw.ovl_srv);
+            ID3D11DeviceContext_Draw(s_hw.ctx, 3, 0);
+        }
+    }
+    if (s_hw.pres_valid && s_hw_view[2] && s_hw_view[3] && !getenv("RECOMP_HW_NOMASK")
+        && (s_hw_view[2] < 640 || s_hw_view[3] < 480 || s_hw_view[0] || s_hw_view[1])
+        && s_hw_view[0] + s_hw_view[2] <= 640 && s_hw_view[1] + s_hw_view[3] <= 480
+        && !ovl_active) {
+        /* Black bars over the overscan margin (see s_hw_view). Position in the 4:3 core of the picture. */
+        HwPsConst pcb;
+        D3D11_MAPPED_SUBRESOURCE map;
+        D3D11_RECT r[4];
+        float mw = ph * (4.0f / 3.0f), mx = px + (pw - mw) * 0.5f;
+        float x0 = mx + (float)s_hw_view[0] * mw / 640.0f;
+        float x1 = mx + (float)(s_hw_view[0] + s_hw_view[2]) * mw / 640.0f;
+        float y0 = py + (float)s_hw_view[1] * ph / 480.0f;
+        float y1 = py + (float)(s_hw_view[1] + s_hw_view[3]) * ph / 480.0f;
+        int i;
+        memset(&pcb, 0, sizeof pcb);
+        pcb.finc0[3] = 1.0f;
+        if (SUCCEEDED(ID3D11DeviceContext_Map(s_hw.ctx, (ID3D11Resource *)s_hw.ps_cb, 0,
+                                              D3D11_MAP_WRITE_DISCARD, 0, &map))) {
+            memcpy(map.pData, &pcb, sizeof pcb);
+            ID3D11DeviceContext_Unmap(s_hw.ctx, (ID3D11Resource *)s_hw.ps_cb, 0);
+        }
+        r[0].left = (LONG)mx;  r[0].right = (LONG)(mx + mw);  r[0].top = (LONG)py;  r[0].bottom = (LONG)(y0 + 0.5f);   /* top */
+        r[1].left = (LONG)mx;  r[1].right = (LONG)(mx + mw);  r[1].top = (LONG)(y1 + 0.5f);  r[1].bottom = (LONG)(py + ph); /* bottom */
+        r[2].left = (LONG)mx;  r[2].right = (LONG)(x0 + 0.5f);  r[2].top = (LONG)py;  r[2].bottom = (LONG)(py + ph);  /* left */
+        r[3].left = (LONG)(x1 + 0.5f);  r[3].right = (LONG)(mx + mw);  r[3].top = (LONG)py;  r[3].bottom = (LONG)(py + ph); /* right */
+        vp.TopLeftX = px; vp.TopLeftY = py; vp.Width = pw; vp.Height = ph;
+        ID3D11DeviceContext_RSSetViewports(s_hw.ctx, 1, &vp);
+        ID3D11DeviceContext_RSSetState(s_hw.ctx, s_hw.rs[0]);
+        ID3D11DeviceContext_PSSetShader(s_hw.ctx, s_hw.ps_solid, NULL, 0);
+        ID3D11DeviceContext_PSSetConstantBuffers(s_hw.ctx, 0, 1, &s_hw.ps_cb);
+        for (i = 0; i < 4; i++) {
+            if (r[i].right <= r[i].left || r[i].bottom <= r[i].top) continue;
+            ID3D11DeviceContext_RSSetScissorRects(s_hw.ctx, 1, &r[i]);
             ID3D11DeviceContext_Draw(s_hw.ctx, 3, 0);
         }
     }
@@ -2595,6 +2678,21 @@ static void hw_flip(void)
             s_hw.flip_prev_draws = clear_only ? 0 : d;
         }
     }
+    {
+        /* The frame's view clip: the largest clip that is used by at least 8 draws (a one-off
+         * full-screen quad must not widen it). Keeps the previous choice for a frame with none. */
+        int k, best = -1;
+        uint64_t barea = 0;
+        for (k = 0; k < s_hw_vc_n; k++) {
+            uint64_t a = (uint64_t)s_hw_vc[k].cw * s_hw_vc[k].ch;
+            if (s_hw_vc[k].n >= 8 && a > barea) { barea = a; best = k; }
+        }
+        if (best >= 0) {
+            s_hw_view[0] = s_hw_vc[best].cx; s_hw_view[1] = s_hw_vc[best].cy;
+            s_hw_view[2] = s_hw_vc[best].cw; s_hw_view[3] = s_hw_vc[best].ch;
+        }
+        s_hw_vc_n = 0;
+    }
     s_hw.biggest = NULL;
     s_hw.biggest_area = 0;
     s_hw.frame++;
@@ -2630,6 +2728,14 @@ static void hw_flip(void)
                         (double)(s_hw_stat_vsh_ticks - vs0) * ms,
                         (double)(s_hw_stat_draw_ticks - dr0) * ms,
                         exec_ms - present_ms, present_ms, frame_ms - exec_ms);
+            }
+            if (getenv("RECOMP_HW_CLIPDBG") && s_hw_clip_n) {
+                int k;
+                for (k = 0; k < s_hw_clip_n; k++)
+                    fprintf(stderr, "  [CLIPH] surf %08X %ux%u clip %ux%u+%u+%u : %u draws%c", (unsigned)s_hw_clip[k].off,
+                            (unsigned)s_hw_clip[k].sw, (unsigned)s_hw_clip[k].sh, (unsigned)s_hw_clip[k].cw, (unsigned)s_hw_clip[k].ch,
+                            (unsigned)s_hw_clip[k].cx, (unsigned)s_hw_clip[k].cy, s_hw_clip[k].n, 10);
+                s_hw_clip_n = 0;
             }
             t0 = now; f0 = s_hw.frame;
             d0 = s_hw.draws; tr0 = s_hw.tris; up0 = s_hw.tex_uploads;

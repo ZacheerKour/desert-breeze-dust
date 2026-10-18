@@ -103,6 +103,12 @@ volatile int g_pd_quest_req = -1;
 extern volatile int g_pd_quest_phase;
 static struct { uint32_t va; unsigned n; } s_fnw[4096];
 static int s_fnw_n;
+/* pd-i0w: "wfn <hexaddr>" in the RECOMP_MEM_LIVE console (mode 5 only) reports, when the dword at that guest address
+ * changes, the last guest functions entered. The writer is one of them or a caller still running. */
+volatile uint32_t g_wfn_va[4];
+volatile uint32_t g_wfn_last[4];
+volatile int g_wfn_n;
+static uint32_t s_wfn_ring[16]; static unsigned s_wfn_rp;
 void recomp_fn_watch_hit(uint32_t va)
 {
     int i;
@@ -115,6 +121,27 @@ void recomp_fn_watch_hit(uint32_t va)
         if (g_pd_quest_phase == 2) {
             static uint8_t seen[0x400000]; static unsigned nq;
             if (va < 0x400000 && !seen[va]) { seen[va] = 1; if (nq++ < 6000) fprintf(stderr, "[QF] %06X%c", (unsigned)va, 10); }
+        }
+        if (g_wfn_n) {
+            int k;
+            s_wfn_ring[s_wfn_rp++ & 15] = va;
+            for (k = 0; k < g_wfn_n; k++) {
+                uint32_t now_v; memcpy(&now_v, (uint8_t *)g_xbox_mem_offset + g_wfn_va[k], 4);
+                if (now_v != g_wfn_last[k]) {
+                    unsigned j; static unsigned nrep;
+                    if (nrep++ < 400) {
+                        fprintf(stderr, "[WFN] %08X %08X -> %08X; entered (newest first):", (unsigned)g_wfn_va[k], (unsigned)g_wfn_last[k], (unsigned)now_v);
+                        for (j = 1; j <= 12; j++) fprintf(stderr, " %06X", (unsigned)s_wfn_ring[(s_wfn_rp - j) & 15]);
+                        fprintf(stderr, "%c  guest stack code addrs:", 10);
+                        for (j = 0; j < 160; j++) {
+                            uint32_t w; memcpy(&w, (uint8_t *)g_xbox_mem_offset + g_esp + j * 4u, 4);
+                            if (w >= 0x11000u && w < 0x262000u) fprintf(stderr, " [+%u]%06X", j * 4u, (unsigned)w);
+                        }
+                        fprintf(stderr, "%c", 10);
+                    }
+                    g_wfn_last[k] = now_v;
+                }
+            }
         }
         if ((va == 0xDE980u || va == 0xB83B0u) && (g_pd_quest_req >= 0 || g_pd_quest_phase >= 1)) {
             extern void pd_quest_step(int req);
@@ -218,6 +245,7 @@ tick:
  *   poke <hexaddr> <hexval> [1|2|4]   write guest memory (default 4 bytes)
  *   peek <hexaddr> [dwords]           print dwords (default 1) to stderr as [MEM]
  *   watch <hexaddr> [1|2|4]           print [WATCH] whenever the value changes (up to 8)
+ *   scan <hexval> / rescan <hexval>   find / narrow dword candidates in guest RAM (pd-i0w)
  * Writes are plain host stores, so use them on data, not on code or while the guest holds a lock. */
 static DWORD WINAPI pd_mem_live(LPVOID unused)
 {
@@ -247,6 +275,45 @@ static DWORD WINAPI pd_mem_live(LPVOID unused)
                     fprintf(stderr, "[MEM] peek %08X:", a);
                     for (k = 0; k < sz; k++) fprintf(stderr, " %08X", m[k]);
                     fprintf(stderr, "\n");
+                } else if (sscanf(line, "scan %x", &a) == 1 || sscanf(line, "rescan %x", &a) == 1) {
+                    /* pd-pc7/pd-i0w: cheat-engine style search of guest RAM for a dword. "scan <hex>" starts a
+                     * candidate list (aligned dwords in 0x10000..0x04000000), "rescan <hex>" keeps the candidates
+                     * that now hold <hex>. Prints the count and up to 24 addresses. */
+                    static uint32_t *cand; static unsigned ncand;
+                    unsigned i, o = 0; const uint32_t *base = (const uint32_t *)((uint8_t *)g_xbox_mem_offset);
+                    if (line[0] == 's') {
+                        if (!cand) cand = (uint32_t *)malloc(sizeof(uint32_t) * 4000000u);
+                        ncand = 0;
+                        for (i = 0x10000u / 4; i < 0x04000000u / 4 && ncand < 4000000u; i++) if (base[i] == a) cand[ncand++] = i * 4;
+                    } else {
+                        for (i = 0; i < ncand; i++) if (base[cand[i] / 4] == a) cand[o++] = cand[i];
+                        ncand = o;
+                    }
+                    fprintf(stderr, "[SCAN] %X: %u candidates:", a, ncand);
+                    for (i = 0; i < ncand && i < 80; i++) fprintf(stderr, " %X", cand[i]);
+                    fprintf(stderr, "%c", 10);
+                } else if (sscanf(line, "fnwatch %d", &sz) == 1) {
+                    /* switch the per-call function hook off (0) after the quest has started, so profiling is not
+                     * distorted by it (the RECOMP_ABI_CHECK call macro still tests the flag) */
+                    g_fn_watch_on = sz;
+                    fprintf(stderr, "[MEM] fn watch mode -> %d%c", sz, 10);
+                } else if (sscanf(line, "wfn %x", &a) == 1 && g_wfn_n < 4) {
+                    memcpy((void *)&g_wfn_last[g_wfn_n], (uint8_t *)g_xbox_mem_offset + a, 4);
+                    g_wfn_va[g_wfn_n] = a; g_wfn_n++;
+                    fprintf(stderr, "[MEM] wfn armed on %08X%c", a, 10);
+                } else if (sscanf(line, "pat %x %x %x", &a, &v, &sz) == 3) {
+                    /* "pat v1 v2 v3": addresses A holding v1 where A+S holds v2 and A+2S holds v3 for some stride S
+                     * (4..0x4000): finds the per-character table of (HP 20, 20, 10). */
+                    const uint32_t *base = (const uint32_t *)((uint8_t *)g_xbox_mem_offset);
+                    unsigned i, S, shown = 0; uint32_t v3 = (uint32_t)sz;
+                    for (i = 0x10000u / 4; i < 0x03F00000u / 4 && shown < 24; i++) {
+                        if (base[i] != a) continue;
+                        for (S = 1; S < 0x1000u; S++) {
+                            if (i + 2 * S >= 0x04000000u / 4) break;
+                            if (base[i + S] == v && base[i + 2 * S] == v3) { fprintf(stderr, "[PAT] %X stride %X%c", i * 4, S * 4, 10); shown++; }
+                        }
+                    }
+                    fprintf(stderr, "[PAT] done %X %X %X: %u hits%c", a, v, v3, shown, 10);
                 } else if (sscanf(line, "quest %d", &sz) == 1) {
                     g_pd_quest_req = sz;
                     fprintf(stderr, "[MEM] quest request %d%c", sz, 10);
@@ -303,7 +370,14 @@ static DWORD WINAPI pd_sampler(LPVOID unused)
     }
     for (s = 0; s < 200; s++) {
         fprintf(stderr, "[SAMPLE] %d:", s);
-        for (k = 0; k < cnt[s]; k++) fprintf(stderr, " %lu=%llX", (unsigned long)tids[s][k], rips[s][k]);
+        for (k = 0; k < cnt[s]; k++) {
+            /* pd-pc7: RIPs outside the exe image (D3D11 driver, kernel32, ...) are printed as module!offset */
+            unsigned long long a = rips[s][k] + (unsigned long long)base; HMODULE hm = NULL; char nm[MAX_PATH];
+            if (rips[s][k] >= 0x4000000ull && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)(uintptr_t)a, &hm) && GetModuleFileNameA(hm, nm, sizeof nm)) {
+                const char *b = strrchr(nm, 92); fprintf(stderr, " %lu=@%s+%llX", (unsigned long)tids[s][k], b ? b + 1 : nm, a - (unsigned long long)(uintptr_t)hm);
+            } else
+                fprintf(stderr, " %lu=%llX", (unsigned long)tids[s][k], rips[s][k]);
+        }
         fprintf(stderr, "\n");
     }
     fflush(stderr);
