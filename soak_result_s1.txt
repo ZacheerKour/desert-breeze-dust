@@ -1,0 +1,1 @@
+PAD DEAD at 11:07:42 after cmd 'rright:500' (live lines 666 -> 666)
