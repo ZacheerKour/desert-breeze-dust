@@ -1,11 +1,13 @@
 # After $1 seconds, poll; when the window is near-black at >100 FPS twice in a row, touch presdbg.flag.
+import os
+ROOT = os.path.dirname(os.path.abspath(__file__))
 import subprocess,time,sys,re
 from PIL import Image
 start=int(sys.argv[1]); limit=int(sys.argv[2]); t0=time.time(); streak=0
 while time.time()-t0<limit:
     time.sleep(8)
     if time.time()-t0<start: continue
-    f=r"%USERPROFILE%\phantom-dust-re\ex.png"
+    f=os.path.join(ROOT, 'ex.png')
     r=subprocess.run(["powershell","-NoProfile","-ExecutionPolicy","Bypass","-File","capwin.ps1",f],capture_output=True,text=True)
     if r.returncode: break
     im=Image.open(f).convert("L").resize((130,100)); b=sum(im.tobytes())/13000
@@ -14,5 +16,5 @@ while time.time()-t0<limit:
     if b<=9 and fps>100 and dr==0:
         streak+=1
         if streak>=2:
-            open(r"%USERPROFILE%\phantom-dust-re\pd-game-v2\presdbg.flag","w").write("1"); print("armed at",int(time.time()-t0)); break
+            open(os.path.join(ROOT, 'pd-game-v2', 'presdbg.flag'),"w").write("1"); print("armed at",int(time.time()-t0)); break
     else: streak=0

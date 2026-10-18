@@ -1,7 +1,8 @@
 #!/bin/bash
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # padcheck.sh <log> <cmd>... : send each pad command, wait, verify the game consumed it (PAD: live line count grows)
 log=$1; shift
-cd ~/phantom-dust-re/pd-game-v2
+cd "$ROOT/pd-game-v2"
 for c in "$@"; do
   n0=$(grep -a -c "PAD: live" $log)
   echo "$c" >> pad_live.txt

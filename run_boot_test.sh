@@ -1,8 +1,9 @@
 #!/bin/bash
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # pd-dz0: cold boot -> title -> Load Profile -> hub -> (quest 1 -> battle loaded). Reports OK/CRASH per run.
 # usage: run_boot_test.sh <tag> [RECOMP_X=Y ...]    (exe: build/pd_ab1.exe)   env LOADCPU=1 starts a CPU burner
 tag=$1; shift
-cd ~/phantom-dust-re/pd-game-v2; : > pad_live.txt; : > live.txt; rm -f sample.flag exit_$tag.txt
+cd "$ROOT/pd-game-v2"; : > pad_live.txt; : > live.txt; rm -f sample.flag exit_$tag.txt
 export RECOMP_AC97_READY=1 RECOMP_PB_EXEC=1 RECOMP_VBLANK=1 RECOMP_FB_WINDOW=1 RECOMP_TRACE_BUDGET=0 RECOMP_APU_DSP_ACK=0x83050810 RECOMP_USB=1 RECOMP_USB_PADS=1 RECOMP_PAD_LIVE=pad_live.txt RECOMP_HW=1 RECOMP_FN_WATCH=5 RECOMP_MEM_LIVE=live.txt
 for kv in "$@"; do export "$kv"; done
 t0=$(date +%s)
@@ -19,7 +20,7 @@ for b in "start:2500" "start:2500" "down:200" "a:1500" "a:1500" "a:1500"; do ali
 for k in 1 2 3 4 5 6 7 8; do alive || break; echo "start:2500" >> pad_live.txt; sleep 15; grep -a -q "pausemenu_en.ssb" run_$tag.err && break; done
 alive && sleep 10
 hub=0; grep -a -q "pausemenu_en.ssb" run_$tag.err && hub=1
-if alive && [ $hub = 1 ]; then echo "a:300" >> pad_live.txt; sleep 4; powershell -NoProfile -ExecutionPolicy Bypass -File ../capwin_ab1.ps1 "%USERPROFILE%\phantom-dust-re\shot_boot_$tag.png" > /dev/null; echo "quest 1" >> live.txt; sleep 50; fi
+if alive && [ $hub = 1 ]; then echo "a:300" >> pad_live.txt; sleep 4; powershell -NoProfile -ExecutionPolicy Bypass -File ../capwin_ab1.ps1 "$(cygpath -w "$ROOT/shot_boot_$tag.png")" > /dev/null; echo "quest 1" >> live.txt; sleep 50; fi
 q=0; grep -a -q "stage torn down; starting quest" run_$tag.err && q=1
 if alive; then
   title=$(powershell -NoProfile -Command "Get-Process pd_ab1 -ErrorAction SilentlyContinue | Select-Object -ExpandProperty MainWindowTitle")

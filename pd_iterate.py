@@ -8,7 +8,7 @@ Only touches: recomp-analysis/, pd-game-v2/ (generated code + build), logs. Does
 """
 import os, re, shutil, subprocess, sys, time, json
 
-ROOT = r'%USERPROFILE%\phantom-dust-re'
+ROOT = os.path.dirname(os.path.abspath(__file__))
 TOOLKIT = os.path.join(ROOT, 'xboxrecomp')
 PY = os.path.join(ROOT, '.venv-recomp', 'Scripts', 'python.exe')
 XBE = os.path.join(ROOT, 'extracted', 'default.xbe')

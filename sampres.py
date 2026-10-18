@@ -1,6 +1,8 @@
 # resolve [SAMPLE] RIPs from a run .err via the link map. usage: sampres.py run.err [map]
+import os
+ROOT = os.path.dirname(os.path.abspath(__file__))
 import sys,re,bisect,collections
-err=sys.argv[1]; mp=sys.argv[2] if len(sys.argv)>2 else r'%USERPROFILE%\phantom-dust-re\pd-game-v2\build\pd_recomp.map'
+err=sys.argv[1]; mp=sys.argv[2] if len(sys.argv)>2 else os.path.join(ROOT, 'pd-game-v2', 'build', 'pd_recomp.map')
 syms=[]
 for l in open(mp,errors='replace'):
     m=re.match(r'\s*0001:([0-9a-f]{8})\s+(\S+)\s+([0-9a-f]{16}) f\s+(\S+)',l)

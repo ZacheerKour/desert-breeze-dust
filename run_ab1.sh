@@ -1,7 +1,8 @@
 #!/bin/bash
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Boot -> title -> Load Profile -> Yes -> Main Menu -> Scenario -> skip movies, until gameplay. Needs a saved profile.
 tag=$1; shift
-cd ~/phantom-dust-re/pd-game-v2; : > pad_live.txt; rm -f sample.flag
+cd "$ROOT/pd-game-v2"; : > pad_live.txt; rm -f sample.flag
 export RECOMP_AC97_READY=1 RECOMP_PB_EXEC=1 RECOMP_VBLANK=1 RECOMP_FB_WINDOW=1 RECOMP_TRACE_BUDGET=0 RECOMP_APU_DSP_ACK=0x83050810 RECOMP_USB=1 RECOMP_USB_PADS=1 RECOMP_PAD_LIVE=pad_live.txt RECOMP_HW=1
 for kv in "$@"; do export "$kv"; done
 (nohup bash -c "build/pd_ab1.exe > run_$tag.out 2> run_$tag.err; echo \$? > exit_$tag.txt" &)

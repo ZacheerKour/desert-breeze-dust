@@ -1,5 +1,6 @@
 #!/bin/bash
-cd ~/phantom-dust-re
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
 for t in 1 2 3 4 5 6; do
   taskkill //F //IM pd_recomp.exe >/dev/null 2>&1; sleep 2
   bash run_game_flow.sh rp$t RECOMP_HW_FLIPDBG=1 > flow_rp$t.log 2>&1

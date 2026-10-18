@@ -1,8 +1,9 @@
 #!/bin/bash
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Usage: run_profile_flow.sh <tag> [extra env assignments...]
 # Boots pd_recomp with a fresh profile, drives title -> name entry -> accept via the live pad file.
 tag=$1; shift
-cd ~/phantom-dust-re
+cd "$ROOT"
 rm -rf bak-profile-20261015/last_$tag; mkdir -p bak-profile-20261015
 [ -d extracted/UDATA/4d530046/A78E1D952BDA ] && mv extracted/UDATA/4d530046/A78E1D952BDA bak-profile-20261015/last_$tag
 cd pd-game-v2; : > pad_live.txt
