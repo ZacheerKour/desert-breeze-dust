@@ -2,8 +2,15 @@
 Reads recomp-analysis/disasm/functions.json + ghidra_funcs.json, writes recomp-analysis/disasm_ext/ (copy) with extended ends."""
 import json, shutil, os
 import capstone
-XBE=open(r'%USERPROFILE%\phantom-dust-re\extracted\default.xbe','rb').read()
-SECS=[(int(x['virtual_addr'],16),x['virtual_size'],int(x['raw_addr'],16),x['raw_size']) for x in json.load(open(r'%USERPROFILE%\phantom-dust-re\recomp-analysis\pd_analysis.json'))['sections']]
+# Usage: pd_extend_ends.py [XBE ANALYSIS_DIR GHIDRA_FUNCS_JSON]; defaults = original in-tree layout.
+# pd_pipeline.py passes explicit paths so the stage works from any clone.
+import sys
+_ROOT=os.path.dirname(os.path.abspath(__file__))
+_X=len(sys.argv)>3
+XBE=open(sys.argv[1] if _X else os.path.join(_ROOT,'extracted','default.xbe'),'rb').read()
+AN=sys.argv[2] if _X else os.path.join(_ROOT,'recomp-analysis')
+_GF=sys.argv[3] if _X else os.path.join(AN,'ghidra_funcs.json')
+SECS=[(int(x['virtual_addr'],16),x['virtual_size'],int(x['raw_addr'],16),x['raw_size']) for x in json.load(open(os.path.join(AN,'pd_analysis.json')))['sections']]
 MD=capstone.Cs(capstone.CS_ARCH_X86,capstone.CS_MODE_32)
 def rd(va,n):
     for v,vs,r,rs in SECS:
@@ -29,12 +36,11 @@ def closure_end(start,limit):
             a+=ins.size
     return mx
 
-AN = r'%USERPROFILE%\phantom-dust-re\recomp-analysis'
 src = os.path.join(AN, 'disasm'); dst = os.path.join(AN, 'disasm_ext')
 if os.path.isdir(dst): shutil.rmtree(dst)
 shutil.copytree(src, dst)
 F = json.load(open(os.path.join(dst, 'functions.json')))
-G = {g['entry']: g for g in json.load(open(os.path.join(AN, 'ghidra_funcs.json')))}
+G = {g['entry']: g for g in json.load(open(_GF))}
 changed = 0; total_bytes = 0
 for f in F:
     s = int(f['start'], 16); e = int(f['end'], 16); g = G.get(s)
