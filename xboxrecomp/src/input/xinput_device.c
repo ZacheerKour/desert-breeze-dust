@@ -84,12 +84,65 @@ static SHORT axis_from_keys(int negative, int positive)
     return (SHORT)v;
 }
 
+/* RECOMP_KEYS=mmo: a layout for keyboards without a numeric pad (laptops),
+ * modelled on the usual MMO bindings so nothing has to be learned:
+ *
+ *   W A S D       left thumb (move)       Q E / R F  right thumb (camera turn / tilt)
+ *   Space         left trigger (jump)     Tab        right trigger (lock on)
+ *   1 2 3 4       A B X Y (skill slots)   left / right mouse button  A / lock on
+ *   Enter, Esc    START                   Backspace  B (back)
+ *   arrows        d-pad (menus)           Z C        white black
+ *   Shift Ctrl    left / right thumb click */
+static BOOL keyboard_mmo(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("RECOMP_KEYS");
+        on = (v && _stricmp(v, "mmo") == 0) ? 1 : 0;
+    }
+    return on ? TRUE : FALSE;
+}
+
+static void keyboard_state_mmo(XBOX_INPUT_STATE *pState)
+{
+    WORD b = 0;
+
+    if (key_down(VK_UP))     b |= XBOX_GAMEPAD_DPAD_UP;
+    if (key_down(VK_DOWN))   b |= XBOX_GAMEPAD_DPAD_DOWN;
+    if (key_down(VK_LEFT))   b |= XBOX_GAMEPAD_DPAD_LEFT;
+    if (key_down(VK_RIGHT))  b |= XBOX_GAMEPAD_DPAD_RIGHT;
+    if (key_down(VK_RETURN) || key_down(VK_ESCAPE)) b |= XBOX_GAMEPAD_START;
+    if (key_down(VK_SHIFT))  b |= XBOX_GAMEPAD_LEFT_THUMB;
+    if (key_down(VK_CONTROL))b |= XBOX_GAMEPAD_RIGHT_THUMB;
+    pState->Gamepad.wButtons = b;
+
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A]        = (key_down('1') || key_down(VK_LBUTTON)) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B]        = (key_down('2') || key_down(VK_BACK)) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_X]        = key_down('3') ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y]        = key_down('4') ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE]    = key_down('Z') ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK]    = key_down('C') ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = key_down(VK_SPACE) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] = (key_down(VK_TAB) || key_down(VK_RBUTTON)) ? 255 : 0;
+
+    pState->Gamepad.sThumbLX = axis_from_keys('A', 'D');
+    pState->Gamepad.sThumbLY = axis_from_keys('S', 'W');
+    pState->Gamepad.sThumbRX = axis_from_keys('Q', 'E');
+    pState->Gamepad.sThumbRY = axis_from_keys('F', 'R');
+}
+
 static void keyboard_state(XBOX_INPUT_STATE *pState)
 {
     static DWORD packet;
     WORD b = 0;
 
     memset(pState, 0, sizeof(*pState));
+
+    if (keyboard_mmo()) {
+        keyboard_state_mmo(pState);
+        pState->dwPacketNumber = ++packet;
+        return;
+    }
 
     if (key_down(VK_UP))     b |= XBOX_GAMEPAD_DPAD_UP;
     if (key_down(VK_DOWN))   b |= XBOX_GAMEPAD_DPAD_DOWN;

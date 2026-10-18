@@ -114,6 +114,8 @@ static XBOX_THREAD_LOCAL int t_isr_owner = 0;
 static volatile LONG g_isr_overlaps = 0, g_isr_waits = 0, g_isr_giveups = 0, g_isr_begins = 0, g_isr_deferred = 0;
 static int s_cpu_lock_on = -1;
 
+extern RECOMP_TLS uint32_t g_esp;
+void xbox_IrqlDumpHolders(void);
 static void cpu_lock_init(void)
 {
     if (InterlockedCompareExchange(&g_cpu_cs_init, 1, 0) == 0) {
@@ -144,7 +146,13 @@ static void cpu_lock_enter(void)
             return;
         if (!t0) { t0 = GetTickCount(); if (!t0) t0 = 1; InterlockedIncrement(&g_isr_waits); }
         if (GetTickCount() - t0 > 200) {
-            InterlockedIncrement(&g_isr_giveups);
+            LONG gn = InterlockedIncrement(&g_isr_giveups);
+            if (gn <= 40) {   /* attribution: who waited, and who holds the boundary up */
+                uint32_t wra = g_esp ? *(uint32_t *)((uintptr_t)g_xbox_mem_offset + g_esp) : 0;
+                fprintf(stderr, "  [CPULOCK-GIVEUP #%ld] waiter tid %lu guest ret %08X esp %08X (waited >200 ms)\n",
+                        (long)gn, (unsigned long)GetCurrentThreadId(), wra, g_esp);
+                xbox_IrqlDumpHolders();
+            }
             return;                                   /* run unguarded rather than wedge the guest */
         }
         SwitchToThread();
