@@ -2039,6 +2039,8 @@ static HwSurface *hw_bind_draw_state(const HwVsp *prog)
                                 (unsigned)t->width, (unsigned)t->height, (unsigned)t->color, (unsigned)t->levels, (unsigned)t->filter,
                                 (unsigned)t->addr_u, (unsigned)t->addr_v, (unsigned)t->pitch, srv[k] == s_hw.white ? "WHITE" : "ok", 10);
                 }
+                fprintf(stderr, "[DRAW]   clip %u,%u %ux%u fmt %08X pitch %u color_off %08X zeta %08X fog %u fogmode %u ps_last_valid %d%c", (unsigned)s_gpu.clip_x, (unsigned)s_gpu.clip_y, (unsigned)s_gpu.clip_w, (unsigned)s_gpu.clip_h,
+                        (unsigned)s_gpu.format, (unsigned)s_gpu.pitch, (unsigned)s_gpu.color_offset, (unsigned)s_gpu.zeta_offset, (unsigned)s_gpu.fog_enable, (unsigned)s_gpu.fog_mode, s_hw.ps_last_valid, 10);
                 fprintf(stderr, "[DRAW]   tscale0 %g %g %g tex0.w %u h %u fmt %02X valid %d filter %08X palette %08X\n", pc.tscale[0][0], pc.tscale[0][1], pc.tscale[0][2], (unsigned)s_gpu.texs[0].width, (unsigned)s_gpu.texs[0].height, (unsigned)s_gpu.texs[0].color, s_gpu.texs[0].valid, (unsigned)s_gpu.texs[0].filter, (unsigned)s_gpu.texs[0].palette);
                 for (k = 0; k < (int)(s_gpu.rc.control & 0xFF) && k < 8; k++)
                     fprintf(stderr, "[DRAW]   stage %d icw %08X aicw %08X ocw %08X aocw %08X c0 %08X c1 %08X\n", k,
