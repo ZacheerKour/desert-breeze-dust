@@ -84,6 +84,7 @@ typedef struct { ID3D11Texture2D *tex; ID3D11DepthStencilView *dsv; UINT w, h; u
 
 static struct {
     int enabled, env_on, dbg, dbg_level, tried;
+    int fast, fast_n; double fast_ema; LONGLONG fast_last;
     int gov, gov_on, gov_env_off; double gov_hi, gov_base, gov_n, gov_ema, gov_off_until, gov_backoff, gov_on_since; LONGLONG gov_last;
     float t, prog_max, attr_frac, cpu_frac, cut_frac, hi_rel, hi_frac;
     int fixed;
@@ -973,7 +974,7 @@ static int ip_flip(const HwSurface *disp, UINT pw, UINT ph)
     if (s_ip.env_on) {                         /* interp_off.flag in the working directory: run-time A/B switch */
         static unsigned n;
         if ((n++ & 15u) == 0) {
-            int want = GetFileAttributesA("interp_off.flag") == INVALID_FILE_ATTRIBUTES && (!s_ip.gov || s_ip.gov_on);
+            int want = GetFileAttributesA("interp_off.flag") == INVALID_FILE_ATTRIBUTES && (!s_ip.gov || s_ip.gov_on) && !s_ip.fast;
             s_ip.defer = GetFileAttributesA("interp_nodefer.flag") == INVALID_FILE_ATTRIBUTES;
             s_ip.gov = GetFileAttributesA("interp_nogov.flag") == INVALID_FILE_ATTRIBUTES && !s_ip.gov_env_off;
             if (!s_ip.gov) s_ip.gov_on = 1;
@@ -998,6 +999,32 @@ static int ip_flip(const HwSurface *disp, UINT pw, UINT ph)
                 return 0;
             }
         }
+    }
+    if (s_ip.env_on) {
+        /* pd-55f: a title that already flips faster than ~40 Hz (the XMV movie loop runs at 60) needs no extra frame: the
+         * interpolated pictures only doubled the presents to 120/s. Off while the flip interval averages under 24 ms, back on
+         * above 30 ms. */
+        LARGE_INTEGER fq;
+        QueryPerformanceCounter(&fq);
+        if (s_ip.fast_last) {
+            double dt = (double)(fq.QuadPart - s_ip.fast_last) * 1000.0 / (double)s_ip.qf.QuadPart;
+            if (dt > 60.0) dt = 60.0;
+            s_ip.fast_ema = s_ip.fast_ema * 0.9 + dt * 0.1;
+            if (!s_ip.fast && s_ip.fast_ema < 24.0) {
+                if (++s_ip.fast_n >= 15) {
+                    s_ip.fast = 1; s_ip.fast_n = 0;
+                    ip_frame_reset(&s_ip.f[0]); ip_frame_reset(&s_ip.f[1]); ip_frame_reset(&s_ip.f[2]); s_ip.job.valid = 0;
+                    s_ip.prev_valid = 0; s_ip_cap_ok = 0; s_ip.enabled = 0;
+                    if (s_ip.dbg) fprintf(stderr, "  [IP] flips already fast (%.1f ms): interpolation off\n", s_ip.fast_ema);
+                }
+            } else if (!s_ip.fast) s_ip.fast_n = 0;
+            else if (s_ip.fast && s_ip.fast_ema > 30.0) {
+                s_ip.fast = 0; s_ip.fast_n = 0;
+                s_ip.enabled = (!s_ip.gov || s_ip.gov_on) && GetFileAttributesA("interp_off.flag") == INVALID_FILE_ATTRIBUTES;
+                if (s_ip.dbg) fprintf(stderr, "  [IP] flips at game rate again: interpolation on\n");
+            }
+        } else s_ip.fast_ema = 33.3;
+        s_ip.fast_last = fq.QuadPart;
     }
     if (s_ip.env_on && s_ip.gov) {
         LARGE_INTEGER q;

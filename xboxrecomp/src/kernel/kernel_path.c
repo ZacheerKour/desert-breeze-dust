@@ -473,6 +473,27 @@ translate:
                 host_path_buf[--n] = L'\0';
         }
 
+        {   /* pd-55f: movie test hook. A file xmv_redirect.txt (cwd) naming another .xmv of the same folder makes every movie the
+             * title opens play that one instead (e.g. the attract movie at the title, or a Scenario movie). Opens are logged. */
+            size_t hn = wcslen(host_path_buf);
+            if (hn > 4 && _wcsicmp(host_path_buf + hn - 4, L".xmv") == 0) {
+                FILE *rf = fopen("xmv_redirect.txt", "r");
+                WCHAR *sl = wcsrchr(host_path_buf, L'\\');
+                if (rf) {
+                    char nm[128] = "";
+                    if (fgets(nm, sizeof nm, rf)) {
+                        size_t k = strlen(nm);
+                        while (k && (nm[k - 1] == '\n' || nm[k - 1] == '\r' || nm[k - 1] == ' ')) nm[--k] = 0;
+                        if (k > 4 && sl) {
+                            swprintf_s(sl + 1, buf_size - (DWORD)(sl + 1 - host_path_buf), L"%S", nm);
+                            fprintf(stderr, "  [XMV] redirect %s -> %s\n", xbox_path, nm);
+                        }
+                    }
+                    fclose(rf);
+                }
+                fprintf(stderr, "  [XMV] open %S at tick %lu\n", host_path_buf, (unsigned long)GetTickCount());
+            }
+        }
         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %S", xbox_path, host_path_buf);
         xbox_remember_host_path(host_path_buf);
         return TRUE;
