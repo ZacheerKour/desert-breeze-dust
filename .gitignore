@@ -79,3 +79,4 @@ __pycache__/
 /audio_cast.txt
 /bak-profile-*/
 .beads.gate.lock
+dist/
