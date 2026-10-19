@@ -12,9 +12,9 @@
  *
  * Opt-in: RECOMP_INTERP=1. Tuning / diagnostics:
  *   RECOMP_INTERP_DBG=1      one [IP] line per second (matches, cuts, timings)
- *   RECOMP_INTERP_GOV=0      disable the governor: it switches interpolation off while the game's own flip interval
- *                            averages above RECOMP_INTERP_GOVMS (36.5 ms; the extra GPU/CPU work would slow the
- *                            simulation, which runs one step per flip), and retries after 4 s, doubling up to 30 s
+ *   RECOMP_INTERP_GOV=0      disable the governor: it switches interpolation off while the game's flip interval
+ *                            with it on is more than RECOMP_INTERP_GOVMS (6 ms) above what it was measured to be without it (the
+ *                            simulation runs one step per flip), and retries after 4 s, doubling up to 30 s
  *   RECOMP_INTERP_T=<0..1>   blend position of the extra frame (default 0.5)
  *   RECOMP_INTERP_PROG=<f>   program draws: max relative constant change that is still blended (1.0)
  *   RECOMP_INTERP_HIREL=<f>, RECOMP_INTERP_HIFRAC=<f>  scene cut when more than HIFRAC (0.4) of the program draws
@@ -43,7 +43,7 @@ typedef struct {
     uint8_t first_touch_full_clear;
     int8_t surf, depth;                 /* indices in s_hw.surf / s_hw.depth, -1 none */
     int32_t partner;                    /* index in the previous frame, -1 none */
-    uint32_t soff, sw, sh;
+    uint32_t soff, sw, sh, hsc;         /* hsc: host pixels per guest pixel of the recorded surface */
     D3D11_VIEWPORT vp;
     D3D11_RECT sc;
     ID3D11RasterizerState *rs;
@@ -84,12 +84,15 @@ typedef struct { ID3D11Texture2D *tex; ID3D11DepthStencilView *dsv; UINT w, h; u
 
 static struct {
     int enabled, env_on, dbg, dbg_level, tried;
-    int gov, gov_on; double gov_hi, gov_ema, gov_off_until, gov_backoff, gov_on_since; LONGLONG gov_last;
+    int gov, gov_on, gov_env_off; double gov_hi, gov_base, gov_n, gov_ema, gov_off_until, gov_backoff, gov_on_since; LONGLONG gov_last;
     float t, prog_max, attr_frac, cpu_frac, cut_frac, hi_rel, hi_frac;
     int fixed;
     const char *dump;
-    IpFrame f[2];
+    IpFrame f[3];
     int cur, prev_valid;
+    double st_job_ms, st_wait_ms; unsigned st_jobs, st_waits; LONGLONG job_t0;
+    int defer, rp_threaded, target_scale, eco; double slice_ms; HANDLE job_ev, job_th; volatile LONG job_busy;
+    struct { int valid, fi, pi, di; UINT pw, ph; } job;
     uint32_t epoch;
     IpTwin tw[HW_MAX_SURFACES];
     IpTwinD twd[HW_MAX_DEPTHS];
@@ -122,6 +125,10 @@ static void ip_init(void)
     /* On by default (60 presented frames over the title's 30, game speed unchanged; the governor
      * falls back to 30 where the guest cannot hold its own frame rate). RECOMP_INTERP=0 turns it off. */
     s_ip.enabled = s_ip.env_on = !(e && *e == '0');
+    e = getenv("RECOMP_INTERP_DEFER"); s_ip.defer = !(e && *e == '0');
+    s_ip.slice_ms = (e = getenv("RECOMP_INTERP_SLICE")) ? atof(e) : 0.4;
+    s_ip.target_scale = (e = getenv("RECOMP_INTERP_SCALE")) ? atoi(e) : 2;
+    e = getenv("RECOMP_INTERP_ECO"); s_ip.eco = e && *e == '1';
     e = getenv("RECOMP_INTERP_DBG"); s_ip.dbg = e && *e && *e != '0'; s_ip.dbg_level = e ? atoi(e) : 0;
     s_ip.t = (e = getenv("RECOMP_INTERP_T")) ? (float)atof(e) : 0.5f;
     s_ip.prog_max = (e = getenv("RECOMP_INTERP_PROG")) ? (float)atof(e) : 1.0f;
@@ -133,9 +140,9 @@ static void ip_init(void)
     e = getenv("RECOMP_INTERP_FIXED"); s_ip.fixed = e && *e && *e != '0';
     s_ip.dump = getenv("RECOMP_INTERP_DUMP");
     QueryPerformanceFrequency(&s_ip.qf);
-    e = getenv("RECOMP_INTERP_GOV"); s_ip.gov = !(e && *e == '0');
-    s_ip.gov_hi = (e = getenv("RECOMP_INTERP_GOVMS")) ? atof(e) : 36.5;
-    s_ip.gov_on = 1; s_ip.gov_ema = 33.3; s_ip.gov_backoff = 4.0;
+    e = getenv("RECOMP_INTERP_GOV"); s_ip.gov_env_off = e && *e == '0'; s_ip.gov = !s_ip.gov_env_off;
+    s_ip.gov_hi = (e = getenv("RECOMP_INTERP_GOVMS")) ? atof(e) : 6.0;
+    s_ip.gov_on = 1; s_ip.gov_ema = 33.3; s_ip.gov_base = 33.3; s_ip.gov_backoff = 4.0;
 }
 
 /* ---- arena / frames ---------------------------------------------------- */
@@ -200,7 +207,7 @@ static void ip_capture(const HwSurface *s, const HwDepth *d, const HwVsp *prog, 
     c->kind = prog ? 1 : 0;
     c->surf = (int8_t)(s - s_hw.surf);
     c->depth = d ? (int8_t)(d - s_hw.depth) : -1;
-    c->soff = s->offset; c->sw = s->w; c->sh = s->h;
+    c->soff = s->offset; c->sw = s->w; c->sh = s->h; c->hsc = s->sc;
     c->vp = *vp; c->sc = *sc; c->rs = rs; c->bs = bs; memcpy(c->bf, bf, 16);
     c->dss = dss; c->sref = s_gpu.stencil_ref & 0xFF; c->ps = ps; c->pc = *pc;
     for (i = 0; i < 4; i++) {
@@ -286,7 +293,7 @@ static void ip_commit_clear(const HwSurface *s, const HwDepth *d, uint32_t param
     memset(r, 0, sizeof *r);
     r->kind = 2; r->partner = -1;
     r->surf = (int8_t)(s - s_hw.surf); r->depth = d ? (int8_t)(d - s_hw.depth) : -1;
-    r->soff = s->offset; r->sw = s->w; r->sh = s->h;
+    r->soff = s->offset; r->sw = s->w; r->sh = s->h; r->hsc = s->sc;
     r->cparam = param; r->cx0 = x0; r->cy0 = y0; r->cx1 = x1; r->cy1 = y1;
     memcpy(r->ccol, col, 16); r->cz = z; r->cst = st;
 }
@@ -470,15 +477,70 @@ static void ip_release_twins(void)
     s_ip.prev_valid = 0;
 }
 
+/* The interpolated picture may be rendered at a lower host scale than the real one (RECOMP_INTERP_SCALE, default 2;
+ * 0 = the same): the extra frame then costs about (2/3)^2 of the GPU time at the usual 3x window scale and is
+ * upscaled by the presenter. */
+static float ip_q(uint32_t hsc)
+{
+    return (s_ip.target_scale > 0 && hsc > (uint32_t)s_ip.target_scale) ? (float)s_ip.target_scale / (float)hsc : 1.0f;
+}
+static UINT ip_dim(UINT v, float q) { UINT r = (UINT)((float)v * q + 0.5f); return r ? r : 1; }
+
+static ID3D11ShaderResourceView *ip_ident_lut(void)
+{
+    static ID3D11Texture2D *tex; static ID3D11ShaderResourceView *srv;
+    if (!srv) {
+        D3D11_TEXTURE2D_DESC td;
+        D3D11_SUBRESOURCE_DATA sd;
+        uint32_t px[256]; int i;
+        for (i = 0; i < 256; i++) px[i] = 0xFF000000u | (uint32_t)(i * 0x010101);
+        memset(&td, 0, sizeof td);
+        td.Width = 256; td.Height = 1; td.MipLevels = 1; td.ArraySize = 1; td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        sd.pSysMem = px; sd.SysMemPitch = sizeof px; sd.SysMemSlicePitch = 0;
+        if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_hw.dev, &td, &sd, &tex)))
+            ID3D11Device_CreateShaderResourceView(s_hw.dev, (ID3D11Resource *)tex, NULL, &srv);
+    }
+    return srv;
+}
+
+/* Fill a smaller twin from the real surface (the frame did not start with a full clear of it). */
+static void ip_blit_down(ID3D11RenderTargetView *dst, UINT w, UINT h, ID3D11ShaderResourceView *src)
+{
+    D3D11_VIEWPORT vp;
+    ID3D11ShaderResourceView *lut = ip_ident_lut();
+    static const float bf[4] = {0, 0, 0, 0};
+    ID3D11ShaderResourceView *none[1] = {NULL};
+    if (!lut) return;
+    ID3D11DeviceContext_PSSetShaderResources(s_hw.ctx, 0, 1, none);
+    ID3D11DeviceContext_OMSetRenderTargets(s_hw.ctx, 1, &dst, NULL);
+    vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (float)w; vp.Height = (float)h; vp.MinDepth = 0; vp.MaxDepth = 1;
+    ID3D11DeviceContext_RSSetViewports(s_hw.ctx, 1, &vp);
+    ID3D11DeviceContext_RSSetState(s_hw.ctx, s_hw.rs_blit);
+    ID3D11DeviceContext_OMSetBlendState(s_hw.ctx, NULL, bf, 0xFFFFFFFFu);
+    ID3D11DeviceContext_OMSetDepthStencilState(s_hw.ctx, hw_depth_state(0), 0);
+    ID3D11DeviceContext_IASetInputLayout(s_hw.ctx, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(s_hw.ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_VSSetShader(s_hw.ctx, s_hw.vs_blit, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(s_hw.ctx, s_hw.ps_blit, NULL, 0);
+    ID3D11DeviceContext_PSSetSamplers(s_hw.ctx, 0, 1, &s_hw.samp_blit);
+    ID3D11DeviceContext_PSSetShaderResources(s_hw.ctx, 0, 1, &src);
+    ID3D11DeviceContext_PSSetShaderResources(s_hw.ctx, 4, 1, &lut);
+    ID3D11DeviceContext_PSSetSamplers(s_hw.ctx, 4, 1, &s_hw.samp_lut);
+    ID3D11DeviceContext_Draw(s_hw.ctx, 3, 0);
+    ID3D11DeviceContext_PSSetShaderResources(s_hw.ctx, 0, 1, none);
+}
+
 /* The twin of real surface `idx`; `copy_real` fills it from the real surface the first time
  * a replay touches it. NULL when it cannot be made. */
-static IpTwin *ip_twin(int idx, int copy_real)
+static IpTwin *ip_twin(int idx, int copy_real, float q)
 {
     HwSurface *rs = &s_hw.surf[idx];
     IpTwin *t = &s_ip.tw[idx];
     D3D11_TEXTURE2D_DESC td;
     if (!rs->tex) return NULL;
     ID3D11Texture2D_GetDesc(rs->tex, &td);
+    if (q < 1.0f) { td.Width = ip_dim(td.Width, q); td.Height = ip_dim(td.Height, q); }
     if (t->tex && (t->w != td.Width || t->h != td.Height)) {
         ID3D11ShaderResourceView_Release(t->srv);
         ID3D11RenderTargetView_Release(t->rtv);
@@ -493,19 +555,22 @@ static IpTwin *ip_twin(int idx, int copy_real)
     }
     if (t->epoch != s_ip.epoch) {
         t->epoch = s_ip.epoch;
-        if (copy_real)
-            ID3D11DeviceContext_CopyResource(s_hw.ctx, (ID3D11Resource *)t->tex, (ID3D11Resource *)rs->tex);
+        if (copy_real) {
+            if (q < 1.0f) ip_blit_down(t->rtv, t->w, t->h, rs->srv);
+            else ID3D11DeviceContext_CopyResource(s_hw.ctx, (ID3D11Resource *)t->tex, (ID3D11Resource *)rs->tex);
+        }
     }
     return t;
 }
 
-static IpTwinD *ip_twin_depth(int idx)
+static IpTwinD *ip_twin_depth(int idx, float q)
 {
     HwDepth *rd = &s_hw.depth[idx];
     IpTwinD *t = &s_ip.twd[idx];
     D3D11_TEXTURE2D_DESC td;
     if (!rd->tex) return NULL;
     ID3D11Texture2D_GetDesc(rd->tex, &td);
+    if (q < 1.0f) { td.Width = ip_dim(td.Width, q); td.Height = ip_dim(td.Height, q); }
     if (t->tex && (t->w != td.Width || t->h != td.Height)) {
         ID3D11DepthStencilView_Release(t->dsv);
         ID3D11Texture2D_Release(t->tex);
@@ -564,10 +629,11 @@ static int ip_replay_clear(const IpRec *r)
     uint32_t param = r->cparam;
     int full = (param & NV097_CLEAR_COLOR_MASK) == NV097_CLEAR_COLOR_MASK && r->cx0 == 0 && r->cy0 == 0
                && r->cx1 >= r->sw && r->cy1 >= r->sh;
-    t = ip_twin(r->surf, !((param & NV097_CLEAR_COLOR_MASK) && full));
+    float q = ip_q(r->hsc);
+    t = ip_twin(r->surf, !((param & NV097_CLEAR_COLOR_MASK) && full), q);
     if (!t) return 0;
     if (r->depth >= 0 && (param & 3)) {
-        td = ip_twin_depth(r->depth);
+        td = ip_twin_depth(r->depth, q);
         if (td)
             ID3D11DeviceContext_ClearDepthStencilView(s_hw.ctx, td->dsv,
                 ((param & 1) ? D3D11_CLEAR_DEPTH : 0) | ((param & 2) ? D3D11_CLEAR_STENCIL : 0), r->cz, r->cst);
@@ -597,11 +663,11 @@ static int ip_replay_clear(const IpRec *r)
             ID3D11Device_CreateBlendState(s_hw.dev, &bd, &bs);
             ID3D11DeviceContext_OMSetRenderTargets(s_hw.ctx, 1, &t->rtv, NULL);
             vp.TopLeftX = 0; vp.TopLeftY = 0;
-            vp.Width = (float)hw_px(s->w, s->sc); vp.Height = (float)(s->h * s->sc);
+            vp.Width = (float)t->w; vp.Height = (float)t->h;
             vp.MinDepth = 0; vp.MaxDepth = 1;
             ID3D11DeviceContext_RSSetViewports(s_hw.ctx, 1, &vp);
-            sc.left = (LONG)hw_px(r->cx0, s->sc); sc.top = (LONG)(r->cy0 * s->sc);
-            sc.right = (LONG)hw_px(r->cx1, s->sc); sc.bottom = (LONG)(r->cy1 * s->sc);
+            sc.left = (LONG)((float)hw_px(r->cx0, s->sc) * q); sc.top = (LONG)((float)(r->cy0 * s->sc) * q);
+            sc.right = (LONG)((float)hw_px(r->cx1, s->sc) * q + 0.999f); sc.bottom = (LONG)((float)(r->cy1 * s->sc) * q + 0.999f);
             ID3D11DeviceContext_RSSetScissorRects(s_hw.ctx, 1, &sc);
             ID3D11DeviceContext_RSSetState(s_hw.ctx, s_hw.rs[0]);
             ID3D11DeviceContext_OMSetBlendState(s_hw.ctx, bs, bf, 0xFFFFFFFFu);
@@ -631,12 +697,20 @@ static int ip_replay_draw(const IpFrame *cur, const IpRec *r, const IpFrame *pre
     uint32_t i;
     int st;
 
-    t = ip_twin(r->surf, 1);
+    float q = ip_q(r->hsc);
+    D3D11_VIEWPORT vpq = r->vp;
+    D3D11_RECT scq = r->sc;
+    t = ip_twin(r->surf, 1, q);
     if (!t) return 0;
-    if (r->depth >= 0) td = ip_twin_depth(r->depth);
+    if (q < 1.0f) {
+        vpq.TopLeftX *= q; vpq.TopLeftY *= q; vpq.Width *= q; vpq.Height *= q;
+        scq.left = (LONG)((float)scq.left * q); scq.top = (LONG)((float)scq.top * q);
+        scq.right = (LONG)((float)scq.right * q + 0.999f); scq.bottom = (LONG)((float)scq.bottom * q + 0.999f);
+    }
+    if (r->depth >= 0) td = ip_twin_depth(r->depth, q);
     ID3D11DeviceContext_OMSetRenderTargets(s_hw.ctx, 1, &t->rtv, td ? td->dsv : NULL);
-    ID3D11DeviceContext_RSSetViewports(s_hw.ctx, 1, &r->vp);
-    ID3D11DeviceContext_RSSetScissorRects(s_hw.ctx, 1, &r->sc);
+    ID3D11DeviceContext_RSSetViewports(s_hw.ctx, 1, &vpq);
+    ID3D11DeviceContext_RSSetScissorRects(s_hw.ctx, 1, &scq);
     ID3D11DeviceContext_RSSetState(s_hw.ctx, r->rs);
     ID3D11DeviceContext_OMSetBlendState(s_hw.ctx, r->bs, r->bf, 0xFFFFFFFFu);
     ID3D11DeviceContext_OMSetDepthStencilState(s_hw.ctx, r->dss, r->sref);
@@ -751,6 +825,7 @@ static int ip_replay(IpFrame *cur, IpFrame *prev, const HwSurface *disp, UINT pw
     D3D11_BOX box;
     D3D11_TEXTURE2D_DESC td;
     float T = s_ip.t;
+    int thr = s_ip.rp_threaded;
     LARGE_INTEGER q0, q1;
 
     QueryPerformanceCounter(&q0);
@@ -804,18 +879,38 @@ static int ip_replay(IpFrame *cur, IpFrame *prev, const HwSurface *disp, UINT pw
     if (disp->tex == NULL) return 0;
 
     s_ip.epoch++;
-    for (i = 0; i < cur->n && ok; i++) {
-        const IpRec *r = &cur->r[i];
-        if (!ip_check_target(r)) { ok = 0; break; }
-        ok = r->kind == 2 ? ip_replay_clear(r) : ip_replay_draw(cur, r, prev, T);
+    i = 0;
+    while (i < cur->n && ok) {
+        /* On the replay thread the D3D lock is taken in short slices, so the executor keeps answering the guest's
+         * flush kicks and drawing the next frame in between. */
+        LARGE_INTEGER c0, c1;
+        if (thr) EnterCriticalSection(&s_hw.lock);
+        QueryPerformanceCounter(&c0);
+        for (; i < cur->n && ok; ) {
+            const IpRec *r = &cur->r[i++];
+            if (!ip_check_target(r)) { ok = 0; break; }
+            ok = r->kind == 2 ? ip_replay_clear(r) : ip_replay_draw(cur, r, prev, T);
+            if (thr) {
+                QueryPerformanceCounter(&c1);
+                if ((double)(c1.QuadPart - c0.QuadPart) * 1000.0 / (double)s_ip.qf.QuadPart > s_ip.slice_ms) break;
+            }
+        }
+        s_hw.vs_last_valid = 0;
+        s_hw.ps_last_valid = 0;
+        if (thr) { LeaveCriticalSection(&s_hw.lock); Sleep(0); }
     }
     if (!ok) { s_ip.st_fail++; return 0; }
+    if (thr) EnterCriticalSection(&s_hw.lock);
     {
         int di = (int)(disp - s_hw.surf);
         dt = &s_ip.tw[di];
-        if (!dt->tex || dt->epoch != s_ip.epoch) { s_ip.st_cut_other++; return 0; }
+        if (!dt->tex || dt->epoch != s_ip.epoch) { s_ip.st_cut_other++; if (thr) LeaveCriticalSection(&s_hw.lock); return 0; }
     }
     ID3D11Texture2D_GetDesc(dt->tex, &td);
+    {
+        float qd = ip_q(disp->sc);
+        pw = ip_dim(pw, qd); ph = ip_dim(ph, qd);
+    }
     if (!s_ip.out_tex || s_ip.out_w != pw || s_ip.out_h != ph) {
         D3D11_TEXTURE2D_DESC od = td;
         if (s_ip.out_srv) ID3D11ShaderResourceView_Release(s_ip.out_srv);
@@ -826,12 +921,13 @@ static int ip_replay(IpFrame *cur, IpFrame *prev, const HwSurface *disp, UINT pw
             ID3D11Device_CreateShaderResourceView(s_hw.dev, (ID3D11Resource *)s_ip.out_tex, NULL, &s_ip.out_srv);
         s_ip.out_w = pw; s_ip.out_h = ph;
     }
-    if (!s_ip.out_srv || pw > td.Width || ph > td.Height) return 0;
+    if (!s_ip.out_srv || pw > td.Width || ph > td.Height) { if (thr) LeaveCriticalSection(&s_hw.lock); return 0; }
     box.left = 0; box.top = 0; box.front = 0; box.right = pw; box.bottom = ph; box.back = 1;
     ID3D11DeviceContext_CopySubresourceRegion(s_hw.ctx, (ID3D11Resource *)s_ip.out_tex, 0, 0, 0, 0,
                                               (ID3D11Resource *)dt->tex, 0, &box);
     s_hw.vs_last_valid = 0;
     s_hw.ps_last_valid = 0;
+    if (thr) LeaveCriticalSection(&s_hw.lock);
     QueryPerformanceCounter(&q1);
     s_ip.st_ms += (double)(q1.QuadPart - q0.QuadPart) * 1000.0 / (double)s_ip.qf.QuadPart;
     s_ip.st_shown++;
@@ -842,15 +938,50 @@ static int ip_replay(IpFrame *cur, IpFrame *prev, const HwSurface *disp, UINT pw
 
 /* At hw_flip, after the real picture was copied (disp != NULL: a fresh picture of size pw x ph).
  * Sets s_ip.show when an interpolated picture is to be presented first. */
-static void ip_flip(const HwSurface *disp, UINT pw, UINT ph)
+static void ip_stats(void)
 {
-    IpFrame *f = &s_ip.f[s_ip.cur], *pv = &s_ip.f[s_ip.cur ^ 1];
+    if (s_ip.dbg) {
+        DWORD now = GetTickCount();
+        if (!s_ip.st_t0) s_ip.st_t0 = now;
+        if (now - s_ip.st_t0 >= 1000) {
+            fprintf(stderr, "  [IP] frames %u shown %u cut(match %u prog %u other %u) fail %u; draws/frame %u matched %u lerped %u; replay %.2f ms/frame\n",
+                    s_ip.st_frames, s_ip.st_shown, s_ip.st_cut_match, s_ip.st_cut_prog, s_ip.st_cut_other, s_ip.st_fail,
+                    s_ip.st_frames ? s_ip.st_draws / s_ip.st_frames : 0, s_ip.st_frames ? s_ip.st_matched / s_ip.st_frames : 0,
+                    s_ip.st_frames ? s_ip.st_lerped / s_ip.st_frames : 0, s_ip.st_shown ? s_ip.st_ms / s_ip.st_shown : 0.0);
+            fprintf(stderr, "  [IPJ] replay job flip->done %.1f ms (n %u), flip waited for it %.1f ms total in %u flips\n",
+                    s_ip.st_jobs ? s_ip.st_job_ms / s_ip.st_jobs : 0.0, s_ip.st_jobs, s_ip.st_wait_ms, s_ip.st_waits);
+            s_ip.st_job_ms = s_ip.st_wait_ms = 0; s_ip.st_jobs = s_ip.st_waits = 0;
+            if (s_ip.dbg_level >= 3) {
+                fprintf(stderr, "  [IPH] rel-change histogram of program draws (<.01 <.05 <.1 <.2 <.3 <.5 <1 >=1): %u %u %u %u %u %u %u %u\n",
+                        s_ip.hist[0], s_ip.hist[1], s_ip.hist[2], s_ip.hist[3], s_ip.hist[4], s_ip.hist[5], s_ip.hist[6], s_ip.hist[7]);
+                memset(s_ip.hist, 0, sizeof s_ip.hist);
+            }
+            s_ip.st_frames = s_ip.st_shown = s_ip.st_cut_match = s_ip.st_cut_prog = s_ip.st_cut_other = s_ip.st_fail = 0;
+            s_ip.st_draws = s_ip.st_matched = s_ip.st_lerped = 0; s_ip.st_ms = 0; s_ip.st_t0 = now;
+        }
+    }
+}
+
+static void ip_start_job(void);
+
+/* Returns 1 when the presentation of this flip is deferred to ip_run_job (idle work of the executor thread). */
+static int ip_flip(const HwSurface *disp, UINT pw, UINT ph)
+{
+    IpFrame *f = &s_ip.f[s_ip.cur], *pv = &s_ip.f[(s_ip.cur + 2) % 3];
     int shown = 0;
     s_ip.show = NULL;
     if (s_ip.env_on) {                         /* interp_off.flag in the working directory: run-time A/B switch */
         static unsigned n;
         if ((n++ & 15u) == 0) {
             int want = GetFileAttributesA("interp_off.flag") == INVALID_FILE_ATTRIBUTES && (!s_ip.gov || s_ip.gov_on);
+            s_ip.defer = GetFileAttributesA("interp_nodefer.flag") == INVALID_FILE_ATTRIBUTES;
+            s_ip.gov = GetFileAttributesA("interp_nogov.flag") == INVALID_FILE_ATTRIBUTES && !s_ip.gov_env_off;
+            if (!s_ip.gov) s_ip.gov_on = 1;
+            {
+                FILE *sf = fopen("interp_slice.txt", "r");
+                float v;
+                if (sf) { if (fscanf(sf, "%f", &v) == 1 && v > 0.0f) s_ip.slice_ms = v; fclose(sf); }
+            }
             FILE *tf = fopen("interp_tune.txt", "r");
             if (tf) {
                 float a, b, c, d, e2;
@@ -860,11 +991,11 @@ static void ip_flip(const HwSurface *disp, UINT pw, UINT ph)
                 fclose(tf);
             }
             if (want != s_ip.enabled) {
-                ip_frame_reset(&s_ip.f[0]); ip_frame_reset(&s_ip.f[1]);
+                ip_frame_reset(&s_ip.f[0]); ip_frame_reset(&s_ip.f[1]); ip_frame_reset(&s_ip.f[2]); s_ip.job.valid = 0;
                 s_ip.prev_valid = 0; s_ip_cap_ok = 0;
                 s_ip.enabled = want;
                 fprintf(stderr, "  [IP] %s\n", want ? "enabled" : "disabled");
-                return;
+                return 0;
             }
         }
     }
@@ -875,30 +1006,42 @@ static void ip_flip(const HwSurface *disp, UINT pw, UINT ph)
         now_s = (double)q.QuadPart / (double)s_ip.qf.QuadPart;
         if (s_ip.gov_last) {
             dt = (double)(q.QuadPart - s_ip.gov_last) * 1000.0 / (double)s_ip.qf.QuadPart;
-            if (dt > 80.0) dt = 80.0;
-            s_ip.gov_ema = s_ip.gov_ema * 0.9 + dt * 0.1;
+            if (dt > 50.0) dt = 50.0;
+            s_ip.gov_ema = s_ip.gov_ema * 0.95 + dt * 0.05;
+            s_ip.gov_n++;
+            if (!s_ip.gov_on && s_ip.gov_n >= 30) s_ip.gov_base = s_ip.gov_ema;   /* what the game does by itself */
         }
         s_ip.gov_last = q.QuadPart;
-        if (s_ip.gov_on && s_ip.gov_ema > s_ip.gov_hi) {
-            s_ip.gov_on = 0;
+        if (s_ip.gov_on && s_ip.gov_n >= 60 && s_ip.gov_ema > s_ip.gov_base + s_ip.gov_hi) {
+            s_ip.gov_on = 0; s_ip.gov_n = 0;
             s_ip.gov_off_until = now_s + s_ip.gov_backoff;
             if (now_s - s_ip.gov_on_since > 20.0) s_ip.gov_backoff = 4.0;
             else if (s_ip.gov_backoff < 30.0) s_ip.gov_backoff *= 2.0;
             if (s_ip.dbg) fprintf(stderr, "  [IP] governor: off (flip interval %.1f ms), retry in %.0f s\n", s_ip.gov_ema, s_ip.gov_off_until - now_s);
-            ip_frame_reset(&s_ip.f[0]); ip_frame_reset(&s_ip.f[1]);
+            ip_frame_reset(&s_ip.f[0]); ip_frame_reset(&s_ip.f[1]); ip_frame_reset(&s_ip.f[2]); s_ip.job.valid = 0;
             s_ip.prev_valid = 0; s_ip_cap_ok = 0; s_ip.enabled = 0;
         } else if (!s_ip.gov_on && now_s >= s_ip.gov_off_until && GetFileAttributesA("interp_off.flag") == INVALID_FILE_ATTRIBUTES) {
-            s_ip.gov_on = 1; s_ip.gov_ema = 33.3; s_ip.gov_on_since = now_s;
+            s_ip.gov_on = 1; s_ip.gov_ema = s_ip.gov_base; s_ip.gov_n = 0; s_ip.gov_on_since = now_s;
             s_ip.enabled = 1;
             if (s_ip.dbg) fprintf(stderr, "  [IP] governor: probing\n");
         }
     }
-    if (!s_ip.enabled) return;
+    if (!s_ip.enabled) return 0;
     if (!disp || f->ndraw == 0) {              /* held / clear-only flip: not a frame */
         ip_frame_reset(f);
-        return;
+        return 0;
     }
     ip_finalize(f);
+    if (s_ip.defer && s_ip.prev_valid && s_ip.t > 0.0f && !s_ip.dump) {
+        { LARGE_INTEGER jq; QueryPerformanceCounter(&jq); s_ip.job_t0 = jq.QuadPart; }
+        s_ip.job.valid = 1; s_ip.job.fi = s_ip.cur; s_ip.job.pi = (s_ip.cur + 2) % 3;
+        s_ip.job.di = (int)(disp - s_hw.surf); s_ip.job.pw = pw; s_ip.job.ph = ph;
+        s_ip.cur = (s_ip.cur + 1) % 3;
+        ip_frame_reset(&s_ip.f[s_ip.cur]);
+        s_ip.prev_valid = 1;
+        ip_start_job();
+        return 1;
+    }
     if (s_ip.prev_valid && s_ip.t > 0.0f)
         shown = ip_replay(f, pv, disp, pw, ph);
     if (shown) {
@@ -922,26 +1065,11 @@ static void ip_flip(const HwSurface *disp, UINT pw, UINT ph)
         if (s_ip.dump_prev)
             ID3D11DeviceContext_CopyResource(s_hw.ctx, (ID3D11Resource *)s_ip.dump_prev, (ID3D11Resource *)s_hw.pres_tex);
     }
-    s_ip.cur ^= 1;                              /* this frame becomes the previous one */
+    s_ip.cur = (s_ip.cur + 1) % 3;              /* this frame becomes the previous one */
     ip_frame_reset(&s_ip.f[s_ip.cur]);
     s_ip.prev_valid = 1;
-    if (s_ip.dbg) {
-        DWORD now = GetTickCount();
-        if (!s_ip.st_t0) s_ip.st_t0 = now;
-        if (now - s_ip.st_t0 >= 1000) {
-            fprintf(stderr, "  [IP] frames %u shown %u cut(match %u prog %u other %u) fail %u; draws/frame %u matched %u lerped %u; replay %.2f ms/frame\n",
-                    s_ip.st_frames, s_ip.st_shown, s_ip.st_cut_match, s_ip.st_cut_prog, s_ip.st_cut_other, s_ip.st_fail,
-                    s_ip.st_frames ? s_ip.st_draws / s_ip.st_frames : 0, s_ip.st_frames ? s_ip.st_matched / s_ip.st_frames : 0,
-                    s_ip.st_frames ? s_ip.st_lerped / s_ip.st_frames : 0, s_ip.st_shown ? s_ip.st_ms / s_ip.st_shown : 0.0);
-            if (s_ip.dbg_level >= 3) {
-                fprintf(stderr, "  [IPH] rel-change histogram of program draws (<.01 <.05 <.1 <.2 <.3 <.5 <1 >=1): %u %u %u %u %u %u %u %u\n",
-                        s_ip.hist[0], s_ip.hist[1], s_ip.hist[2], s_ip.hist[3], s_ip.hist[4], s_ip.hist[5], s_ip.hist[6], s_ip.hist[7]);
-                memset(s_ip.hist, 0, sizeof s_ip.hist);
-            }
-            s_ip.st_frames = s_ip.st_shown = s_ip.st_cut_match = s_ip.st_cut_prog = s_ip.st_cut_other = s_ip.st_fail = 0;
-            s_ip.st_draws = s_ip.st_matched = s_ip.st_lerped = 0; s_ip.st_ms = 0; s_ip.st_t0 = now;
-        }
-    }
+    ip_stats();
+    return 0;
 }
 
 static DWORD WINAPI ip_presenter(LPVOID unused)
@@ -995,5 +1123,71 @@ static void ip_flush_pending(void)
         s_ip.pend = 0;
         s_ip.show = NULL;
         hw_present_locked(1);
+    }
+}
+
+/* The deferred half of ip_flip, on its own thread: replay in short lock slices, then present the interpolated picture
+ * and queue the real one. The guest and the executor are not held for it. */
+static DWORD WINAPI ip_worker(LPVOID unused)
+{
+    (void)unused;
+    s_ip.rp_threaded = 1;
+    for (;;) {
+        int shown = 0, di, ok;
+        WaitForSingleObject(s_ip.job_ev, INFINITE);
+        {   /* EcoQoS for this thread: the scheduler prefers the efficiency cores, away from the guest and executor */
+            static int eco = -1; static unsigned n;
+            if ((n++ & 31u) == 0) {
+                int want = s_ip.eco && GetFileAttributesA("interp_noeco.flag") == INVALID_FILE_ATTRIBUTES;
+                if (want != eco) {
+                    THREAD_POWER_THROTTLING_STATE ts;
+                    ts.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+                    ts.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+                    ts.StateMask = want ? THREAD_POWER_THROTTLING_EXECUTION_SPEED : 0;
+                    SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &ts, sizeof ts);
+                    eco = want;
+                }
+            }
+        }
+        if (!s_ip.job.valid) continue;
+        di = s_ip.job.di;
+        EnterCriticalSection(&s_hw.lock);
+        ok = di >= 0 && di < HW_MAX_SURFACES && s_hw.surf[di].tex;
+        LeaveCriticalSection(&s_hw.lock);
+        if (ok)
+            shown = ip_replay(&s_ip.f[s_ip.job.fi], &s_ip.f[s_ip.job.pi], &s_hw.surf[di], s_ip.job.pw, s_ip.job.ph);
+        EnterCriticalSection(&s_hw.lock);
+        s_ip.show = shown ? s_ip.out_srv : NULL;
+        s_hw.last_flip_ms = GetTickCount();
+        hw_present_locked(1);
+        if (shown) ip_schedule_real();
+        { LARGE_INTEGER jq; QueryPerformanceCounter(&jq);
+          s_ip.st_job_ms += (double)(jq.QuadPart - s_ip.job_t0) * 1000.0 / (double)s_ip.qf.QuadPart; s_ip.st_jobs++; }
+        ip_stats();
+        s_ip.job.valid = 0;
+        LeaveCriticalSection(&s_hw.lock);
+    }
+    return 0;
+}
+
+static void ip_start_job(void)
+{
+    if (!s_ip.job_ev) {
+        s_ip.job_ev = CreateEventA(NULL, FALSE, FALSE, NULL);
+        s_ip.job_th = CreateThread(NULL, 0, ip_worker, NULL, 0, NULL);
+        if (s_ip.job_th) SetThreadPriority(s_ip.job_th, THREAD_PRIORITY_BELOW_NORMAL);
+    }
+    SetEvent(s_ip.job_ev);
+}
+
+/* hw_flip, before it takes the lock: the previous frame's replay must be done (its frames are reused). */
+static void ip_wait_job(void)
+{
+    if (s_ip.job.valid) {
+        LARGE_INTEGER w0, w1;
+        QueryPerformanceCounter(&w0);
+        while (s_ip.job.valid) Sleep(0);
+        QueryPerformanceCounter(&w1);
+        s_ip.st_wait_ms += (double)(w1.QuadPart - w0.QuadPart) * 1000.0 / (double)s_ip.qf.QuadPart; s_ip.st_waits++;
     }
 }
