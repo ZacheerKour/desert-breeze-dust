@@ -134,6 +134,8 @@ typedef struct {
  * psdiag.flag = every draw uses the trivial pixel shader (what does the combiner cost?). */
 static volatile int s_hw_psdiag;
 static volatile LONG s_hw_presents;
+/* Presented frames so far (real plus interpolated), for the window title. */
+long nv2a_hw_presents(void) { return (long)s_hw_presents; }
 static double s_hw_pi_sum, s_hw_pi_sq, s_hw_pi_max; static unsigned s_hw_pi_n, s_hw_pi_slow, s_hw_pi_fast;
 
 /* Frame interpolation (nv2a_hw_interp.inc): which render target hw_texture() returned, and whether it
@@ -3365,6 +3367,7 @@ static int hw_method(uint32_t method, uint32_t param)
 }
 
 #else  /* !_WIN32 */
+long nv2a_hw_presents(void) { return -1; }
 static int  hw_active(void) { return 0; }
 static void hw_draw_batch(const Nv2aVshOutput *v, uint32_t n) { (void)v; (void)n; }
 static int  hw_draw_program_batch(void) { return 0; }

@@ -749,11 +749,21 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             static LONG f0;
             DWORD now = GetTickCount();
             if (now - t0 >= 1000) {
+                extern long nv2a_hw_presents(void);
+                static long p0;
                 LONG f = s_flips;
+                long pr = nv2a_hw_presents();
                 wchar_t tb[128];
-                _snwprintf(tb, 127, L"%ls | FPS: %.1f | draws: %ld", s_title,
-                           t0 ? (f - f0) * 1000.0 / (now - t0) : 0.0,
-                           (long)s_frame_draws);
+                /* FPS = frames shown (interpolated ones included); "game" = the title's own frames. */
+                if (pr >= 0 && t0 && pr - p0 > f - f0)
+                    _snwprintf(tb, 127, L"%ls | FPS: %.1f (game %.1f) | draws: %ld", s_title,
+                               (pr - p0) * 1000.0 / (now - t0), (f - f0) * 1000.0 / (now - t0),
+                               (long)s_frame_draws);
+                else
+                    _snwprintf(tb, 127, L"%ls | FPS: %.1f | draws: %ld", s_title,
+                               t0 ? (f - f0) * 1000.0 / (now - t0) : 0.0,
+                               (long)s_frame_draws);
+                p0 = pr;
                 tb[127] = 0;
                 SetWindowTextW(hwnd, tb);
                 t0 = now; f0 = f;
