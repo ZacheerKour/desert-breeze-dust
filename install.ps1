@@ -217,7 +217,7 @@ try {
     # ---------------------------------------------------------------------------------------------------------
     Step 'generate C code (several minutes)'
     $work = Join-Path $Root 'recomp-analysis'
-    Invoke-Native 'pd_pipeline.py' { & $vpy (Join-Path $Root 'pd_pipeline.py') --xbe $xbe --work $work --if-stale }
+    Invoke-Native 'pd_pipeline.py' { & $vpy (Join-Path $Root 'tools\pipeline\pd_pipeline.py') --xbe $xbe --work $work --if-stale }
 
     # ---------------------------------------------------------------------------------------------------------
     Step 'configure + build'
