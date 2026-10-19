@@ -141,6 +141,10 @@ static double s_hw_pi_sum, s_hw_pi_sq, s_hw_pi_max; static unsigned s_hw_pi_n, s
 /* Frame interpolation (nv2a_hw_interp.inc): which render target hw_texture() returned, and whether it
  * is the target being drawn into (then the caller got a copy). */
 static void ip_init(void);
+/* RECOMP_HW_FMTAUDIT=1 (pd-zmn): per texture format, textures uploaded, texels that sample_tex could not decode (they become
+ * white) and stage lookups that fell back to the white texture; printed every 5 s as [FMT]. */
+static struct { unsigned up, texels_bad, white, tex_total; unsigned w, h; } s_hw_fmt[256];
+static int s_hw_fmtaudit = -1;
 static HwSurface *s_ip_ta;
 static int s_ip_ts;
 
@@ -390,11 +394,17 @@ static const char s_hw_hlsl[] =
 "      o.a = rd_a(R[(f1 >> 8) & 15], f1 >> 8);\n"
 "    } else o = R[12];\n"
 "  }\n"
+"  float fa = o.a;\n"
 "  if (misc.y == 1) o = float4(s0.rgb, 1.0); else if (misc.y == 2) o = float4(s1.rgb, 1.0);\n"
 "  else if (misc.y == 3) o = float4(s2.rgb, 1.0); else if (misc.y == 4) o = float4(s3.rgb, 1.0);\n"
 "  else if (misc.y == 5) o = float4(i.d0.rgb, 1.0); else if (misc.y == 6) o = float4(i.d1.rgb, 1.0);\n"
 "  else if (misc.y == 7) o = float4(s0.aaa, 1.0); else if (misc.y == 8) o = float4(R[13].rgb, 1.0);\n"
 "  else if (misc.y == 9) o = float4(R[12].rgb, 1.0);\n"
+"  else if (misc.y == 11) o = float4(fa, fa, fa, 1.0);\n"
+"  else if (misc.y == 12) o = float4(i.t2.www, 1.0);\n"
+"  else if (misc.y == 13) o = float4(i.t3.www, 1.0);\n"
+"  else if (misc.y == 14) o = float4((R[8].a * 0.5 + 0.5).xxx, 1.0);\n"
+"  else if (misc.y == 15) o = float4(R[10].aaa, 1.0);\n"
 "  else if (misc.y == 10) o = float4(float(misc.z & 255u) / 255.0, float((misc.z >> 8) & 255u) / 255.0, float((misc.z >> 16) & 255u) / 255.0, 1.0);\n"
 "  o = saturate(o);\n"
 "  if (atest.x != 0) {\n"
@@ -901,12 +911,24 @@ static HwSurface *hw_surface(void)
     uint32_t bpp = surface_bpp(), off, w, h, i;
     HwSurface *s = NULL, *oldest = &s_hw.surf[0];
     D3D11_TEXTURE2D_DESC td;
+    ID3D11Texture2D *grow_from = NULL;
 
     if (!s_gpu.color_offset || !bpp || !s_gpu.pitch)
         return NULL;
     off = dma_resolve(s_gpu.color_offset);
     w = s_gpu.pitch / bpp;
     h = s_gpu.clip_y + s_gpu.clip_h;
+    {   /* pd-6l4: a swizzled render target (format type 2) has no pitch: its size is the log2 width/height in the format
+         * word. The title leaves SET_SURFACE_PITCH at the display buffer's 0xA00, so pitch / bpp registered the glow
+         * chain's 512x512 targets as 640x512 or 1280x512 surfaces at the display buffers' addresses (the intermittent
+         * 640x512 registration). RECOMP_HW_SWIZ_SURF=0 restores the old guess. */
+        static int on = -1;
+        if (on < 0) { const char *e = getenv("RECOMP_HW_SWIZ_SURF"); on = !(e && *e == '0'); }
+        if (on && ((s_gpu.format >> 8) & 0xF) == 2) {
+            uint32_t lw = (s_gpu.format >> 16) & 0xFF, lh = (s_gpu.format >> 24) & 0xFF;
+            if (lw >= 1 && lw <= 12 && lh >= 1 && lh <= 12) { w = 1u << lw; h = 1u << lh; }
+        }
+    }
     if (!w || !h || w > 4096 || h > 4096)
         return NULL;
     for (i = 0; i < HW_MAX_SURFACES; i++) {
@@ -924,11 +946,17 @@ static HwSurface *hw_surface(void)
     if (!s)
         s = oldest;
     if (s->tex) {
+        /* pd-6l4: a surface found to be taller than registered (a draw whose clip reaches below the rows seen so
+         * far) used to be recreated empty, wiping what the frame had drawn into it. Keep the old rows. */
+        if (s->offset == off && s->w == w && h > s->h && getenv("RECOMP_HW_GROW_WIPE") == NULL)
+            grow_from = s->tex, s->tex = NULL, ID3D11ShaderResourceView_Release(s->srv), ID3D11RenderTargetView_Release(s->rtv);
         if (s_hw.front == s) s_hw.front = NULL;
         if (s_hw.biggest == s) s_hw.biggest = NULL;
-        ID3D11ShaderResourceView_Release(s->srv);
-        ID3D11RenderTargetView_Release(s->rtv);
-        ID3D11Texture2D_Release(s->tex);
+        if (!grow_from) {
+            ID3D11ShaderResourceView_Release(s->srv);
+            ID3D11RenderTargetView_Release(s->rtv);
+            ID3D11Texture2D_Release(s->tex);
+        }
         memset(s, 0, sizeof *s);
     }
     memset(&td, 0, sizeof td);
@@ -938,13 +966,26 @@ static HwSurface *hw_surface(void)
     td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     td.SampleDesc.Count = 1;
     td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-    if (FAILED(ID3D11Device_CreateTexture2D(s_hw.dev, &td, NULL, &s->tex)))
+    if (FAILED(ID3D11Device_CreateTexture2D(s_hw.dev, &td, NULL, &s->tex))) {
+        if (grow_from) ID3D11Texture2D_Release(grow_from);
         return NULL;
+    }
     ID3D11Device_CreateRenderTargetView(s_hw.dev, (ID3D11Resource *)s->tex, NULL, &s->rtv);
     ID3D11Device_CreateShaderResourceView(s_hw.dev, (ID3D11Resource *)s->tex, NULL, &s->srv);
     {
         static const float black[4] = {0, 0, 0, 1};
         ID3D11DeviceContext_ClearRenderTargetView(s_hw.ctx, s->rtv, black);
+    }
+    if (grow_from) {
+        D3D11_TEXTURE2D_DESC od;
+        ID3D11Texture2D_GetDesc(grow_from, &od);
+        if (od.Width == td.Width && od.Height <= td.Height) {
+            D3D11_BOX bx; bx.left = 0; bx.top = 0; bx.front = 0; bx.right = od.Width; bx.bottom = od.Height; bx.back = 1;
+            ID3D11DeviceContext_CopySubresourceRegion(s_hw.ctx, (ID3D11Resource *)s->tex, 0, 0, 0, 0,
+                                                      (ID3D11Resource *)grow_from, 0, &bx);
+        }
+        ID3D11Texture2D_Release(grow_from);
+        grow_from = NULL;
     }
     s->offset = off; s->w = w; s->h = h; s->sc = hw_surface_scale(w);
     s->drawn_frame = s_hw.frame;
@@ -1160,10 +1201,38 @@ static ID3D11ShaderResourceView *hw_texture(int stage, const HwSurface *target)
     for (y = 0; y < t->height; y++)
         for (x = 0; x < t->width; x++) {
             uint32_t argb = 0xFFFFFFFFu;
-            if (!sample_tex(t, 0, x, y, &argb))
+            if (!sample_tex(t, 0, x, y, &argb)) {
                 argb = 0xFFFFFFFFu;
+                s_hw_fmt[t->color & 255].texels_bad++;
+            }
             px[(size_t)y * t->width + x] = argb;
         }
+    /* pd-s27 experiment (RECOMP_HW_DXT1DILATE=1): colour of the one-bit-transparent DXT1 texels = mean of the block's
+     * opaque texels instead of black, so bilinear filtering does not pull black into the cut-out edges. */
+    {
+        static int dil = -1;
+        if (dil < 0) { const char *e = getenv("RECOMP_HW_DXT1DILATE"); dil = e && *e && *e != '0'; }
+        if (dil && t->color == 0x0C) {
+            uint32_t bx, by, k;
+            for (by = 0; by + 4 <= t->height; by += 4)
+                for (bx = 0; bx + 4 <= t->width; bx += 4) {
+                    uint32_t sr = 0, sg = 0, sb = 0, n = 0;
+                    for (k = 0; k < 16; k++) {
+                        uint32_t v = px[(size_t)(by + (k >> 2)) * t->width + bx + (k & 3)];
+                        if (v >> 24) { sr += (v >> 16) & 255; sg += (v >> 8) & 255; sb += v & 255; n++; }
+                    }
+                    if (n && n < 16) {
+                        uint32_t fill = ((sr / n) << 16) | ((sg / n) << 8) | (sb / n);
+                        for (k = 0; k < 16; k++) {
+                            uint32_t *q = &px[(size_t)(by + (k >> 2)) * t->width + bx + (k & 3)];
+                            if (!(*q >> 24)) *q = fill;      /* alpha stays 0 */
+                        }
+                    }
+                }
+        }
+    }
+    s_hw_fmt[t->color & 255].up++;
+    s_hw_fmt[t->color & 255].w = t->width; s_hw_fmt[t->color & 255].h = t->height;
     mips = t->levels > 1 && tex_size_from_format(t->color);
     if (!c->tex) {
         memset(&td, 0, sizeof td);
@@ -1813,6 +1882,7 @@ static HwSurface *hw_bind_draw_state(const HwVsp *prog)
         }
         pc.tscale[st][2] = srv[st] ? 1.0f : 0.0f;
         if (!srv[st]) {
+            if (t->valid && (s_gpu.rc_seen ? (mode >= 1 && mode <= 3) : st == 0)) s_hw_fmt[t->color & 255].white++;
             if (hw_dbg_env("RECOMP_HW_GLOWDBG", 0) && (s_gpu.rc_seen ? (mode >= 1 && mode <= 3) : st == 0) && t->valid) {
                 static int nw;
                 if (nw++ < 40)
@@ -1906,6 +1976,35 @@ static HwSurface *hw_bind_draw_state(const HwVsp *prog)
     if (!s_hw.biggest || area >= s_hw.biggest_area) {
         s_hw.biggest = s;
         s_hw.biggest_area = area;
+    }
+    {   /* RECOMP_HW_DRAWDBG=<hex texture offset>: log the state of draws that sample that texture (first 6) */
+        static int init; static uint32_t want; static unsigned n;
+        if (!init) { const char *e = getenv("RECOMP_HW_DRAWDBG"); init = 1; want = e ? (uint32_t)strtoul(e, NULL, 16) : 0; }
+        if (want && n < 12) {
+            int k, hit = 0;
+            for (k = 0; k < 4; k++) if (s_gpu.texs[k].valid && s_gpu.texs[k].offset == want && (s_gpu.rc_seen ? (((s_gpu.rc.stage_program >> (k * 5)) & 0x1F) >= 1 && ((s_gpu.rc.stage_program >> (k * 5)) & 0x1F) <= 3) : k == 0)) hit = 1;
+            if (hit) {
+                n++;
+                fprintf(stderr, "[DRAW] #%u surf %08X %ux%u prog %s n=%u atest %u func %X ref %02X blend %u %X/%X eq %X cmask %08X depth t%u m%u f%X rc_seen %d ctl %08X stg %08X fin %08X/%08X\n", n,
+                        (unsigned)s->offset, (unsigned)s->w, (unsigned)s->h, prog ? "gpu" : "cpu", (unsigned)s_gpu.idx_count,
+                        (unsigned)s_gpu.alpha_test, (unsigned)s_gpu.alpha_func, (unsigned)s_gpu.alpha_ref,
+                        (unsigned)s_gpu.blend_enable, (unsigned)s_gpu.blend_sfactor, (unsigned)s_gpu.blend_dfactor, (unsigned)s_gpu.blend_equation,
+                        (unsigned)s_gpu.color_mask, (unsigned)s_gpu.depth_test, (unsigned)s_gpu.depth_mask, (unsigned)s_gpu.depth_func,
+                        (int)s_gpu.rc_seen, (unsigned)s_gpu.rc.control, (unsigned)s_gpu.rc.stage_program,
+                        (unsigned)s_gpu.rc.final0, (unsigned)s_gpu.rc.final1);
+                for (k = 0; k < 4; k++) {
+                    const Texture *t = &s_gpu.texs[k];
+                    if (t->valid)
+                        fprintf(stderr, "[DRAW]   tex%d off %08X %ux%u fmt %02X levels %u filter %08X addr %u/%u pitch %u srv %s%c", k, (unsigned)t->offset,
+                                (unsigned)t->width, (unsigned)t->height, (unsigned)t->color, (unsigned)t->levels, (unsigned)t->filter,
+                                (unsigned)t->addr_u, (unsigned)t->addr_v, (unsigned)t->pitch, srv[k] == s_hw.white ? "WHITE" : "ok", 10);
+                }
+                for (k = 0; k < (int)(s_gpu.rc.control & 0xFF) && k < 8; k++)
+                    fprintf(stderr, "[DRAW]   stage %d icw %08X aicw %08X ocw %08X aocw %08X c0 %08X c1 %08X\n", k,
+                            (unsigned)s_gpu.rc.color_icw[k], (unsigned)s_gpu.rc.alpha_icw[k], (unsigned)s_gpu.rc.color_ocw[k],
+                            (unsigned)s_gpu.rc.alpha_ocw[k], (unsigned)s_gpu.rc.factor0[k], (unsigned)s_gpu.rc.factor1[k]);
+            }
+        }
     }
     if (s_ip.enabled)
         ip_capture(s, d, prog, &vp, &sc, rs_sel, bs_sel, bf, ds_sel, ps_sel, &pc, srv, smp,
@@ -2200,11 +2299,12 @@ static void hw_maxdraw_refresh(void)
  * samples a 512-wide render target). The pixel-shader port mis-evaluates its combiner
  * setup and whites the frame out (software evaluation is correct); the proper fix is in
  * the HLSL combiner port. Phantom Dust only, off by default. */
+static volatile int s_hw_skipz_flag;      /* skipz.flag in the cwd (polled with RECOMP_PERF=1): same as RECOMP_HW_SKIPZONLY */
 static int hw_skip_zonly(void)
 {
     static int on = -1;
     if (on < 0) on = getenv("RECOMP_HW_SKIPZONLY") != NULL;
-    return on && (s_gpu.color_mask & 0x01010101u) == 0;
+    return (on || s_hw_skipz_flag) && (s_gpu.color_mask & 0x01010101u) == 0;
 }
 
 static int hw_skip_glow(void)
@@ -3031,6 +3131,7 @@ static void hw_perf_flip(void)
     if (!on) return;
     QueryPerformanceCounter(&q);
     s_hw_psdiag = GetFileAttributesA("psdiag.flag") != INVALID_FILE_ATTRIBUTES;
+    s_hw_skipz_flag = GetFileAttributesA("skipz.flag") != INVALID_FILE_ATTRIBUTES;
     s_hw_psspec_off = GetFileAttributesA("psspec_off.flag") != INVALID_FILE_ATTRIBUTES;
     if (!qf.QuadPart) { QueryPerformanceFrequency(&qf); t0 = q; lastq = q; return; }
     if (n < 512) iv[n++] = (double)(q.QuadPart - lastq.QuadPart) * 1000.0 / (double)qf.QuadPart;
@@ -3284,6 +3385,19 @@ static void hw_flip(void)
         }
     }
     s_hw.last_flip_ms = GetTickCount();
+    if (s_hw_fmtaudit < 0) s_hw_fmtaudit = getenv("RECOMP_HW_FMTAUDIT") != NULL;
+    if (s_hw_fmtaudit) {
+        static DWORD t0f;
+        DWORD nowf = GetTickCount();
+        if (nowf - t0f > 5000) {
+            int f;
+            t0f = nowf;
+            for (f = 0; f < 256; f++)
+                if (s_hw_fmt[f].up || s_hw_fmt[f].white)
+                    fprintf(stderr, "  [FMT] %02X: %u uploads (last %ux%u), %u undecodable texels, %u white-fallback lookups\n", f,
+                            s_hw_fmt[f].up, s_hw_fmt[f].w, s_hw_fmt[f].h, s_hw_fmt[f].texels_bad, s_hw_fmt[f].white);
+        }
+    }
     if (!ip_flip(ip_disp, ip_pw, ip_ph)) {
         hw_present_locked(1);
         if (s_ip.show)
