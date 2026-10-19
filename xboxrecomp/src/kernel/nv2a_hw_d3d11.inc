@@ -133,6 +133,16 @@ typedef struct {
 /* RECOMP_PERF diagnostics, toggled at run time by flag files in the working directory:
  * psdiag.flag = every draw uses the trivial pixel shader (what does the combiner cost?). */
 static volatile int s_hw_psdiag;
+static volatile LONG s_hw_presents;
+/* Presented frames so far (real plus interpolated), for the window title. */
+long nv2a_hw_presents(void) { return (long)s_hw_presents; }
+static double s_hw_pi_sum, s_hw_pi_sq, s_hw_pi_max; static unsigned s_hw_pi_n, s_hw_pi_slow, s_hw_pi_fast;
+
+/* Frame interpolation (nv2a_hw_interp.inc): which render target hw_texture() returned, and whether it
+ * is the target being drawn into (then the caller got a copy). */
+static void ip_init(void);
+static HwSurface *s_ip_ta;
+static int s_ip_ts;
 
 static struct {
     int tried, ok, scale, nocull;
@@ -873,6 +883,7 @@ static int hw_active(void)
     if (!s_hw.tried) {
         s_hw.tried = 1;
         InitializeCriticalSection(&s_hw.lock);
+        ip_init();
         if (getenv("RECOMP_HW"))
             s_hw.ok = hw_init();
     }
@@ -1094,8 +1105,10 @@ static ID3D11ShaderResourceView *hw_texture(int stage, const HwSurface *target)
                 fprintf(stderr, "  [TEX] frame=%u off=%08X ALIAS-SURFACE %ux%u drawn_frame=%u (tex %ux%u fmt=%X)%c", (unsigned)s_hw.frame, (unsigned)t->offset,
                         (unsigned)best->w, (unsigned)best->h, (unsigned)best->drawn_frame, (unsigned)t->width, (unsigned)t->height, (unsigned)t->color, 10);
         }
-        if (best)
+        if (best) {
+            s_ip_ta = best; s_ip_ts = best == target;
             return best == target ? hw_self_shadow(best) : best->srv;
+        }
     }
     if (!hw_mem_ok(t->offset, hw_tex_bytes(t)))
         return NULL;
@@ -1594,6 +1607,8 @@ static ID3D11PixelShader *hw_ps_pick(const HwPsConst *pc)
     return s_hw.ps;
 }
 
+#include "nv2a_hw_interp.inc"
+
 static HwSurface *hw_bind_draw_state(const HwVsp *prog)
 {
     HwSurface *s = hw_surface();
@@ -1604,6 +1619,12 @@ static HwSurface *hw_bind_draw_state(const HwVsp *prog)
     D3D11_RECT sc;
     ID3D11ShaderResourceView *srv[4];
     ID3D11SamplerState *smp[4];
+    ID3D11RasterizerState *rs_sel;
+    ID3D11BlendState *bs_sel;
+    ID3D11DepthStencilState *ds_sel;
+    ID3D11PixelShader *ps_sel;
+    HwSurface *alias_sel[4];
+    int self_sel[4];
     HwVsConst *vc = &s_hw.vs_last;
     /* The header (vp, fogp, ws, pad) and then cur[]: everything in HwVsConst
      * before the program constants. */
@@ -1664,11 +1685,14 @@ static HwSurface *hw_bind_draw_state(const HwVsp *prog)
         ID3D11RasterizerState **set = s_hw.front_face == 0x901 ? s_hw.rs_ccw : s_hw.rs;
         if (s_hw.cull_enable && !s_hw.nocull)
             mode = s_hw.cull_face == 0x404 ? 2 : (s_hw.cull_face == 0x405 ? 1 : 0);
-        ID3D11DeviceContext_RSSetState(s_hw.ctx, set[mode]);
+        rs_sel = set[mode];
+        ID3D11DeviceContext_RSSetState(s_hw.ctx, rs_sel);
     }
     hw_color4(s_gpu.blend_color, bf);
-    ID3D11DeviceContext_OMSetBlendState(s_hw.ctx, hw_blend_state(), bf, 0xFFFFFFFFu);
-    ID3D11DeviceContext_OMSetDepthStencilState(s_hw.ctx, hw_depth_state(d != NULL), s_gpu.stencil_ref & 0xFF);
+    bs_sel = hw_blend_state();
+    ds_sel = hw_depth_state(d != NULL);
+    ID3D11DeviceContext_OMSetBlendState(s_hw.ctx, bs_sel, bf, 0xFFFFFFFFu);
+    ID3D11DeviceContext_OMSetDepthStencilState(s_hw.ctx, ds_sel, s_gpu.stencil_ref & 0xFF);
 
     if (hw_dbg_env("RECOMP_HW_GLOWDBG", 0) && s->w < 640) {
         static uint32_t seen[16]; static int ns;
@@ -1778,8 +1802,10 @@ static HwSurface *hw_bind_draw_state(const HwVsp *prog)
         const Texture *t = &s_gpu.texs[st];
         uint32_t mode = (s_gpu.rc.stage_program >> (st * 5)) & 0x1F;
         srv[st] = NULL;
+        s_ip_ta = NULL; s_ip_ts = 0;
         if ((s_gpu.rc_seen ? (mode >= 1 && mode <= 3) : st == 0) && t->valid)
             srv[st] = hw_texture(st, s);
+        alias_sel[st] = srv[st] ? s_ip_ta : NULL; self_sel[st] = srv[st] ? s_ip_ts : 0;
         pc.tscale[st][0] = pc.tscale[st][1] = 1.0f;
         if (t->valid && !tex_size_from_format(t->color)) {
             pc.tscale[st][0] = 1.0f / (float)t->width;
@@ -1869,7 +1895,8 @@ static HwSurface *hw_bind_draw_state(const HwVsp *prog)
     ID3D11DeviceContext_IASetVertexBuffers(s_hw.ctx, 0, 1, &s_hw.vb, &stride, &zero);
     ID3D11DeviceContext_VSSetShader(s_hw.ctx, prog ? prog->vs : s_hw.vs, NULL, 0);
     ID3D11DeviceContext_VSSetConstantBuffers(s_hw.ctx, 0, 1, &s_hw.vs_cb);
-    ID3D11DeviceContext_PSSetShader(s_hw.ctx, s_hw_psdiag ? s_hw.ps_solid : hw_ps_pick(&pc), NULL, 0);
+    ps_sel = s_hw_psdiag ? s_hw.ps_solid : hw_ps_pick(&pc);
+    ID3D11DeviceContext_PSSetShader(s_hw.ctx, ps_sel, NULL, 0);
     ID3D11DeviceContext_PSSetConstantBuffers(s_hw.ctx, 0, 1, &s_hw.ps_cb);
     ID3D11DeviceContext_PSSetShaderResources(s_hw.ctx, 0, 4, srv);
     ID3D11DeviceContext_PSSetSamplers(s_hw.ctx, 0, 4, smp);
@@ -1880,6 +1907,9 @@ static HwSurface *hw_bind_draw_state(const HwVsp *prog)
         s_hw.biggest = s;
         s_hw.biggest_area = area;
     }
+    if (s_ip.enabled)
+        ip_capture(s, d, prog, &vp, &sc, rs_sel, bs_sel, bf, ds_sel, ps_sel, &pc, srv, smp,
+                   (const HwSurface *const *)alias_sel, self_sel, hdr);
     return s;
 }
 
@@ -2228,6 +2258,7 @@ static int hw_draw_program_batch(void)
     HwSurface *bound;
     float (*vout)[4];
     uint16_t *iout;
+    uint8_t *vrec = NULL; uint16_t *irec = NULL;
     LARGE_INTEGER t0, t1;
 
     if (s_hw.cpu_vsh || n < 3 || n > NV_MAX_INDICES)
@@ -2338,6 +2369,11 @@ static int hw_draw_program_batch(void)
     }
     vout = (float (*)[4])((uint8_t *)vmap.pData + s_hw.vb_off);
     iout = (uint16_t *)((uint8_t *)imap.pData + s_hw.ib_off);
+    if (s_ip.enabled) {                    /* write-combined memory cannot be read back: stage copies */
+        static uint8_t *vst; static uint16_t *ist;
+        if (!vst) { vst = (uint8_t *)malloc((size_t)NV_MAX_INDICES * 128); ist = (uint16_t *)malloc((size_t)NV_MAX_INDICES * 3 * 2); }
+        vrec = vst; irec = ist;
+    }
 
     if (++batch_id == 0) {
         memset(stamp, 0, sizeof stamp);
@@ -2355,10 +2391,12 @@ static int hw_draw_program_batch(void)
         for (; a < HW_VSP_SLOTS; a++)
             in[a][0] = in[a][1] = in[a][2] = in[a][3] = 0.0f;
         memcpy(vout[nv * HW_VSP_SLOTS], in, sizeof in);   /* write-combined: no reads */
+        if (vrec) memcpy(vrec + (size_t)nv * 128, in, sizeof in);
         nv++;
     }
 #define HW_IDX(x, y, z) do { iout[ni] = remap[s_gpu.idx[x]]; \
         iout[ni + 1] = remap[s_gpu.idx[y]]; iout[ni + 2] = remap[s_gpu.idx[z]]; \
+        if (irec) { irec[ni] = iout[ni]; irec[ni + 1] = iout[ni + 1]; irec[ni + 2] = iout[ni + 2]; } \
         ni += 3; } while (0)
     switch (s_gpu.prim) {
     case NV_PRIM_TRIANGLES:
@@ -2397,6 +2435,7 @@ static int hw_draw_program_batch(void)
         ID3D11DeviceContext_DrawIndexed(s_hw.ctx, ni, s_hw.ib_off / 2,
                                         (INT)(s_hw.vb_off / (uint32_t)sizeof(HwVertex)));
         hw_trace_end();
+        if (vrec) ip_commit_prog(vrec, nv, irec, ni);
         s_hw.draws++;
         s_hw.gpu_vsh_batches++;
         s_hw.tris += ni / 3;
@@ -2508,6 +2547,7 @@ static void hw_draw_batch(const Nv2aVshOutput *v, uint32_t n)
         hw_trace_begin();
         ID3D11DeviceContext_Draw(s_hw.ctx, count, s_hw.vb_off / (uint32_t)sizeof(HwVertex));
         hw_trace_end();
+        ip_commit_cpu(o, count);
         s_hw.vb_off += (uint32_t)sizeof(HwVertex) * count;
         s_hw.cpu_vsh_batches++;
         s_hw.draws++;
@@ -2556,6 +2596,13 @@ static void hw_clear(uint32_t param)
             s_hw.ctx, d->dsv,
             ((param & 1) ? D3D11_CLEAR_DEPTH : 0) | ((param & 2) ? D3D11_CLEAR_STENCIL : 0),
             z, (UINT8)(s_gpu.zstencil_clear & 0xFF));
+    }
+    if (s_ip.enabled && (param & (0x03 | NV097_CLEAR_COLOR_MASK))) {
+        float c[4];
+        float z = d ? (float)(hw_zmax_bits() == 0xFFFFu ? (s_gpu.zstencil_clear & 0xFFFF) : (s_gpu.zstencil_clear >> 8))
+                      / (float)hw_zmax_bits() : 1.0f;
+        hw_color4(s_gpu.clear_color, c);
+        ip_commit_clear(s, d, param, x0, y0, x1, y1, c, z, (uint8_t)(s_gpu.zstencil_clear & 0xFF));
     }
     if (param & NV097_CLEAR_COLOR_MASK) {
         float c[4];
@@ -2625,6 +2672,7 @@ static void hw_clear(uint32_t param)
 static void hw_release_all_targets(void)
 {
     int i;
+    ip_release_twins();
     for (i = 0; i < HW_MAX_SURFACES; i++) {
         HwSurface *t = &s_hw.surf[i];
         if (t->tex) {
@@ -2715,7 +2763,8 @@ static void hw_present_locked(int vsync)
         ID3D11DeviceContext_PSSetSamplers(s_hw.ctx, 4, 1, &s_hw.samp_lut);
     }
     if (s_hw.pres_valid && s_hw.pres_srv) {
-        ID3D11DeviceContext_PSSetShaderResources(s_hw.ctx, 0, 1, &s_hw.pres_srv);
+        ID3D11ShaderResourceView *shown = s_ip.show ? s_ip.show : s_hw.pres_srv;
+        ID3D11DeviceContext_PSSetShaderResources(s_hw.ctx, 0, 1, &shown);
         ID3D11DeviceContext_Draw(s_hw.ctx, 3, 0);
     } else if (s_hw.front && s_hw.front->srv) {
         ID3D11DeviceContext_PSSetShaderResources(s_hw.ctx, 0, 1, &s_hw.front->srv);
@@ -2829,7 +2878,20 @@ static void hw_present_locked(int vsync)
     }
     /* A flip waits for the host's vertical blank, which is what paces a title
      * that draws as fast as it is allowed to; repaints do not. */
+    s_hw_presents++;
     QueryPerformanceCounter(&t0);
+    {   /* interval between presented frames, for the [PERF] line */
+        static LARGE_INTEGER lastp, pf;
+        if (!pf.QuadPart) QueryPerformanceFrequency(&pf);
+        if (lastp.QuadPart) {
+            double dt = (double)(t0.QuadPart - lastp.QuadPart) * 1000.0 / (double)pf.QuadPart;
+            s_hw_pi_n++; s_hw_pi_sum += dt; s_hw_pi_sq += dt * dt;
+            if (dt > s_hw_pi_max) s_hw_pi_max = dt;
+            if (dt > 20.0) s_hw_pi_slow++;
+            if (dt < 10.0) s_hw_pi_fast++;
+        }
+        lastp = t0;
+    }
     if (s_hw.tearing)   /* never blocks on the host monitor; hw_flip paces to the console rate */
         IDXGISwapChain_Present(s_hw.swap, 0, DXGI_PRESENT_ALLOW_TEARING);
     else
@@ -2962,6 +3024,7 @@ static void hw_perf_flip(void)
     static LARGE_INTEGER qf, lastq, t0;
     static double iv[512]; static int n;
     static uint64_t pr0, ex0, dr0;
+    static LONG pres0;
     static ULONGLONG cpu0;
     LARGE_INTEGER q;
     if (on < 0) { const char *e = getenv("RECOMP_PERF"); on = e ? atoi(e) : 0; }
@@ -2982,8 +3045,8 @@ static void hw_perf_flip(void)
         p99 = n ? iv[(int)((n - 1) * 0.99 + 0.5)] : 0;
         GetProcessTimes(GetCurrentProcess(), &c, &x, &k, &u);
         cpu = (((ULONGLONG)k.dwHighDateTime << 32) | k.dwLowDateTime) + (((ULONGLONG)u.dwHighDateTime << 32) | u.dwLowDateTime);
-        fprintf(stderr, "  [PERF] flips %d in %.2fs (%.1f fps) interval avg %.1f p99 %.1f max %.1f ms, >50ms %d; per s: present %.0f ms, executor %.0f ms, draws %.0f ms; psfb %ld; cpu %.2f cores\n",
-                n, secs, n / secs, n ? sum / n : 0.0, p99, mx, slow,
+        fprintf(stderr, "  [PERF] presents %ld (%.1f/s) flips %d in %.2fs (%.1f fps) interval avg %.1f p99 %.1f max %.1f ms, >50ms %d; per s: present %.0f ms, executor %.0f ms, draws %.0f ms; psfb %ld; cpu %.2f cores\n",
+                (long)(s_hw_presents - pres0), (double)(s_hw_presents - pres0) / secs, n, secs, n / secs, n ? sum / n : 0.0, p99, mx, slow,
                 (double)(s_hw.present_ticks - pr0) * ms / secs, (double)(g_nv2a_exec_ticks - ex0) * ms / secs,
                 (double)(s_hw_stat_draw_ticks - dr0) * ms / secs, (long)InterlockedExchange(&s_hw_psv_fb, 0),
                 cpu0 ? (double)(cpu - cpu0) / 1e7 / secs : 0.0);
@@ -3023,7 +3086,12 @@ static void hw_perf_flip(void)
             for (i = 0; i < 4; i++) fprintf(stderr, " %lu=%.2f", (unsigned long)top[i].tid, (double)top[i].d / 1e7 / secs);
             fprintf(stderr, " cores\n");
         }
-        cpu0 = cpu; pr0 = s_hw.present_ticks; ex0 = g_nv2a_exec_ticks; dr0 = s_hw_stat_draw_ticks;
+        if (s_hw_pi_n > 1) {
+            double mean = s_hw_pi_sum / s_hw_pi_n, var = s_hw_pi_sq / s_hw_pi_n - mean * mean;
+            fprintf(stderr, "  [PERF-PRES] present interval mean %.2f std %.2f max %.1f ms; >20ms %u, <10ms %u of %u\n", mean, var > 0 ? sqrt(var) : 0.0, s_hw_pi_max, s_hw_pi_slow, s_hw_pi_fast, s_hw_pi_n);
+        }
+        s_hw_pi_sum = s_hw_pi_sq = s_hw_pi_max = 0; s_hw_pi_n = s_hw_pi_slow = s_hw_pi_fast = 0;
+        pres0 = s_hw_presents; cpu0 = cpu; pr0 = s_hw.present_ticks; ex0 = g_nv2a_exec_ticks; dr0 = s_hw_stat_draw_ticks;
         n = 0; t0 = q;
     }
 }
@@ -3031,6 +3099,7 @@ static void hw_perf_flip(void)
 static void hw_flip(void)
 {
     unsigned s_hw_framedraws_at_flip = s_hw_framedraws;
+    const HwSurface *ip_disp = NULL; UINT ip_pw = 0, ip_ph = 0;
     if (s_hw.pace_hz > 0.0) {
         /* Presentation is paced here, by the console's rate, not by the host monitor:
          * a 30 Hz or 144 Hz display must not change how often the title may flip.
@@ -3058,7 +3127,9 @@ static void hw_flip(void)
         prev = d; last = now;
     }
     hw_maxdraw_refresh();
+    ip_wait_job();
     EnterCriticalSection(&s_hw.lock);
+    ip_flush_pending();
     hw_glow_dump_check(s_hw.biggest, 1);
     /* Which surface is the picture? The largest one drawn this frame is usually
      * right, but the same memory is sometimes drawn under a second, larger shape
@@ -3140,6 +3211,7 @@ static void hw_flip(void)
                 ID3D11DeviceContext_CopySubresourceRegion(s_hw.ctx, (ID3D11Resource *)s_hw.pres_tex, 0, 0, 0, 0,
                                                           (ID3D11Resource *)s_hw.biggest->tex, 0, &cbox);
                 s_hw.pres_valid = 1;
+                ip_disp = s_hw.biggest; ip_pw = td.Width; ip_ph = td.Height;
                 if (getenv("RECOMP_HW_FLICKERDBG")) hw_flicker_probe();
             }
             s_hw.flip_prev_draws = clear_only ? 0 : d;
@@ -3212,9 +3284,18 @@ static void hw_flip(void)
         }
     }
     s_hw.last_flip_ms = GetTickCount();
-    hw_present_locked(1);
+    if (!ip_flip(ip_disp, ip_pw, ip_ph)) {
+        hw_present_locked(1);
+        if (s_ip.show)
+            ip_schedule_real();
+    }
     hw_perf_flip();
     LeaveCriticalSection(&s_hw.lock);
+}
+
+/* Executor thread, when it has nothing new to scan: the interpolation's replay (see ip_run_job). */
+void nv2a_hw_idle_work(void)
+{
 }
 
 /* Called by the window thread about 60 times a second. A title that is not
@@ -3293,11 +3374,13 @@ static int hw_method(uint32_t method, uint32_t param)
 }
 
 #else  /* !_WIN32 */
+long nv2a_hw_presents(void) { return -1; }
 static int  hw_active(void) { return 0; }
 static void hw_draw_batch(const Nv2aVshOutput *v, uint32_t n) { (void)v; (void)n; }
 static int  hw_draw_program_batch(void) { return 0; }
 static void hw_clear(uint32_t param) { (void)param; }
 static void hw_flip(void) {}
+void nv2a_hw_idle_work(void) {}
 void xbox_SetGammaRamp(const uint8_t *rgb768) { (void)rgb768; }
 static int  hw_method(uint32_t method, uint32_t param) { (void)method; (void)param; return 0; }
 void nv2a_hw_idle_present(void) {}
