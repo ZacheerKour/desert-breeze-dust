@@ -25,12 +25,16 @@ import struct
 import subprocess
 import sys
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+# Frozen (make_soundtrack.exe in a release folder): files live next to the exe, not in the unpack dir.
+HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 MUSIC = os.path.join(HERE, "extracted", "TDATA", "FFFE0000", "MUSIC")
 AUDIO = (".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".wma", ".opus")
 
 
 def find_ffmpeg():
+    bundled = os.path.join(HERE, "tools", "ffmpeg", "ffmpeg.exe")
+    if os.path.isfile(bundled):
+        return bundled
     p = shutil.which("ffmpeg")
     if p:
         return p
@@ -58,10 +62,17 @@ def duration_ms(ffmpeg, path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("folder")
-    ap.add_argument("--name", default="Custom Soundtrack")
+    ap.add_argument("--name", default=None, help="soundtrack name shown in Music Manager (default: the folder name)")
     ap.add_argument("--id", type=int, default=1)
     ap.add_argument("--bitrate", default="128k")
     a = ap.parse_args()
+    a.folder = os.path.abspath(a.folder.strip('"'))
+    if not os.path.isdir(a.folder):
+        sys.exit("not a folder: " + a.folder)
+    if not a.name:
+        a.name = os.path.basename(a.folder.rstrip("\\/")) or "Custom Soundtrack"
+    if not os.path.isfile(os.path.join(HERE, "extracted", "default.xbe")):
+        sys.exit(r"extracted\default.xbe not found next to this tool: run INSTALL.bat with your disc first")
     ff = find_ffmpeg()
     files = sorted(f for f in os.listdir(a.folder) if f.lower().endswith(AUDIO))
     if not files:
