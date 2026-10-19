@@ -101,7 +101,8 @@ volatile int g_fn_watch_arm;
 volatile int g_pd_stage_req = -1;
 volatile DWORD g_fncount_ms = 1000;
 volatile int g_pd_quest_req = -1;
-extern volatile int g_pd_quest_phase;
+volatile int g_pd_hub_req = 0, g_pd_hook_va = 0;   /* console `hub`: end the stage and start the town (pd-sweep) */
+extern volatile int g_pd_quest_phase, g_pd_hub_phase;
 static struct { uint32_t va; unsigned n; } s_fnw[4096];
 static int s_fnw_n;
 /* pd-i0w: "wfn <hexaddr>" in the RECOMP_MEM_LIVE console (mode 5 only) reports, when the dword at that guest address
@@ -203,7 +204,9 @@ void recomp_fn_watch_hit(uint32_t va)
                 }
             }
         }
-        if ((va == 0xDE980u || va == 0xB83B0u) && (g_pd_quest_req >= 0 || g_pd_quest_phase >= 1)) {
+        if (va == 0x1A9B80u || va == 0x1A9BE0u) { extern void pd_reg_hook(uint32_t); pd_reg_hook(va); }
+        if ((va == 0xDE980u || va == 0xB83B0u) && (g_pd_quest_req >= 0 || g_pd_quest_phase >= 1 || g_pd_hub_req || g_pd_hub_phase)) {
+            g_pd_hook_va = (int)va;
             extern void pd_quest_step(int req);
             int q = g_pd_quest_req; g_pd_quest_req = -1;
             pd_quest_step(q);
@@ -392,6 +395,9 @@ static DWORD WINAPI pd_mem_live(LPVOID unused)
                         }
                     }
                     fprintf(stderr, "[PAT] done %X %X %X: %u hits%c", a, v, v3, shown, 10);
+                } else if (!strncmp(line, "hub", 3)) {
+                    g_pd_hub_req = 1;
+                    fprintf(stderr, "[MEM] hub request%c", 10);
                 } else if (sscanf(line, "quest %d", &sz) == 1) {
                     g_pd_quest_req = sz;
                     fprintf(stderr, "[MEM] quest request %d%c", sz, 10);
