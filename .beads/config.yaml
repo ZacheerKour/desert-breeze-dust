@@ -110,5 +110,4 @@
 
 # - github.token    → use GITHUB_TOKEN env var instead
 
-sync:
-    remote: "git+https://github.com/ZacheerKour/desert-breeze-dust.git"
+# sync: the issue database is not synced to the public repo; .beads/issues.jsonl is the shared copy.
