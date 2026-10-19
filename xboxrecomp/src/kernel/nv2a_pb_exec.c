@@ -900,6 +900,8 @@ static uint32_t linear_twin(uint32_t fmt)
     case 0x06: return 0x12;                /* A8R8G8B8  -> LIN_A8R8G8B8  */
     case 0x07: return 0x1E;                /* X8R8G8B8  -> LIN_X8R8G8B8  */
     case 0x19: return 0x1F;                /* A8        -> LIN_A8        */
+    case 0x01: return 0x1B;                /* AY8       -> LIN_AY8       (pd-zmn: was undecoded) */
+    case 0x1A: return 0x20;                /* A8Y8      -> LIN_A8Y8      (pd-zmn) */
     default:   return fmt;                 /* already linear, or unhandled */
     }
 }
@@ -1045,6 +1047,16 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
     case 0x1F:                                      /* LIN_A8 */
         *argb = ((uint32_t)p[u] << 24) | 0x00FFFFFFu;
         return 1;
+    case 0x1B: {                                    /* LIN_AY8: one byte is both the colour and the alpha (pd-zmn) */
+        uint32_t t = p[u];
+        *argb = (t << 24) | (t << 16) | (t << 8) | t;
+        return 1;
+    }
+    case 0x20: {                                    /* LIN_A8Y8: alpha in the high byte, luminance in the low (pd-zmn) */
+        uint32_t t = ((const uint16_t *)p)[u];
+        *argb = ((t >> 8) << 24) | ((t & 0xFFu) << 16) | ((t & 0xFFu) << 8) | (t & 0xFFu);
+        return 1;
+    }
 
     /* 4:2:2 packed YUV, two texels per four bytes.
      *
@@ -1658,10 +1670,10 @@ static uint32_t modulate(uint32_t t, const float c[4])
 static uint32_t tex_texel_bytes(uint32_t fmt)
 {
     switch (fmt) {
-    case 0x00: case 0x01: case 0x0B: case 0x13: case 0x19: case 0x1F:
+    case 0x00: case 0x01: case 0x0B: case 0x13: case 0x19: case 0x1B: case 0x1F:
         return 1;
     case 0x02: case 0x03: case 0x04: case 0x05: case 0x10: case 0x11:
-    case 0x1C: case 0x1D:
+    case 0x1A: case 0x1C: case 0x1D: case 0x20:
         return 2;
     default:
         return 4;
