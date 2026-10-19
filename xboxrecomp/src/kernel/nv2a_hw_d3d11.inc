@@ -196,6 +196,7 @@ static struct {
     HwTexture *texs;                     /* HW_MAX_TEXTURES, open addressing */
     HwSurface *front, *biggest;          /* shown / largest drawn this frame */
     uint32_t biggest_area;
+    int alias_only;                      /* this flip drew only a non-video alias: keep the last picture */
     uint32_t frame;
     DWORD last_flip_ms;
     ID3D11Texture2D *ovl_tex;
@@ -3250,8 +3251,31 @@ static void hw_flip(void)
         } else {
             s_hw.cand_w = s_hw.biggest->w; s_hw.cand_h = s_hw.biggest->h; s_hw.cand_streak = 1;
         }
-        if (!s_hw.disp_w || (s_hw.cand_streak >= 3 && (s_hw.cand_w != s_hw.disp_w || s_hw.cand_h != s_hw.disp_h) && s_hw.cand_w >= 640)) {
+        /* Only a real video mode can become the display shape. An effect pass
+         * that draws a 640x512 / 1280x512 alias of the display buffer for a few
+         * frames in a row (cutscenes do) used to win the three-flip vote, and the
+         * presenter then showed that mostly black alias: a flicker that settled on
+         * a black screen (user report, Clinic cutscene, fast desktop GPU).
+         * RECOMP_HW_ANYSHAPE=1 restores the old rule. */
+        static int anyshape = -1;
+        int video_mode;
+        if (anyshape < 0) anyshape = getenv("RECOMP_HW_ANYSHAPE") ? 1 : 0;
+        video_mode = anyshape
+            || ((s_hw.cand_w == 640 || s_hw.cand_w == 720) && (s_hw.cand_h == 448 || s_hw.cand_h == 468 || s_hw.cand_h == 480 || s_hw.cand_h == 576))
+            || (s_hw.cand_w == 1280 && s_hw.cand_h == 720) || (s_hw.cand_w == 1920 && s_hw.cand_h == 1080);
+        if (!s_hw.disp_w || (s_hw.cand_streak >= 3 && (s_hw.cand_w != s_hw.disp_w || s_hw.cand_h != s_hw.disp_h) && s_hw.cand_w >= 640 && video_mode)) {
+            if (s_hw.disp_w != s_hw.cand_w || s_hw.disp_h != s_hw.cand_h) {
+                static unsigned nlog;
+                if (nlog++ < 200)
+                    fprintf(stderr, "  [PRESENT] display shape %ux%u -> %ux%u (surface %08X, frame %u)\n", (unsigned)s_hw.disp_w, (unsigned)s_hw.disp_h,
+                            (unsigned)s_hw.cand_w, (unsigned)s_hw.cand_h, (unsigned)s_hw.biggest->offset, (unsigned)s_hw.frame);
+            }
             s_hw.disp_w = s_hw.cand_w; s_hw.disp_h = s_hw.cand_h;
+        } else if (s_hw.cand_streak == 3 && !video_mode && (s_hw.cand_w != s_hw.disp_w || s_hw.cand_h != s_hw.disp_h)) {
+            static unsigned nrej;
+            if (nrej++ < 200)
+                fprintf(stderr, "  [PRESENT] ignored non-video shape %ux%u (surface %08X, frame %u); keeping %ux%u\n", (unsigned)s_hw.cand_w, (unsigned)s_hw.cand_h,
+                        (unsigned)s_hw.biggest->offset, (unsigned)s_hw.frame, (unsigned)s_hw.disp_w, (unsigned)s_hw.disp_h);
         }
         for (q = 0; q < HW_MAX_SURFACES; q++) {
             HwSurface *t = &s_hw.surf[q];
@@ -3259,6 +3283,9 @@ static void hw_flip(void)
                 && (!best || t->w * t->h >= best->w * best->h))
                 best = t;
         }
+        /* Nothing of the display shape was drawn this frame and the biggest
+         * surface is not a video mode (an effect alias): keep the last picture. */
+        s_hw.alias_only = !best && !video_mode && s_hw.disp_w && !anyshape;
         if (best && best != s_hw.biggest) {
             if (getenv("RECOMP_HW_FLICKERDBG"))
                 fprintf(stderr, "  [FLK] present %08X %ux%u instead of %08X %ux%u\n", (unsigned)best->offset, (unsigned)best->w, (unsigned)best->h,
@@ -3278,7 +3305,12 @@ static void hw_flip(void)
          * flip in a row is a deliberate fade/black and is shown. */
         unsigned d = s_hw_framedraws_at_flip;
         int clear_only = (d == 0);
-        if (clear_only && s_hw.flip_prev_draws > 100 && !s_hw.flip_held && s_hw.pres_valid) {
+        if (s_hw.alias_only && s_hw.pres_valid) {
+            static unsigned nhold;
+            if (nhold++ < 50)
+                fprintf(stderr, "  [PRESENT] held the last picture: only a %ux%u alias was drawn (frame %u)\n",
+                        (unsigned)s_hw.biggest->w, (unsigned)s_hw.biggest->h, (unsigned)s_hw.frame);
+        } else if (clear_only && s_hw.flip_prev_draws > 100 && !s_hw.flip_held && s_hw.pres_valid) {
             s_hw.flip_held = 1;
             if (getenv("RECOMP_HW_FLICKERDBG")) fprintf(stderr, "  [FLK] held a clear-only flip (prev draws %u)\n", s_hw.flip_prev_draws);
         } else {
