@@ -111,6 +111,14 @@ static CRITICAL_SECTION g_cpu_cs;
 static volatile LONG g_cpu_cs_init = 0;          /* 0 = no, 1 = initialising, 2 = ready */
 static XBOX_THREAD_LOCAL int t_cpu_held = 0;     /* this thread's lock acquisitions through irql_track */
 static XBOX_THREAD_LOCAL int t_isr_owner = 0;
+/* pd-ojl follow-up (2026-10-19): long-hold attribution. The outermost hold of the CPU lock is timed on every thread; a hold over
+ * 50 ms is logged ([IRQLLONG], first 60) with the thread's role, hold time and the guest/host return addresses at acquire. */
+static XBOX_THREAD_LOCAL const char *t_role = "guest";
+static XBOX_THREAD_LOCAL LONGLONG t_hold_q0;
+static XBOX_THREAD_LOCAL uint32_t t_hold_gra;
+static XBOX_THREAD_LOCAL void *t_hold_hra;
+static volatile LONG g_long_holds;
+void xbox_IrqlSetRole(const char *r) { t_role = r; }
 static volatile LONG g_isr_overlaps = 0, g_isr_waits = 0, g_isr_giveups = 0, g_isr_begins = 0, g_isr_deferred = 0;
 static int s_cpu_lock_on = -1;
 
@@ -207,6 +215,10 @@ static void cpu_lock_enter(void)
                     if (w > ip->maxwait) { ip->maxwait = w; ip->wait_ra = t_ip_ra; }
                 }
             }
+            if (t_cpu_held == 0) {
+                LARGE_INTEGER hq; QueryPerformanceCounter(&hq); t_hold_q0 = hq.QuadPart;
+                t_hold_gra = g_esp ? *(uint32_t *)((uintptr_t)g_xbox_mem_offset + g_esp) : 0;
+            }
             t_cpu_held++;
             return;
         }
@@ -230,6 +242,16 @@ static void cpu_lock_enter(void)
 
 static void cpu_lock_leave(void)
 {
+    if (t_cpu_held == 1 && t_hold_q0) {
+        LARGE_INTEGER hq, hf; double ms;
+        QueryPerformanceCounter(&hq); QueryPerformanceFrequency(&hf);
+        ms = (double)(hq.QuadPart - t_hold_q0) * 1000.0 / (double)hf.QuadPart;
+        t_hold_q0 = 0;
+        if (ms > 50.0 && InterlockedIncrement(&g_long_holds) <= 60)
+            fprintf(stderr, "  [IRQLLONG] tid %lu role %s held the CPU lock %.0f ms; acquired at guest ret %08X, host %p; released at guest ret %08X\n",
+                    (unsigned long)GetCurrentThreadId(), t_role, ms, t_hold_gra, t_hold_hra,
+                    g_esp ? *(uint32_t *)((uintptr_t)g_xbox_mem_offset + g_esp) : 0);
+    }
     if (t_cpu_held > 0) {
         if (s_ip_on == 1 && t_cpu_held == 1) {
             LARGE_INTEGER q; IrqlProf *ip;
@@ -255,7 +277,9 @@ static void cpu_lock_leave(void)
 int xbox_IrqlTryBeginIsr(int force)
 {
     cpu_lock_init();
+    t_role = "OHCI-ISR";
     if (s_cpu_lock_on && TryEnterCriticalSection(&g_cpu_cs)) {
+        if (t_cpu_held == 0) { LARGE_INTEGER hq; QueryPerformanceCounter(&hq); t_hold_q0 = hq.QuadPart; t_hold_gra = 0; t_hold_hra = 0; }
         t_cpu_held++;
     } else if (!force && (s_cpu_lock_on || xbox_IrqlBlocksInterrupts())) {
         InterlockedIncrement(&g_isr_deferred);
@@ -362,7 +386,7 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
     if (now == was)
         return;
 
-    if (now) { cpu_lock_enter(); d = InterlockedIncrement(&g_irql_raised_count); }
+    if (now) { t_hold_hra = ra; cpu_lock_enter(); d = InterlockedIncrement(&g_irql_raised_count); }
     else { d = InterlockedDecrement(&g_irql_raised_count); cpu_lock_leave(); }
     InterlockedIncrement(&s_transitions);
     if (now)
@@ -398,6 +422,7 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
 int xbox_IrqlEnterInterrupt(int level)
 {
     int saved = (int)g_current_irql;
+    t_role = level == 2 ? "DPC" : (level == 16 ? "ISR" : "interrupt");
     if (g_current_irql != (KIRQL)level) {
         irql_track(g_current_irql, (KIRQL)level, IRQL_CALLER());
         g_current_irql = (KIRQL)level;

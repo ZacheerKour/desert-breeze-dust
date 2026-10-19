@@ -1100,6 +1100,45 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
     return 0;
 }
 
+/* pd-ojl follow-up (2026-10-19): the flush kick answered by a dedicated high-priority thread. The D3D vblank DPC (0x24CA70) spins on
+ * bit 16 of PFB 0x100410 while it holds the CPU lock; the executor answered it between methods and the ack thread at the top of its
+ * loop, and under CPU load (or a heavy frame) both were late: DPC holds of 50-1400 ms, the pad's USB interrupts deferred, the
+ * pad dead for seconds (OHCIDEAD). This thread only watches that bit: hot for 2 ms after a kick (they come in bursts), else
+ * Sleep(1). RECOMP_FLUSH_THREAD=0 turns it off. */
+static DWORD WINAPI nv2a_flush_thread(LPVOID unused)
+{
+    LARGE_INTEGER f, last, now;
+    const char *ke = getenv("RECOMP_FLUSH_KICK_THREAD");
+    int kick = ke && atoi(ke);
+    (void)unused;
+    QueryPerformanceFrequency(&f);
+    last.QuadPart = 0;
+    while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        volatile uint32_t *r = s_flush_kick_reg;
+        if (r && kick && (*r & 0x00010000u)) {   /* off by default: answering the flush kick before the executor has read the frame's */
+            *r &= ~0x00010000u;                   /* data let the guest reuse vertex buffers early (one native crash in fetch_attr, 09:19) */
+            QueryPerformanceCounter(&last);
+            continue;
+        }
+        if (r) {
+            /* The vblank ISR/DPC (0x24CC20) acks PCRTC_INTR_0 (0x600100) and then spins until PMC_INTR_0 (0x100) reads clear. The
+             * ack thread clears them only after a whole pushbuffer scan, i.e. up to a frame (50-1800 ms measured) with the CPU lock
+             * held: the pad's interrupts starved. Same clear, done here; the vblank hold still keeps a fresh vblank visible. */
+            volatile uint32_t *regs = (volatile uint32_t *)((char *)r - 0x100410);
+            if (!xbox_VblankHoldActive()) {
+                if (regs[0x000100 / 4]) { regs[0x000100 / 4] = 0; QueryPerformanceCounter(&last); continue; }
+                if (regs[0x600100 / 4]) { regs[0x600100 / 4] = 0; QueryPerformanceCounter(&last); continue; }
+            }
+        }
+        QueryPerformanceCounter(&now);
+        if (last.QuadPart && (now.QuadPart - last.QuadPart) * 1000 < 2 * f.QuadPart)
+            YieldProcessor();
+        else
+            Sleep(1);
+    }
+    return 0;
+}
+
 static void xbox_Nv2aAckStart(void)
 {
     dsp_ack_init();
@@ -1107,6 +1146,13 @@ static void xbox_Nv2aAckStart(void)
     g_nv2a_ack_stop = 0;
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);
+    {
+        const char *e = getenv("RECOMP_FLUSH_THREAD");
+        if (!(e && atoi(e) == 0)) {
+            HANDLE ft = CreateThread(NULL, 0, nv2a_flush_thread, NULL, 0, NULL);
+            if (ft) { SetThreadPriority(ft, THREAD_PRIORITY_HIGHEST); CloseHandle(ft); }
+        }
+    }
     if (g_nv2a_ack_thread) {
         fprintf(stderr, "  NV2A busy-bit ack: %zu register(s) acknowledged\n",
                 sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]));
