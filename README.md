@@ -129,6 +129,9 @@ It is safe to re-run, and the log is `install.log`. A release zip is made with `
 - [rePOP](https://github.com/FulGerNet/rePOP) by FulGerNet: the Direct3D 11 renderer design and vertex-program translator were ported from it (MIT). None of rePOP's generated game code is used.
 - [xdvdfs](https://github.com/antangelo/xdvdfs) by antangelo (MIT), [7-Zip](https://www.7-zip.org/) by Igor Pavlov (`7zr`, LGPL), and [FFmpeg](https://ffmpeg.org/) (GPL build by gyan.dev), all bundled unmodified in releases with their licences.
 
+## AI assistance disclosure
+This port was built with substantial help from **Claude**, Anthropic's AI model, used through Claude Code. That covers the reverse engineering, the runtime and renderer code, the debugging, the tooling, and this documentation. The project owner directed the work, play-tested it, and reviewed and decided what was released. Every change was tested against the running game, and the engineering log ([`RECOMP_ANALYSIS.md`](RECOMP_ANALYSIS.md)) records the evidence. AI-written code can still contain mistakes, so please report anything that looks wrong.
+
 ## Legal
 Phantom Dust is © Microsoft Corporation, published by Majesco. This project is not affiliated with or endorsed by Microsoft or Majesco, and no rights to the game are granted or implied.
 
