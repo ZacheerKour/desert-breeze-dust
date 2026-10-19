@@ -286,6 +286,8 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
         GetCurrentDirectoryW(MAX_PATH, s_game_dir);
     }
 
+    if (!save_dir && getenv("RECOMP_SAVE_DIR"))
+        save_dir = getenv("RECOMP_SAVE_DIR");   /* test instances: a private (e.g. empty) save folder */
     if (save_dir) {
         MultiByteToWideChar(CP_UTF8, 0, save_dir, -1, s_save_dir, MAX_PATH);
     } else {

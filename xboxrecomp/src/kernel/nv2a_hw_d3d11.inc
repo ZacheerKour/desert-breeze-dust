@@ -1145,6 +1145,16 @@ static ID3D11ShaderResourceView *hw_texture(int stage, const HwSurface *target)
          * within the last few frames, counts as a render-to-texture alias. */
         if (best && best->w != t->width && s_hw.frame > best->drawn_frame + 4 && !getenv("RECOMP_HW_ALIAS_OLD"))
             best = NULL;
+        /* Opening cutscene fix (user report 2026-10-19): a movie frame buffer that sits on the address of a render target drawn in an
+         * earlier scene (the town/clinic glow chain, 512 wide like the movie texture) sampled that stale target: flat grey/olive/black
+         * movie frames in the Scenario opening. A target that has not been drawn for 30 frames is not a render-to-texture alias.
+         * RECOMP_HW_ALIAS_STALE=<frames> changes it, 0 = never expire (old). */
+        {
+            static int lim = -1;
+            if (lim < 0) { const char *e = getenv("RECOMP_HW_ALIAS_STALE"); lim = e ? atoi(e) : 30; }
+            if (best && lim > 0 && s_hw.frame > best->drawn_frame + (uint32_t)lim)
+                best = NULL;
+        }
         if (best) {
             static int dbg = -1; if (dbg < 0) dbg = getenv("RECOMP_HW_TEXDBG") ? 1 : 0;
             if (dbg && GetFileAttributesA("presdbg.flag") != INVALID_FILE_ATTRIBUTES)
@@ -1153,11 +1163,14 @@ static ID3D11ShaderResourceView *hw_texture(int stage, const HwSurface *target)
         }
         if (best) {
             s_ip_ta = best; s_ip_ts = best == target;
+            if (getenv("RECOMP_HW_YUVDBG") && t->color == 0x24) fprintf(stderr, "[YUV] ALIAS surface %08X %ux%u drawn_frame %u frame %u target %08X\n", (unsigned)best->offset, (unsigned)best->w, (unsigned)best->h, (unsigned)best->drawn_frame, (unsigned)s_hw.frame, (unsigned)target->offset);
             return best == target ? hw_self_shadow(best) : best->srv;
         }
     }
-    if (!hw_mem_ok(t->offset, hw_tex_bytes(t)))
+    if (!hw_mem_ok(t->offset, hw_tex_bytes(t))) {
+        if (getenv("RECOMP_HW_YUVDBG")) fprintf(stderr, "[YUV] mem_ok failed off %08X bytes %u\n", (unsigned)t->offset, (unsigned)hw_tex_bytes(t));
         return NULL;
+    }
 
     slot = (t->offset >> 6) * 2654435761u >> 22;      /* 10 bits */
     for (i = 0; i < 16; i++) {
@@ -1234,6 +1247,27 @@ static ID3D11ShaderResourceView *hw_texture(int stage, const HwSurface *target)
                         }
                     }
                 }
+        }
+    }
+    if (t->color == 0x24 && getenv("RECOMP_HW_YUVDBG")) {   /* movie frame statistics: is the decoded picture flat? */
+        static unsigned n; uint32_t i, mn = 255, mx = 0; uint64_t sum = 0;
+        for (i = 0; i < t->width * t->height; i += 37) { uint32_t g = (px[i] >> 8) & 255; if (g < mn) mn = g; if (g > mx) mx = g; sum += g; }
+        if (n % 60 == 31) {
+            char fn[64]; FILE *bf; uint32_t hd[13], y2, x2;
+            snprintf(fn, sizeof fn, "yuv_%03u.bmp", n);
+            bf = fopen(fn, "wb");
+            if (bf) {
+                memset(hd, 0, sizeof hd); hd[0] = 54 + t->width * 3 * t->height; hd[2] = 54; hd[3] = 40; hd[4] = t->width; hd[5] = t->height; hd[6] = 1 | (24u << 16);
+                fwrite("BM", 1, 2, bf); fwrite(hd, 4, 13, bf);
+                for (y2 = 0; y2 < t->height; y2++) for (x2 = 0; x2 < t->width; x2++) { uint32_t v = px[(size_t)(t->height - 1 - y2) * t->width + x2]; fwrite(&v, 1, 3, bf); }
+                fclose(bf);
+            }
+        }
+        if ((n++ % 30) == 0) {
+            const uint8_t *raw = (const uint8_t *)xbox_GetMemoryOffset() + t->offset;
+            fprintf(stderr, "[YUV] upload #%u %ux%u G min %u max %u mean %u; raw bytes %02X %02X %02X %02X %02X %02X %02X %02X ... mid %02X %02X %02X %02X\n", n, (unsigned)t->width, (unsigned)t->height, mn, mx,
+                    (unsigned)(sum / (t->width * t->height / 37 + 1)), raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+                    raw[t->pitch * (t->height / 2)], raw[t->pitch * (t->height / 2) + 1], raw[t->pitch * (t->height / 2) + 2], raw[t->pitch * (t->height / 2) + 3]);
         }
     }
     s_hw_fmt[t->color & 255].up++;
@@ -1987,6 +2021,7 @@ static HwSurface *hw_bind_draw_state(const HwVsp *prog)
         if (!init) { const char *e = getenv("RECOMP_HW_DRAWDBG"); init = 1; want = e ? (uint32_t)strtoul(e, NULL, 16) : 0; }
         if (want && n < 12) {
             int k, hit = 0;
+            if (want == 0xFFFFFFFFu && GetFileAttributesA("drawdbg.flag") != INVALID_FILE_ATTRIBUTES) hit = 1;
             for (k = 0; k < 4; k++) if (s_gpu.texs[k].valid && s_gpu.texs[k].offset == want && (s_gpu.rc_seen ? (((s_gpu.rc.stage_program >> (k * 5)) & 0x1F) >= 1 && ((s_gpu.rc.stage_program >> (k * 5)) & 0x1F) <= 3) : k == 0)) hit = 1;
             if (hit) {
                 n++;
@@ -2004,6 +2039,7 @@ static HwSurface *hw_bind_draw_state(const HwVsp *prog)
                                 (unsigned)t->width, (unsigned)t->height, (unsigned)t->color, (unsigned)t->levels, (unsigned)t->filter,
                                 (unsigned)t->addr_u, (unsigned)t->addr_v, (unsigned)t->pitch, srv[k] == s_hw.white ? "WHITE" : "ok", 10);
                 }
+                fprintf(stderr, "[DRAW]   tscale0 %g %g %g tex0.w %u h %u fmt %02X valid %d filter %08X palette %08X\n", pc.tscale[0][0], pc.tscale[0][1], pc.tscale[0][2], (unsigned)s_gpu.texs[0].width, (unsigned)s_gpu.texs[0].height, (unsigned)s_gpu.texs[0].color, s_gpu.texs[0].valid, (unsigned)s_gpu.texs[0].filter, (unsigned)s_gpu.texs[0].palette);
                 for (k = 0; k < (int)(s_gpu.rc.control & 0xFF) && k < 8; k++)
                     fprintf(stderr, "[DRAW]   stage %d icw %08X aicw %08X ocw %08X aocw %08X c0 %08X c1 %08X\n", k,
                             (unsigned)s_gpu.rc.color_icw[k], (unsigned)s_gpu.rc.alpha_icw[k], (unsigned)s_gpu.rc.color_ocw[k],
@@ -2497,6 +2533,16 @@ static int hw_draw_program_batch(void)
             in[a][0] = in[a][1] = in[a][2] = in[a][3] = 0.0f;
         memcpy(vout[nv * HW_VSP_SLOTS], in, sizeof in);   /* write-combined: no reads */
         if (vrec) memcpy(vrec + (size_t)nv * 128, in, sizeof in);
+        {   /* drawdbg_v.flag: print the first vertices of the batches that sample a movie texture (fmt 0x24) */
+            static int dv = -1; static unsigned ndv;
+            if (dv < 0) dv = getenv("RECOMP_HW_YUVDBG") != NULL;
+            if (dv && s_gpu.texs[0].valid && s_gpu.texs[0].color == 0x24 && nv < 4 && ndv < 16) {
+                uint32_t q; ndv++;
+                fprintf(stderr, "[YUVV] vs %08X v%u:", prog->key, (unsigned)nv);
+                for (q = 0; q < nslot; q++) fprintf(stderr, " a%u=(%g %g %g %g)", (unsigned)slot_attr[q], in[q][0], in[q][1], in[q][2], in[q][3]);
+                fprintf(stderr, "%c", 10);
+            }
+        }
         nv++;
     }
 #define HW_IDX(x, y, z) do { iout[ni] = remap[s_gpu.idx[x]]; \

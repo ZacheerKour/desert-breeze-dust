@@ -85,6 +85,7 @@ typedef struct { ID3D11Texture2D *tex; ID3D11DepthStencilView *dsv; UINT w, h; u
 static struct {
     int enabled, env_on, dbg, dbg_level, tried;
     int fast, fast_n; double fast_ema; LONGLONG fast_last;
+    int movie_seen;
     int gov, gov_on, gov_env_off; double gov_hi, gov_base, gov_n, gov_ema, gov_off_until, gov_backoff, gov_on_since; LONGLONG gov_last;
     float t, prog_max, attr_frac, cpu_frac, cut_frac, hi_rel, hi_frac;
     int fixed;
@@ -219,6 +220,8 @@ static void ip_capture(const HwSurface *s, const HwDepth *d, const HwVsp *prog, 
     }
     if (prog) { c->vs = prog->vs; c->vskey = prog->key; c->vmask = prog->mask; }
     memcpy(c->hdr, hdr, sizeof c->hdr);
+    /* A YUY2 texture (format 0x24) is a movie frame: never interpolate those frames (see ip_flip). */
+    if (s_gpu.texs[0].valid && s_gpu.texs[0].color == 0x24) s_ip.movie_seen = 1;
     s_ip_cap_ok = 1;
 }
 
@@ -1052,6 +1055,15 @@ static int ip_flip(const HwSurface *disp, UINT pw, UINT ph)
             s_ip.enabled = 1;
             if (s_ip.dbg) fprintf(stderr, "  [IP] governor: probing\n");
         }
+    }
+    if (s_ip.movie_seen) {
+        /* Movie frames (XMV, drawn as a YUY2 texture) are not interpolated: the replay of such a frame showed flat grey/olive/black
+         * pictures in the Scenario opening (the picture was fine with interpolation off) and the movie loop already presents at the
+         * game's own rate. Drop the recorded frames; interpolation resumes on the first non-movie frame. */
+        s_ip.movie_seen = 0;
+        ip_frame_reset(&s_ip.f[0]); ip_frame_reset(&s_ip.f[1]); ip_frame_reset(&s_ip.f[2]); s_ip.job.valid = 0;
+        s_ip.prev_valid = 0; s_ip_cap_ok = 0;
+        return 0;
     }
     if (!s_ip.enabled) return 0;
     if (!disp || f->ndraw == 0) {              /* held / clear-only flip: not a frame */
