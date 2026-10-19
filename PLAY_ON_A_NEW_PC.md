@@ -53,5 +53,8 @@ The re-run only rebuilds what changed. Your profiles live in `extracted\UDATA` a
 ## 6. Watch-along prompt for a Claude Code session on that PC
 Open Claude Code in `C:\recomp\phantom-dust-re` and paste the text in `WATCHER_PROMPT.md`.
 
+## Frame rate
+The game itself runs at 30 frames per second, as on the Xbox. The PC port draws an in-between frame for each pair of real frames, so battles show **60 FPS** at normal game speed. The window title shows `FPS: 60.0 (game 30.0)` when that is happening. In the busiest parts of the hub the game cannot hold its own 30, and the port then falls back to plain 30. `RECOMP_INTERP=0` (set in the .bat before the exe line) turns the in-between frames off. A laptop should be plugged in, and the game window kept in front.
+
 ## Known issues
 (filled in by the PM at hand-off)
