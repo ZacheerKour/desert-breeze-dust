@@ -883,6 +883,14 @@ extern int xbox_VblankHoldActive(void);   /* kernel_bridge.c */
  * RECOMP_FLUSH_ACK_POLL=0 turns it off. */
 static volatile uint32_t *s_flush_kick_reg;
 static int s_flush_poll_on = -1;
+void xbox_Nv2aSetGrFenceBits(uint32_t fence)
+{
+    if (s_flush_kick_reg) {      /* same register block: kick reg is regs + 0x100410 */
+        volatile uint32_t *gr = (volatile uint32_t *)((char *)s_flush_kick_reg - 0x100410 + 0x400B10);
+        *gr = (*gr & ~0x7Cu) | ((fence << 2) & 0x7Cu);
+    }
+}
+
 void xbox_Nv2aAckPoll(void)
 {
     volatile uint32_t *r = s_flush_kick_reg;

@@ -112,10 +112,26 @@ volatile int g_wfn_n;
 volatile uint32_t g_fl_va[16]; volatile int g_fl_n;
 volatile DWORD g_fo_until; volatile uint32_t g_fo_dst, g_fo_src; volatile float g_fo_d[3];
 static uint32_t s_wfn_ring[16]; static unsigned s_wfn_rp;
+/* RECOMP_FPS60=1: the title's frame loop (sub_000B13D0) locks itself to 2 vblanks per frame in sub_000B0960
+ * ("target = last target + 2", then waits on an event the vblank callback sub_000B08E0 sets on every second callback).
+ * Its game time is counted in vblanks, so one vblank per frame is a true 60 FPS frame with half the step. Hook: at entry
+ * of sub_000B0960 the stored target is lowered by one, so the add of 2 makes it +1 (the vblank callback is overridden in
+ * recomp_manual.c so that the event comes every vblank). Needs the function-entry hook, which is on for mode 7. */
+int g_fps60;
 void recomp_fn_watch_hit(uint32_t va)
 {
     int i;
     static DWORD last;
+    if (g_fps60 && va == 0xB0960u) {
+        /* the original computes target = [esi+0x54] + 2. Make it max(last + 1, current count): one vblank per frame, and a
+         * frame that ran late is not punished with the extra "resync" vblank wait of the original (it would turn a 17.5 ms
+         * frame into 33 ms). */
+        uint32_t *last = (uint32_t *)((uint8_t *)g_xbox_mem_offset + g_esi + 0x54);
+        uint32_t cnt = *(volatile uint32_t *)((uint8_t *)g_xbox_mem_offset + 0x39E700u);
+        if ((int32_t)(cnt - (*last + 1)) > 0) *last = cnt - 2; else *last -= 1;
+    }
+    if (g_fn_watch_on == 7)
+        return;
     if (g_fn_watch_on == 6) {
         /* Mode 6 (console "fncount <ms>"): count calls of every guest function for a window, then print the busiest
          * 70 and return to mode 5. Shows what a stuck scene is polling. */
@@ -403,14 +419,20 @@ static DWORD WINAPI pd_mem_live(LPVOID unused)
 
 static DWORD WINAPI pd_sampler(LPVOID unused)
 {
+    int pd_sample_stack = getenv("PD_SAMPLE_STACK") != NULL;
     uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
     DWORD me = GetCurrentThreadId();
     static unsigned long long rips[200][64]; static DWORD tids[200][64]; int cnt[200] = {0};
     int s, k;
     (void)unused;
+    /* PD_SAMPLE_DELAY=flag: sample 20 s each time sample.flag appears (the file is deleted when the round is printed), so one
+     * boot can be profiled in several scenes. */
+    for (;;) {
+    int rearm = 0;
     { const char *dly = getenv("PD_SAMPLE_DELAY");
-      if (dly && !strcmp(dly, "flag")) { while (GetFileAttributesA("sample.flag") == INVALID_FILE_ATTRIBUTES) Sleep(500); }
+      if (dly && !strcmp(dly, "flag")) { rearm = 1; while (GetFileAttributesA("sample.flag") == INVALID_FILE_ATTRIBUTES) Sleep(500); }
       else Sleep(dly ? (DWORD)atoi(dly) * 1000u : 9000u); }
+    memset(cnt, 0, sizeof cnt);
     for (s = 0; s < 200; s++) {
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         THREADENTRY32 te; te.dwSize = sizeof(te);
@@ -421,7 +443,20 @@ static DWORD WINAPI pd_sampler(LPVOID unused)
                 if (!h) continue;
                 if (SuspendThread(h) != (DWORD)-1) {
                     CONTEXT c; c.ContextFlags = CONTEXT_CONTROL;
-                    if (GetThreadContext(h, &c)) { rips[s][cnt[s]] = (unsigned long long)(c.Rip - base); tids[s][cnt[s]] = te.th32ThreadID; cnt[s]++; }
+                    if (GetThreadContext(h, &c)) {
+                        rips[s][cnt[s]] = (unsigned long long)(c.Rip - base); tids[s][cnt[s]] = te.th32ThreadID; cnt[s]++;
+                        if (c.Rip - base >= 0x4000000ull && pd_sample_stack) {
+                            /* a thread parked outside the exe (ntdll wait): add the first exe return addresses on its stack as
+                             * pseudo-threads tid+k*0x10000000 so sampres.py names the guest function that called the wait */
+                            int k = 0, q;
+                            const unsigned long long *sp = (const unsigned long long *)c.Rsp;
+                            for (q = 0; q < 1024 && k < 10 && cnt[s] < 64; q++) {
+                                unsigned long long v; SIZE_T got = 0;
+                                if (!ReadProcessMemory(GetCurrentProcess(), sp + q, &v, sizeof v, &got) || got != sizeof v) break;
+                                if (v > base && v - base < 0x4000000ull) { rips[s][cnt[s]] = v - base; tids[s][cnt[s]] = te.th32ThreadID + (DWORD)(k + 1) * 0x10000000u; cnt[s]++; k++; }
+                            }
+                        }
+                    }
                     ResumeThread(h);
                 }
                 CloseHandle(h);
@@ -443,6 +478,10 @@ static DWORD WINAPI pd_sampler(LPVOID unused)
         fprintf(stderr, "\n");
     }
     fflush(stderr);
+    if (!rearm) break;
+    DeleteFileA("sample.flag");
+    fprintf(stderr, "[SAMPLE] round done\n");
+    }
     return 0;
 }
 
@@ -686,8 +725,22 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
 /* ── WinMain ───────────────────────────────────────────────── */
 
 /* Hybrid-CPU / power-throttling set-up, run first thing in WinMain (the exe is a WIN32-subsystem build: main() below is not its entry). */
+/* pd-vnc: D3D's make-space wait (sub_00246261) blocks on the event at miniport (0x2532A8) + 0x1A4, which the graphics interrupt sets
+ * for software method 5 (pushbuffer method 0x100, data 5). The executor now hands such methods to this hook. Needs
+ * RECOMP_TITLE_KEVENTS=1 (default here) so that wait really blocks on, and is woken by, the guest-built event. */
+extern void (*g_nv2a_swm_hook)(uint32_t subch, uint32_t data);
+extern void xbox_GuestKeSetEvent(uint32_t va);
+extern void xbox_EnableGuestEvent(uint32_t va);
+static void pd_swm_hook(uint32_t subch, uint32_t data)
+{
+    if (subch == 0 && (data & 0x1Fu) == 5u)
+        xbox_GuestKeSetEvent(0x002532A8u + 0x1A4u);
+}
+
 static void pd_cpu_setup(void)
 {
+    xbox_EnableGuestEvent(0x002532A8u + 0x1A4u);
+    if (!getenv("RECOMP_SWM5") || atoi(getenv("RECOMP_SWM5"))) g_nv2a_swm_hook = pd_swm_hook;
     {   /* RECOMP_PCORES=1: keep the process on the performance cores of a hybrid CPU (experiment: E-core placement). */
         const char *pc = getenv("RECOMP_PCORES");
         if (pc && atoi(pc)) {
@@ -849,6 +902,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
      * does nothing while appearing to be set. */
     xbox_WatchdogStart();
     if (getenv("RECOMP_FN_WATCH")) { int m = atoi(getenv("RECOMP_FN_WATCH")); g_fn_watch_on = (m >= 2 && m <= 5) ? m : 1; }
+    { const char *f6 = getenv("RECOMP_FPS60"); g_fps60 = f6 && atoi(f6); if (g_fps60 && !g_fn_watch_on) g_fn_watch_on = 7; }
     if (getenv("RECOMP_SAMPLE")) CreateThread(NULL, 0, pd_sampler, NULL, 0, NULL);
     if (getenv("RECOMP_MEM_LIVE")) CreateThread(NULL, 0, pd_mem_live, NULL, 0, NULL);
 

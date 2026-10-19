@@ -1570,10 +1570,30 @@ static HANDLE ke_shadow_lookup(uint32_t guest_va);
 static void ke_shadow_insert(uint32_t guest_va, HANDLE host);
 static HANDLE bridge_resolve_handle(uint32_t token);
 static HANDLE ke_guest_event(uint32_t guest_va, int *type);
+static uint32_t s_guest_event_reg[8];
+/* Treat one guest-built KEVENT as a real event (wait blocks, set wakes) without turning RECOMP_TITLE_KEVENTS on for everything. */
+void xbox_EnableGuestEvent(uint32_t va)
+{
+    int k;
+    for (k = 0; k < 8; k++) if (!s_guest_event_reg[k] || s_guest_event_reg[k] == va) { s_guest_event_reg[k] = va; return; }
+}
 
 /* ── KeSetEvent (ordinal 145) ────────────────────────────── */
+/* Set a guest-built KEVENT from the host (what a graphics interrupt handler does): SignalState in guest memory plus the host
+ * event behind it. Used for software method 5 (pd-vnc). */
+void xbox_GuestKeSetEvent(uint32_t va)
+{
+    int type = 0;
+    HANDLE ge = ke_guest_event(va, &type);
+    BRIDGE_MEM32(va + 4) = 1;
+    if (ge)
+        SetEvent(ge);
+}
+
+static void waitlog_hit(const char *kind, uint32_t object);
 static void bridge_KeSetEvent(void)
 {
+    waitlog_hit("KeSetEvent", STACK_ARG(0));
     uint32_t guest_va = STACK_ARG(0);
     uint32_t increment = STACK_ARG(1);
     uint32_t wait = STACK_ARG(2);
@@ -1604,8 +1624,28 @@ static void bridge_KeSetEvent(void)
 }
 
 /* ── KeWaitForSingleObject (ordinal 159) ─────────────────── */
+/* RECOMP_WAITLOG=1: every 3 s the busiest (kind, object, guest caller, thread) wait sites. */
+static void waitlog_hit(const char *kind, uint32_t object)
+{
+    static int on = -1;
+    static struct { const char *k; uint32_t obj, ret, tid, n; } t[64];
+    static DWORD last;
+    uint32_t ret, tid; int i;
+    if (on < 0) on = getenv("RECOMP_WAITLOG") != NULL;
+    if (!on) return;
+    ret = g_esp ? BRIDGE_MEM32(g_esp) : 0; tid = (uint32_t)GetCurrentThreadId();
+    for (i = 0; i < 64 && t[i].n; i++) if (t[i].k == kind && t[i].obj == object && t[i].ret == ret && t[i].tid == tid) break;
+    if (i < 64) { t[i].k = kind; t[i].obj = object; t[i].ret = ret; t[i].tid = tid; t[i].n++; }
+    if (GetTickCount() - last > 3000) {
+        last = GetTickCount();
+        for (i = 0; i < 64 && t[i].n; i++) { fprintf(stderr, "  [WAITLOG] %s obj %08X from %08X tid %u x%u%c", t[i].k, t[i].obj, t[i].ret, t[i].tid, t[i].n, 10); }
+        memset(t, 0, sizeof t);
+    }
+}
+
 static void bridge_KeWaitForSingleObject(void)
 {
+    waitlog_hit("KeWait", STACK_ARG(0));
     uint32_t object = STACK_ARG(0);
     uint32_t wait_reason = STACK_ARG(1);
     uint32_t wait_mode = STACK_ARG(2);
@@ -1626,9 +1666,13 @@ static void bridge_KeWaitForSingleObject(void)
             } else {
                 SetEvent(ge);                          /* set by a header write */
             }
+            DWORD _w0 = GetTickCount();
             g_eax = (uint32_t)xbox_KeWaitForSingleObject(
                 ge, wait_reason, wait_mode,
                 (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+            if (GetTickCount() - _w0 > 40) {   /* a guest-built event wait that took long (pd-vnc / 60 FPS investigation) */
+                static int nl_; if (nl_++ < 200) fprintf(stderr, "  [LONGWAIT] obj %08X type %d waited %lu ms, state %u%c", object, type, (unsigned long)(GetTickCount() - _w0), (unsigned)BRIDGE_MEM32(object + 4), 10);
+            }
             if (g_eax == 0 && type == 1)               /* synchronization: consumed */
                 BRIDGE_MEM32(object + 4) = 0;
             return;
@@ -1655,6 +1699,7 @@ static void bridge_KeWaitForSingleObject(void)
  */
 static void bridge_NtWaitForSingleObject(void)
 {
+    waitlog_hit("NtWait", STACK_ARG(0));
     HANDLE   handle      = bridge_resolve_handle(STACK_ARG(0));
     uint32_t alertable   = STACK_ARG(1);
     uint32_t timeout_ptr = STACK_ARG(2);
@@ -1679,6 +1724,7 @@ static void bridge_NtClearEvent(void)
  * context's go-event and only the first 14 KB of the map ever loaded. */
 static void bridge_NtSetEvent(void)
 {
+    waitlog_hit("NtSetEvent", STACK_ARG(0));
     HANDLE   handle = bridge_resolve_handle(STACK_ARG(0));
     uint32_t prev   = STACK_ARG(1);
     g_eax = (uint32_t)xbox_NtSetEvent(handle, XBOX_TO_NATIVE(prev));
@@ -1708,6 +1754,7 @@ static HANDLE bridge_resolve_handle(uint32_t token);
 
 static void bridge_NtWaitForSingleObjectEx(void)
 {
+    waitlog_hit("NtWaitEx", STACK_ARG(0));
     HANDLE   handle      = bridge_resolve_handle(STACK_ARG(0));
     uint32_t wait_mode   = STACK_ARG(1);
     uint32_t alertable   = STACK_ARG(2);
@@ -1763,6 +1810,7 @@ static void bridge_NtWaitForSingleObjectEx(void)
  */
 static void bridge_NtWaitForMultipleObjectsEx(void)
 {
+    waitlog_hit("NtWaitMultEx", STACK_ARG(1));
     uint32_t count       = STACK_ARG(0);
     uint32_t handles_va  = STACK_ARG(1);
     uint32_t wait_type   = STACK_ARG(2);
@@ -1863,6 +1911,7 @@ static void bridge_NtUserIoApcDispatcher(void)
  * title into a hot spin. Halo's cache-partition setup retries this way. */
 static void bridge_KeDelayExecutionThread(void)
 {
+    waitlog_hit("KeDelay", STACK_ARG(2));
     uint32_t wait_mode    = STACK_ARG(0);
     uint32_t alertable    = STACK_ARG(1);
     uint32_t interval_ptr = STACK_ARG(2);
@@ -1901,6 +1950,7 @@ static void bridge_KeBugCheckEx(void)
 /* ── NtYieldExecution (ordinal 238) ──────────────────────── */
 static void bridge_NtYieldExecution(void)
 {
+    waitlog_hit("NtYield", 0);
     g_eax = (uint32_t)xbox_NtYieldExecution();
 }
 
@@ -4599,6 +4649,7 @@ static void bridge_NtCreateSemaphore(void)
  * Handle token in, LONG by value, optional 4-byte PLONG out. */
 static void bridge_NtReleaseSemaphore(void)
 {
+    waitlog_hit("NtRelSem", STACK_ARG(0));
     uint32_t count_va = STACK_ARG(2);
 
     g_eax = (uint32_t)xbox_NtReleaseSemaphore(
@@ -4624,6 +4675,7 @@ static void bridge_KeAlertThread(void)
 
 static void bridge_KeWaitForMultipleObjects(void)
 {
+    waitlog_hit("KeWaitMult", STACK_ARG(1));
     uint32_t count      = STACK_ARG(0);
     uint32_t objects_va = STACK_ARG(1);
     uint32_t wait_type  = STACK_ARG(2);
@@ -6399,8 +6451,11 @@ static HANDLE ke_guest_event(uint32_t guest_va, int *type)
         const char *e = getenv("RECOMP_TITLE_KEVENTS");
         enabled = e && *e == '1';
     }
-    if (!enabled)
-        return NULL;
+    if (!enabled) {   /* off globally: only the objects a title registered with xbox_EnableGuestEvent */
+        int k, reg = 0;
+        for (k = 0; k < 8; k++) if (s_guest_event_reg[k] == guest_va) reg = 1;
+        if (!reg) return NULL;
+    }
     if (guest_va < 0x10000u || (guest_va & 3u))
         return NULL;
     if (guest_va >= 0x04000000u && (guest_va < 0x80000000u || guest_va >= 0x84000000u))
@@ -7190,6 +7245,7 @@ static void bridge_KeInitializeSemaphore(void)
 /* --- KePulseEvent (ordinal 123, 3 args = 12 bytes) --- */
 static void bridge_KePulseEvent(void)
 {
+    waitlog_hit("KePulse", STACK_ARG(0));
     uint32_t guest_va = STACK_ARG(0);
     uint32_t increment = STACK_ARG(1);
     uint32_t wait = STACK_ARG(2);
@@ -7242,6 +7298,7 @@ static void bridge_KeReleaseMutant(void)
 /* --- KeReleaseSemaphore (ordinal 132, 4 args = 16 bytes) --- */
 static void bridge_KeReleaseSemaphore(void)
 {
+    waitlog_hit("KeRelSem", STACK_ARG(0));
     uint32_t guest_va = STACK_ARG(0);
     uint32_t increment = STACK_ARG(1);
     uint32_t adjustment = STACK_ARG(2);  /* LONG */

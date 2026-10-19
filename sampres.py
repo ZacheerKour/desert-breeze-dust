@@ -13,7 +13,7 @@ def res(rva):
     return (syms[i][1],syms[i][2],rva-syms[i][0]) if i>=0 else ('?','',0)
 byt=collections.defaultdict(collections.Counter); allc=collections.Counter(); ns=0
 for l in open(err,errors='replace'):
-    if not l.startswith('[SAMPLE]'): continue
+    if not l.startswith('[SAMPLE]') or ':' not in l: continue
     ns+=1
     for tok in l.split(':',1)[1].split():
         if '=' not in tok: continue

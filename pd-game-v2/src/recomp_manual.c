@@ -86,8 +86,24 @@ extern ptrdiff_t g_xbox_mem_offset;
  *       g_eax = result;
  *   }
  */
+/* RECOMP_FPS60: the vblank callback (D3D SetVerticalBlankCallback target) sets the frame-limiter event only when the old
+ * counter is odd, i.e. every second vblank. Set it on every vblank as well (see g_fps60 in main.c). */
+extern int g_fps60;
+static void fps60_vblank_callback(void)
+{
+    uint32_t old = MEM32(0x39E700);
+    if (!(old & 1u)) {
+        PUSH32(esp, MEM32(0x39E710));
+        PUSH32(esp, 0x000B0925u);
+        sub_00144F2B();
+    }
+    sub_000B08E0();
+}
+
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
 {
+    if (g_fps60 && xbox_va == 0x000B08E0u)
+        return fps60_vblank_callback;
     /*
      * TODO: Add your overrides here. Examples:
      *

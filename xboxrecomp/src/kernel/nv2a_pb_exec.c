@@ -3087,8 +3087,15 @@ static void tex_stage_method(uint32_t method, uint32_t param)
 }
 
 extern void xbox_Nv2aAckPoll(void);
+/* Method 0x100 on subchannel 0 is a "software method": on hardware it traps to the driver's interrupt handler with the data word
+ * (D3D's handler is sub_0024D0C0 in Phantom Dust: data 1 = swap, 5 = wake the thread waiting for pushbuffer space, ...). The executor
+ * does not run that handler; a title that depends on one of them registers a hook (pd-vnc: the make-space wait spins forever on
+ * the event that software method 5 sets). */
+void (*g_nv2a_swm_hook)(uint32_t subch, uint32_t data);
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
+    if (method == 0x0100 && g_nv2a_swm_hook)
+        g_nv2a_swm_hook(subch, param);
     static int inited;
     static unsigned poll_n;
     if ((++poll_n & 7u) == 0)
@@ -3238,6 +3245,16 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             sem_base = e ? (uint32_t)strtoul(e, NULL, 16) : 0x3000u;
         }
         uint32_t at = XBOX_CONTIG_BASE + sem_base + (s_gpu.sem_offset & 0x03FFFFFFu);
+        /* PGRAPH 0x400B10 (pd-vnc). D3D's idle wait (guest sub_002460B0: block-until-idle / pushbuffer space) spins until
+         * ((*[dev+0x30] << 2) ^ reg[0x400B10]) & 0x7C == 0, where *[dev+0x30] is the semaphore dword (physical 0x3000) the GPU
+         * just released a fence into. The register therefore holds the low five bits of the last released fence: write it
+         * here, before the semaphore, so both agree as soon as the semaphore can be read. Nothing wrote it before, so the
+         * wait only ended when the register's stale bits happened to match (hang with a 120 Hz vblank, and after the pause
+         * menu / a finished quest with the 60 FPS frame loop). */
+        {
+            extern void xbox_Nv2aSetGrFenceBits(uint32_t fence);
+            xbox_Nv2aSetGrFenceBits(param);
+        }
         memcpy(mem + at, &param, 4);
         { static int n; if (n++ < 20) fprintf(stderr, "  [GPU] semaphore release 0x%08X -> off 0x%X (va 0x%08X)%c", param, s_gpu.sem_offset, at, 10); }
         break;
