@@ -3127,6 +3127,7 @@ static void hw_flip(void)
         prev = d; last = now;
     }
     hw_maxdraw_refresh();
+    ip_wait_job();
     EnterCriticalSection(&s_hw.lock);
     ip_flush_pending();
     hw_glow_dump_check(s_hw.biggest, 1);
@@ -3283,12 +3284,18 @@ static void hw_flip(void)
         }
     }
     s_hw.last_flip_ms = GetTickCount();
-    ip_flip(ip_disp, ip_pw, ip_ph);
-    hw_present_locked(1);
-    if (s_ip.show)
-        ip_schedule_real();
+    if (!ip_flip(ip_disp, ip_pw, ip_ph)) {
+        hw_present_locked(1);
+        if (s_ip.show)
+            ip_schedule_real();
+    }
     hw_perf_flip();
     LeaveCriticalSection(&s_hw.lock);
+}
+
+/* Executor thread, when it has nothing new to scan: the interpolation's replay (see ip_run_job). */
+void nv2a_hw_idle_work(void)
+{
 }
 
 /* Called by the window thread about 60 times a second. A title that is not
@@ -3373,6 +3380,7 @@ static void hw_draw_batch(const Nv2aVshOutput *v, uint32_t n) { (void)v; (void)n
 static int  hw_draw_program_batch(void) { return 0; }
 static void hw_clear(uint32_t param) { (void)param; }
 static void hw_flip(void) {}
+void nv2a_hw_idle_work(void) {}
 void xbox_SetGammaRamp(const uint8_t *rgb768) { (void)rgb768; }
 static int  hw_method(uint32_t method, uint32_t param) { (void)method; (void)param; return 0; }
 void nv2a_hw_idle_present(void) {}
