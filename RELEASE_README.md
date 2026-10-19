@@ -21,6 +21,14 @@ Double-click **pd-game-v2\play_watched.bat** (`run_game.bat` is the same without
 - **Frame rate:** battles show 60 FPS (the game runs at 30 and the port draws in-between frames). The title bar shows `FPS: 60.0 (game 30.0)`. Busy hub areas may run around 50.
 - **First minutes:** some stutter while shaders compile; they are cached in `pd-game-v2\bin\shadercache` after that.
 
+## Custom soundtrack (your own battle music)
+Like the Xbox dashboard's ripped soundtracks:
+1. Put up to 84 songs (mp3, flac, wav, ogg, m4a, aac, wma or opus) in a folder. The folder name becomes the soundtrack name.
+2. Drag that folder onto **make_soundtrack.bat** (after INSTALL.bat has been run). It converts the songs to the Xbox's format; nothing else to install.
+3. In the game: **Options Mode > Music Manager**. Pick a stage (Highway, Palace, ...), then your soundtrack, then a song. That song plays in battles on that stage.
+
+Running it again with another folder replaces the soundtrack (one soundtrack at a time for now).
+
 ## Reporting problems
 Note what you were doing, take a screenshot, and keep `pd-game-v2\run_user.err`. `WATCHER_PROMPT.md` is a ready prompt for a Claude Code session that watches you play and files bugs.
 
@@ -28,3 +36,5 @@ Note what you were doing, take a screenshot, and keep `pd-game-v2\run_user.err`.
 - Not every mission has been played through to the end yet. Report anything that crashes or hangs.
 - Split Screen: Player 1 waits at "Please wait..." until a second controller signs in.
 - "Go to Xbox Live" restarts the game (there is no online service).
+- Under heavy load the controller can stop responding for a few seconds and then recover by itself (seen once in a 1-hour test; being fixed).
+- Starting a quest through the debug console after another quest can crash (the normal Battle Terminal route is fine).

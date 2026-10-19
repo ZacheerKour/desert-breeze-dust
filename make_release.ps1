@@ -43,6 +43,22 @@ if (-not (Test-Path $sz)) {
 Copy-Item $sz "$stage\tools\7zr\7zr.exe"
 Set-Content -Path "$stage\tools\7zr\LICENSE.txt" -Encoding ascii -Value '7zr.exe is the standalone 7-Zip console extractor for .7z (7-Zip by Igor Pavlov, GNU LGPL). Source: https://www.7-zip.org/'
 
+# Custom soundtrack tool (Options > Music Manager): frozen make_soundtrack.py + ffmpeg (GPL build, license and README kept).
+$st = Join-Path $Root 'dist\st\make_soundtrack.exe'
+if (-not (Test-Path $st) -or (Get-Item $st).LastWriteTime -lt (Get-Item (Join-Path $Root 'make_soundtrack.py')).LastWriteTime) {
+    $vpy = Join-Path $Root '.venv-recomp\Scripts\python.exe'
+    & $vpy -m pip install -q --disable-pip-version-check pyinstaller
+    & $vpy -m PyInstaller --onefile --clean --noconfirm --distpath (Join-Path $Root 'dist\st') --workpath (Join-Path $Root 'dist\st_build') --specpath (Join-Path $Root 'dist\st_build') --name make_soundtrack (Join-Path $Root 'make_soundtrack.py') | Out-Null
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $st)) { throw 'PyInstaller build of make_soundtrack.exe failed' }
+}
+Copy-Item $st $stage
+Copy-Item (Join-Path $Root 'make_soundtrack.bat') $stage
+$ff = Get-ChildItem "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\Gyan.FFmpeg.Essentials*\*\bin\ffmpeg.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+if (-not $ff) { throw 'ffmpeg not found: winget install --id Gyan.FFmpeg.Essentials' }
+New-Item -ItemType Directory -Force "$stage\tools\ffmpeg" | Out-Null
+Copy-Item $ff.FullName "$stage\tools\ffmpeg\"
+foreach ($f in 'LICENSE', 'README.txt') { $p = Join-Path $ff.Directory.Parent.FullName $f; if (Test-Path $p) { Copy-Item $p "$stage\tools\ffmpeg\" } }
+
 $exeSha = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
 Set-Content -Path "$stage\PREBUILT.txt" -Encoding ascii -Value @(
     "Phantom Dust PC port, prebuilt release $Version",
