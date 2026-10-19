@@ -874,9 +874,30 @@ static void framebuffer_probe_tick(void)
 }
 
 extern int xbox_VblankHoldActive(void);   /* kernel_bridge.c */
+
+/* The PFB flush kick (0x100410 bit 16) is a cache flush request: the guest sets it and spins until the "GPU" clears it. The
+ * ack thread clears it at the top of its loop, which is only reached after the pushbuffer scan of the previous pass -- a
+ * whole frame of execution. The D3D vblank DPC does this flush while it holds the emulated CPU lock (IRQL), so the game
+ * thread waited for the executor through the lock (DPCLONG: routine 0x24CA70, 25-130 ms, frame dips in battle,
+ * 2026-10-18). The executor now calls this every few methods, so the flush completes in microseconds.
+ * RECOMP_FLUSH_ACK_POLL=0 turns it off. */
+static volatile uint32_t *s_flush_kick_reg;
+static int s_flush_poll_on = -1;
+void xbox_Nv2aAckPoll(void)
+{
+    volatile uint32_t *r = s_flush_kick_reg;
+    if (s_flush_poll_on < 0) {
+        const char *e = getenv("RECOMP_FLUSH_ACK_POLL");
+        s_flush_poll_on = !(e && atoi(e) == 0);
+    }
+    if (r && s_flush_poll_on && (*r & 0x00010000u))
+        *r &= ~0x00010000u;
+}
+
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
+    s_flush_kick_reg = (volatile uint32_t *)((char *)regs + 0x100410);
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
             volatile uint32_t *r =

@@ -16,7 +16,9 @@ for l in open(err,errors='replace'):
     if not l.startswith('[SAMPLE]'): continue
     ns+=1
     for tok in l.split(':',1)[1].split():
-        t,r=tok.split('=')
+        if '=' not in tok: continue
+        t,r=tok.split('=',1)
+        if not r.startswith('@') and not re.fullmatch(r'[0-9A-Fa-f]+',r): continue
         n=(r,'',0) if r.startswith('@') else res(int(r,16))
         if r.startswith('@'): n=(r.split('+')[0],'',0)
         byt[t][n[0]]+=1; allc[n[0]]+=1

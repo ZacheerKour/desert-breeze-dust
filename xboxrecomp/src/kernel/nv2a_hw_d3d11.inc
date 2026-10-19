@@ -41,6 +41,8 @@
 
 #define COBJMACROS
 #include <d3d11.h>
+#include <dxgi1_6.h>
+#include <tlhelp32.h>
 #include <d3dcompiler.h>
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3dcompiler.lib")
@@ -128,11 +130,17 @@ typedef struct {
     uint32_t misc[4];
 } HwPsConst;
 
+/* RECOMP_PERF diagnostics, toggled at run time by flag files in the working directory:
+ * psdiag.flag = every draw uses the trivial pixel shader (what does the combiner cost?). */
+static volatile int s_hw_psdiag;
+
 static struct {
     int tried, ok, scale, nocull;
     int fx_scale;                       /* the same for surfaces smaller than the display */
     int auto_scale;                     /* RECOMP_HW_SCALE unset: follow the window height */
     int vsync, cpu_vsh;
+    int tearing;                        /* flip-model swap chain with ALLOW_TEARING in use */
+    double pace_hz;                     /* flips per second cap (own pacer), 0 = none */
     float aspect;                       /* shown width / height */
     float widen;                        /* host surface width multiple over 4:3 */
     CRITICAL_SECTION lock;
@@ -402,14 +410,20 @@ static const char *hw_shader_cache_dir(void)
             dir = "bin\\shadercache";
         if (!*dir || strcmp(dir, "0") == 0)
             dir = NULL;
-        else
+        else {
+            char parent[MAX_PATH]; const char *sl = strrchr(dir, 92);
+            if (sl && (size_t)(sl - dir) < sizeof parent) {   /* bin\shadercache: the parent may not exist */
+                memcpy(parent, dir, (size_t)(sl - dir)); parent[sl - dir] = 0;
+                CreateDirectoryA(parent, NULL);
+            }
             CreateDirectoryA(dir, NULL);
+        }
     }
     return dir;
 }
 
 static void hw_shader_cache_path(char *path, size_t cap, const char *src, size_t len,
-                                 const char *entry, const char *target)
+                                 const char *entry, const char *target, UINT cflags)
 {
     uint64_t h = 1469598103934665603ull;
     size_t i;
@@ -419,11 +433,13 @@ static void hw_shader_cache_path(char *path, size_t cap, const char *src, size_t
         h = (h ^ (uint8_t)entry[i]) * 1099511628211ull;
     for (i = 0; target[i]; i++)
         h = (h ^ (uint8_t)target[i]) * 1099511628211ull;
+    if (cflags != (D3DCOMPILE_OPTIMIZATION_LEVEL1 | D3DCOMPILE_IEEE_STRICTNESS))
+        h = (h ^ cflags) * 1099511628211ull;
     snprintf(path, cap, "%s\\%016llx.cso", hw_shader_cache_dir(), (unsigned long long)h);
 }
 
-static ID3DBlob *hw_compile_src(const char *src, size_t len, const char *entry,
-                                const char *target)
+static ID3DBlob *hw_compile_src_f(const char *src, size_t len, const char *entry,
+                                  const char *target, UINT cflags)
 {
     ID3DBlob *code = NULL, *err = NULL;
     HRESULT hr;
@@ -431,7 +447,7 @@ static ID3DBlob *hw_compile_src(const char *src, size_t len, const char *entry,
     FILE *f;
 
     if (hw_shader_cache_dir()) {
-        hw_shader_cache_path(path, sizeof path, src, len, entry, target);
+        hw_shader_cache_path(path, sizeof path, src, len, entry, target, cflags);
         f = fopen(path, "rb");
         if (f) {
             long n;
@@ -447,9 +463,7 @@ static ID3DBlob *hw_compile_src(const char *src, size_t len, const char *entry,
             fclose(f);
         }
     }
-    hr = D3DCompile(src, len, "nv2a_hw", NULL, NULL, entry, target,
-                    D3DCOMPILE_OPTIMIZATION_LEVEL1
-                    | D3DCOMPILE_IEEE_STRICTNESS, 0, &code, &err);
+    hr = D3DCompile(src, len, "nv2a_hw", NULL, NULL, entry, target, cflags, 0, &code, &err);
     if (SUCCEEDED(hr) && hw_shader_cache_dir()) {
         f = fopen(path, "wb");
         if (f) {
@@ -466,6 +480,39 @@ static ID3DBlob *hw_compile_src(const char *src, size_t len, const char *entry,
     }
     if (err) ID3D10Blob_Release(err);
     return code;
+}
+
+static ID3DBlob *hw_compile_src(const char *src, size_t len, const char *entry,
+                                const char *target)
+{
+    return hw_compile_src_f(src, len, entry, target,
+                            D3DCOMPILE_OPTIMIZATION_LEVEL1 | D3DCOMPILE_IEEE_STRICTNESS);
+}
+
+/* A shader already in the disk cache, without ever compiling: NULL when it is not there. */
+static ID3DBlob *hw_cache_lookup(const char *src, size_t len, const char *entry, const char *target, UINT cflags)
+{
+    char path[MAX_PATH];
+    ID3DBlob *code = NULL;
+    FILE *f;
+    long n;
+    if (!hw_shader_cache_dir())
+        return NULL;
+    hw_shader_cache_path(path, sizeof path, src, len, entry, target, cflags);
+    f = fopen(path, "rb");
+    if (!f)
+        return NULL;
+    fseek(f, 0, SEEK_END);
+    n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (n > 0 && SUCCEEDED(D3DCreateBlob((SIZE_T)n, &code))
+        && fread(ID3D10Blob_GetBufferPointer(code), 1, (size_t)n, f) == (size_t)n) {
+        fclose(f);
+        return code;
+    }
+    if (code) ID3D10Blob_Release(code);
+    fclose(f);
+    return NULL;
 }
 
 static ID3DBlob *hw_compile(const char *entry, const char *target)
@@ -518,7 +565,8 @@ static void hw_resize_backbuffer(void)
         ID3D11RenderTargetView_Release(s_hw.bb_rtv);
         s_hw.bb_rtv = NULL;
         IDXGISwapChain_ResizeBuffers(s_hw.swap, 0, (UINT)rc.right,
-                                     (UINT)rc.bottom, DXGI_FORMAT_UNKNOWN, 0);
+                                     (UINT)rc.bottom, DXGI_FORMAT_UNKNOWN,
+                                     s_hw.tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
     }
     if (SUCCEEDED(IDXGISwapChain_GetBuffer(s_hw.swap, 0, &IID_ID3D11Texture2D,
                                            (void **)&bb))) {
@@ -606,17 +654,105 @@ static int hw_init(void)
                      SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     }
 
-    memset(&sd, 0, sizeof sd);
-    sd.BufferCount = 2;
-    sd.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sd.OutputWindow = s_hw.hwnd;
-    sd.SampleDesc.Count = 1;
-    sd.Windowed = TRUE;
-    sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
-    hr = D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
-                                       NULL, 0, D3D11_SDK_VERSION, &sd,
-                                       &s_hw.swap, &s_hw.dev, &fl, &s_hw.ctx);
+    {
+        /* Adapter: RECOMP_GPU = high (default: the high-performance GPU, the RTX on a
+         * hybrid laptop), default (the OS / DXGI default), or a 0-based adapter index.
+         * Falls back to the default adapter on any failure. */
+        IDXGIFactory1 *fac = NULL;
+        IDXGIAdapter1 *ad = NULL;
+        const char *g = getenv("RECOMP_GPU");
+        int pref_high = !(g && !_stricmp(g, "default"));
+        int idx = (g && g[0] >= '0' && g[0] <= '9') ? atoi(g) : -1;
+        int want_tear = 0;
+        DXGI_ADAPTER_DESC1 adesc;
+        char name[128];
+
+        if (SUCCEEDED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&fac))) {
+            IDXGIFactory6 *f6 = NULL;
+            UINT k;
+            for (k = 0; ; k++) {   /* list everything once, so the log shows the choice */
+                IDXGIAdapter1 *a1 = NULL;
+                if (FAILED(IDXGIFactory1_EnumAdapters1(fac, k, &a1))) break;
+                IDXGIAdapter1_GetDesc1(a1, &adesc);
+                WideCharToMultiByte(CP_ACP, 0, adesc.Description, -1, name, sizeof name, NULL, NULL);
+                fprintf(stderr, "  [HW] adapter #%u: %s (%u MB VRAM, flags %u)\n", k, name,
+                        (unsigned)(adesc.DedicatedVideoMemory >> 20), (unsigned)adesc.Flags);
+                IDXGIAdapter1_Release(a1);
+            }
+            if (idx >= 0) {
+                IDXGIFactory1_EnumAdapters1(fac, (UINT)idx, &ad);
+            } else if (pref_high && SUCCEEDED(IDXGIFactory1_QueryInterface(fac, &IID_IDXGIFactory6, (void **)&f6))) {
+                IDXGIFactory6_EnumAdapterByGpuPreference(f6, 0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                                                         &IID_IDXGIAdapter1, (void **)&ad);
+                IDXGIFactory6_Release(f6);
+            }
+            {
+                IDXGIFactory5 *f5 = NULL;
+                BOOL t = FALSE;
+                e = getenv("RECOMP_HW_TEARING");
+                if ((!e || atoi(e) != 0) &&
+                    SUCCEEDED(IDXGIFactory1_QueryInterface(fac, &IID_IDXGIFactory5, (void **)&f5))) {
+                    if (SUCCEEDED(IDXGIFactory5_CheckFeatureSupport(f5, DXGI_FEATURE_PRESENT_ALLOW_TEARING, &t, sizeof t)))
+                        want_tear = t ? 1 : 0;
+                    IDXGIFactory5_Release(f5);
+                }
+            }
+        }
+        memset(&sd, 0, sizeof sd);
+        sd.BufferCount = 2;
+        sd.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        sd.OutputWindow = s_hw.hwnd;
+        sd.SampleDesc.Count = 1;
+        sd.Windowed = TRUE;
+        sd.SwapEffect = want_tear ? DXGI_SWAP_EFFECT_FLIP_DISCARD : DXGI_SWAP_EFFECT_DISCARD;
+        sd.Flags = want_tear ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+        hr = E_FAIL;
+        if (fac && ad) {
+            hr = D3D11CreateDevice((IDXGIAdapter *)ad, D3D_DRIVER_TYPE_UNKNOWN, NULL, 0, NULL, 0,
+                                   D3D11_SDK_VERSION, &s_hw.dev, &fl, &s_hw.ctx);
+            if (SUCCEEDED(hr)) {
+                hr = IDXGIFactory1_CreateSwapChain(fac, (IUnknown *)s_hw.dev, &sd, &s_hw.swap);
+                if (FAILED(hr)) { /* flip model refused: the old model on the same device */
+                    sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD; sd.Flags = 0; want_tear = 0;
+                    hr = IDXGIFactory1_CreateSwapChain(fac, (IUnknown *)s_hw.dev, &sd, &s_hw.swap);
+                }
+            }
+            if (FAILED(hr)) {
+                if (s_hw.ctx) { ID3D11DeviceContext_Release(s_hw.ctx); s_hw.ctx = NULL; }
+                if (s_hw.dev) { ID3D11Device_Release(s_hw.dev); s_hw.dev = NULL; }
+                s_hw.swap = NULL;
+                fprintf(stderr, "  [HW] chosen adapter failed 0x%08lX; default adapter\n", hr);
+            }
+        }
+        if (FAILED(hr)) {
+            want_tear = 0; sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD; sd.Flags = 0;
+            hr = D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
+                                               NULL, 0, D3D11_SDK_VERSION, &sd,
+                                               &s_hw.swap, &s_hw.dev, &fl, &s_hw.ctx);
+        }
+        if (SUCCEEDED(hr)) {
+            IDXGIDevice *dd = NULL; IDXGIAdapter *da = NULL; DXGI_ADAPTER_DESC d0;
+            if (SUCCEEDED(ID3D11Device_QueryInterface(s_hw.dev, &IID_IDXGIDevice, (void **)&dd))) {
+                if (SUCCEEDED(IDXGIDevice_GetAdapter(dd, &da))) {
+                    IDXGIAdapter_GetDesc(da, &d0);
+                    WideCharToMultiByte(CP_ACP, 0, d0.Description, -1, name, sizeof name, NULL, NULL);
+                    fprintf(stderr, "  [HW] adapter: %s (%u MB VRAM); swap effect %s, tearing %d\n", name,
+                            (unsigned)(d0.DedicatedVideoMemory >> 20),
+                            sd.SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD ? "flip" : "blt", want_tear);
+                    IDXGIAdapter_Release(da);
+                }
+                IDXGIDevice_Release(dd);
+            }
+        }
+        s_hw.tearing = want_tear;
+        if (ad) IDXGIAdapter1_Release(ad);
+        if (fac) IDXGIFactory1_Release(fac);
+        e = getenv("RECOMP_HW_PACE");
+        s_hw.pace_hz = e ? atof(e) : 60.0;
+        /* Own pacing replaces DXGI's vsync wait only when tearing presents are on. */
+        if (!s_hw.tearing) s_hw.pace_hz = 0;
+    }
     if (FAILED(hr)) {
         fprintf(stderr, "  [HW] D3D11CreateDeviceAndSwapChain failed 0x%08lX\n", hr);
         return 0;
@@ -1222,6 +1358,242 @@ static int hw_dbg_env(const char *name, int slot)
     return v[slot];
 }
 
+
+/* ---- Specialised pixel shaders ------------------------------------------------------------------
+ * ps_main interprets the register-combiner words at run time: the register file is an indexable
+ * temp array, every stage is decoded per pixel, and four textures are sampled whatever the stage
+ * program says. On a power-limited laptop GPU that interpreter is the frame cost (hub at 2x: 6 FPS
+ * from the pixel stage alone). A "variant" is the same source with the draw's combiner state turned
+ * into compile-time constants (cw, ctl, alpha-test mode, texture-bound flags), so the loop unrolls,
+ * the register indices resolve and unused samples disappear. Variants are compiled on a worker
+ * thread (and kept in the shader cache on disk); until one is ready the draw uses the interpreter.
+ * RECOMP_HW_PSSPEC=0 turns this off; a file psspec_off.flag in the working directory does the same
+ * at run time (RECOMP_PERF=1 polls it). */
+#define HW_PSV_SIZE 2048
+typedef struct {
+    uint32_t cw[8][4];
+    uint32_t ctl[4];
+    uint32_t ax, ay, mx, my, bound;
+} HwPsSpec;
+typedef struct {
+    uint64_t key;
+    volatile LONG state;                /* 0 empty, 1 queued, 2 ready, 3 failed */
+    ID3D11PixelShader *volatile ps;
+    HwPsSpec spec;
+} HwPsv;
+static HwPsv s_hw_psv[HW_PSV_SIZE];
+static int s_hw_psv_n;
+static volatile int s_hw_psspec_off;
+static int s_hw_psspec_env = -1;
+static HANDLE s_hw_psv_sem;
+static CRITICAL_SECTION s_hw_psv_cs;
+static int s_hw_psv_q[HW_PSV_SIZE], s_hw_psv_qh, s_hw_psv_qt;
+static volatile LONG s_hw_psv_ready, s_hw_psv_failed, s_hw_psv_fb;   /* fb: draws that ran on the interpreter */
+
+static char *hw_str_replace_all(const char *src, const char *from, const char *to)
+{
+    size_t fl = strlen(from), tl = strlen(to), n = 0, cap;
+    const char *q;
+    char *out, *o;
+    for (q = src; (q = strstr(q, from)) != NULL; q += fl)
+        n++;
+    cap = strlen(src) + n * (tl > fl ? tl - fl : 0) + 1;
+    out = (char *)malloc(cap);
+    if (!out)
+        return NULL;
+    o = out;
+    for (;;) {
+        q = strstr(src, from);
+        if (!q) {
+            strcpy(o, src);
+            break;
+        }
+        memcpy(o, src, (size_t)(q - src));
+        o += q - src;
+        memcpy(o, to, tl);
+        o += tl;
+        src = q + fl;
+    }
+    return out;
+}
+
+/* The shader text for one combiner configuration: everything up to ps_main as it is, then constants,
+ * then ps_main with the control reads replaced. Caller frees. */
+static char *hw_psv_source(const HwPsSpec *sp, size_t *out_len)
+{
+    static const char marker[] = "float4 ps_main(VO i) : SV_Target {";
+    const char *all_vs = s_hw_hlsl_vs_common;
+    const char *body = strstr(s_hw_hlsl, marker);
+    char *pm, *t, *res, hdr[4096], tmp[96];
+    size_t pre_len = body ? (size_t)(body - s_hw_hlsl) : 0, vlen = strlen(all_vs), n, k, w;
+    char *o = hdr;
+    if (!body)
+        return NULL;
+    n = sp->ctl[0] & 0xFF;
+    if (n > 8) n = 8;
+    o += sprintf(o, "static const uint4 cwS[8] = {");
+    for (k = 0; k < 8; k++)
+        o += sprintf(o, "%suint4(%uu,%uu,%uu,%uu)", k ? "," : "",
+                     (k < n && sp->mx) ? sp->cw[k][0] : 0u, (k < n && sp->mx) ? sp->cw[k][1] : 0u,
+                     (k < n && sp->mx) ? sp->cw[k][2] : 0u, (k < n && sp->mx) ? sp->cw[k][3] : 0u);
+    o += sprintf(o, "};\nstatic const uint4 ctlS = uint4(%uu,%uu,%uu,%uu);\n",
+                 sp->ctl[0], sp->ctl[1], sp->ctl[2], sp->ctl[3]);
+    o += sprintf(o, "static const uint4 atestS = uint4(%uu,%uu,0u,0u);\n", sp->ax, sp->ay);
+    o += sprintf(o, "static const uint MX = %uu; static const uint MY = %uu;\n", sp->mx, sp->my);
+    o += sprintf(o, "static const float B0 = %d.0, B1 = %d.0, B2 = %d.0, B3 = %d.0;\n",
+                 (int)(sp->bound & 1), (int)((sp->bound >> 1) & 1), (int)((sp->bound >> 2) & 1), (int)((sp->bound >> 3) & 1));
+    pm = hw_str_replace_all(body, "cw[s]", "cwS[s]");
+    if (!pm) return NULL;
+    t = hw_str_replace_all(pm, "ctl.", "ctlS."); free(pm); pm = t; if (!pm) return NULL;
+    t = hw_str_replace_all(pm, "atest.x", "atestS.x"); free(pm); pm = t; if (!pm) return NULL;
+    t = hw_str_replace_all(pm, "atest.y", "atestS.y"); free(pm); pm = t; if (!pm) return NULL;
+    t = hw_str_replace_all(pm, "misc.x", "MX"); free(pm); pm = t; if (!pm) return NULL;
+    t = hw_str_replace_all(pm, "misc.y", "MY"); free(pm); pm = t; if (!pm) return NULL;
+    for (k = 0; k < 4; k++) {
+        char from[24], to[8];
+        sprintf(from, "tscale[%u].z", (unsigned)k);
+        sprintf(to, "B%u", (unsigned)k);
+        t = hw_str_replace_all(pm, from, to); free(pm); pm = t; if (!pm) return NULL;
+    }
+    t = hw_str_replace_all(pm, "[loop] for (uint s = 0; s < n; s++)", "[unroll] for (uint s = 0; s < n; s++)");
+    free(pm); pm = t; if (!pm) return NULL;
+    (void)tmp;
+    w = vlen + pre_len + strlen(hdr) + strlen(pm) + 1;
+    res = (char *)malloc(w);
+    if (!res) { free(pm); return NULL; }
+    memcpy(res, all_vs, vlen);
+    memcpy(res + vlen, s_hw_hlsl, pre_len);
+    memcpy(res + vlen + pre_len, hdr, strlen(hdr));
+    strcpy(res + vlen + pre_len + strlen(hdr), pm);
+    free(pm);
+    *out_len = strlen(res);
+    return res;
+}
+
+static DWORD WINAPI hw_psv_worker(LPVOID unused)
+{
+    (void)unused;
+    for (;;) {
+        int idx;
+        HwPsv *v;
+        char *src;
+        size_t len = 0;
+        ID3DBlob *b;
+        ID3D11PixelShader *ps = NULL;
+        WaitForSingleObject(s_hw_psv_sem, INFINITE);
+        EnterCriticalSection(&s_hw_psv_cs);
+        idx = s_hw_psv_q[s_hw_psv_qh];
+        s_hw_psv_qh = (s_hw_psv_qh + 1) % HW_PSV_SIZE;
+        LeaveCriticalSection(&s_hw_psv_cs);
+        v = &s_hw_psv[idx];
+        src = hw_psv_source(&v->spec, &len);
+        b = src ? hw_compile_src_f(src, len, "ps_main", "ps_4_0",
+                                   D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_IEEE_STRICTNESS) : NULL;
+        free(src);
+        if (b && SUCCEEDED(ID3D11Device_CreatePixelShader(s_hw.dev, ID3D10Blob_GetBufferPointer(b),
+                                                         ID3D10Blob_GetBufferSize(b), NULL, &ps)))
+            ;
+        else
+            ps = NULL;
+        if (b) ID3D10Blob_Release(b);
+        if (ps) {
+            v->ps = ps;
+            InterlockedExchange(&v->state, 2);
+            InterlockedIncrement(&s_hw_psv_ready);
+        } else {
+            InterlockedExchange(&v->state, 3);
+            InterlockedIncrement(&s_hw_psv_failed);
+        }
+    }
+    return 0;
+}
+
+/* The pixel shader for this draw's constants: a ready variant, else the interpreter. */
+static ID3D11PixelShader *hw_ps_pick(const HwPsConst *pc)
+{
+    HwPsSpec sp;
+    uint64_t h = 1469598103934665603ull;
+    uint32_t *w = (uint32_t *)&sp;
+    size_t i, nw, n;
+    unsigned slot, probe;
+    HwPsv *v;
+
+    if (s_hw_psspec_env < 0) {
+        const char *e = getenv("RECOMP_HW_PSSPEC");
+        s_hw_psspec_env = !(e && atoi(e) == 0);
+    }
+    if (!s_hw_psspec_env || s_hw_psspec_off)
+        return s_hw.ps;
+    s_hw_psv_fb++;                      /* undone below when a variant is returned */
+    memset(&sp, 0, sizeof sp);
+    n = pc->ctl[0] & 0xFF;
+    if (n > 8) n = 8;
+    sp.mx = pc->misc[0];
+    sp.my = pc->misc[1];
+    if (sp.mx)
+        for (i = 0; i < n; i++)
+            memcpy(sp.cw[i], pc->cw[i], 16);
+    memcpy(sp.ctl, pc->ctl, 16);
+    sp.ax = pc->atest[0];
+    sp.ay = pc->atest[1];
+    for (i = 0; i < 4; i++)
+        if (pc->tscale[i][2] > 0.5f)
+            sp.bound |= 1u << i;
+    nw = sizeof sp / 4;
+    for (i = 0; i < nw; i++)
+        h = (h ^ w[i]) * 1099511628211ull;
+    if (!h) h = 1;
+    slot = (unsigned)(h % HW_PSV_SIZE);
+    for (probe = 0; probe < 16; probe++, slot = (slot + 1) % HW_PSV_SIZE) {
+        v = &s_hw_psv[slot];
+        if (v->state != 0 && v->key == h) {
+            if (v->state == 2) { s_hw_psv_fb--; return v->ps; }
+            return s_hw.ps;
+        }
+        if (v->state == 0)
+            break;
+    }
+    if (probe == 16 || s_hw_psv_n >= HW_PSV_SIZE - 64)
+        return s_hw.ps;
+    if (!s_hw_psv_sem) {
+        InitializeCriticalSection(&s_hw_psv_cs);
+        s_hw_psv_sem = CreateSemaphoreA(NULL, 0, HW_PSV_SIZE, NULL);
+        { int wi; for (wi = 0; wi < 3; wi++) CloseHandle(CreateThread(NULL, 0, hw_psv_worker, NULL, 0, NULL)); }
+    }
+    v = &s_hw_psv[slot];
+    v->key = h;
+    v->spec = sp;
+    v->ps = NULL;
+    s_hw_psv_n++;
+    {   /* On disk already (an earlier run): create it right here, no frames on the slow interpreter. */
+        size_t slen = 0;
+        char *src = hw_psv_source(&sp, &slen);
+        ID3DBlob *b = src ? hw_cache_lookup(src, slen, "ps_main", "ps_4_0",
+                                            D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_IEEE_STRICTNESS) : NULL;
+        ID3D11PixelShader *ps = NULL;
+        free(src);
+        if (b) {
+            if (SUCCEEDED(ID3D11Device_CreatePixelShader(s_hw.dev, ID3D10Blob_GetBufferPointer(b),
+                                                         ID3D10Blob_GetBufferSize(b), NULL, &ps)) && ps) {
+                v->ps = ps;
+                InterlockedExchange(&v->state, 2);
+                InterlockedIncrement(&s_hw_psv_ready);
+                ID3D10Blob_Release(b);
+                s_hw_psv_fb--;
+                return ps;
+            }
+            ID3D10Blob_Release(b);
+        }
+    }
+    EnterCriticalSection(&s_hw_psv_cs);
+    s_hw_psv_q[s_hw_psv_qt] = (int)slot;
+    s_hw_psv_qt = (s_hw_psv_qt + 1) % HW_PSV_SIZE;
+    LeaveCriticalSection(&s_hw_psv_cs);
+    InterlockedExchange(&v->state, 1);
+    ReleaseSemaphore(s_hw_psv_sem, 1, NULL);
+    return s_hw.ps;
+}
+
 static HwSurface *hw_bind_draw_state(const HwVsp *prog)
 {
     HwSurface *s = hw_surface();
@@ -1497,7 +1869,7 @@ static HwSurface *hw_bind_draw_state(const HwVsp *prog)
     ID3D11DeviceContext_IASetVertexBuffers(s_hw.ctx, 0, 1, &s_hw.vb, &stride, &zero);
     ID3D11DeviceContext_VSSetShader(s_hw.ctx, prog ? prog->vs : s_hw.vs, NULL, 0);
     ID3D11DeviceContext_VSSetConstantBuffers(s_hw.ctx, 0, 1, &s_hw.vs_cb);
-    ID3D11DeviceContext_PSSetShader(s_hw.ctx, s_hw.ps, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(s_hw.ctx, s_hw_psdiag ? s_hw.ps_solid : hw_ps_pick(&pc), NULL, 0);
     ID3D11DeviceContext_PSSetConstantBuffers(s_hw.ctx, 0, 1, &s_hw.ps_cb);
     ID3D11DeviceContext_PSSetShaderResources(s_hw.ctx, 0, 4, srv);
     ID3D11DeviceContext_PSSetSamplers(s_hw.ctx, 0, 4, smp);
@@ -2458,7 +2830,10 @@ static void hw_present_locked(int vsync)
     /* A flip waits for the host's vertical blank, which is what paces a title
      * that draws as fast as it is allowed to; repaints do not. */
     QueryPerformanceCounter(&t0);
-    IDXGISwapChain_Present(s_hw.swap, vsync && s_hw.vsync ? 1 : 0, 0);
+    if (s_hw.tearing)   /* never blocks on the host monitor; hw_flip paces to the console rate */
+        IDXGISwapChain_Present(s_hw.swap, 0, DXGI_PRESENT_ALLOW_TEARING);
+    else
+        IDXGISwapChain_Present(s_hw.swap, vsync && s_hw.vsync ? 1 : 0, 0);
     QueryPerformanceCounter(&t1);
     s_hw.present_ticks += (uint64_t)(t1.QuadPart - t0.QuadPart);
 }
@@ -2577,9 +2952,101 @@ static void hw_flicker_probe(void)
     if (nh < 9) hist[nh++] = sum; else { for (i = 0; i < 8; i++) hist[i] = hist[i + 1]; hist[8] = sum; }
 }
 
+
+/* RECOMP_PERF=1: a [PERF] line every second: flips, frame interval avg/p99/max (ms),
+ * time inside Present, in the pushbuffer executor and in draw calls (ms per second),
+ * process CPU use in cores. */
+static void hw_perf_flip(void)
+{
+    static int on = -1;
+    static LARGE_INTEGER qf, lastq, t0;
+    static double iv[512]; static int n;
+    static uint64_t pr0, ex0, dr0;
+    static ULONGLONG cpu0;
+    LARGE_INTEGER q;
+    if (on < 0) { const char *e = getenv("RECOMP_PERF"); on = e ? atoi(e) : 0; }
+    if (!on) return;
+    QueryPerformanceCounter(&q);
+    s_hw_psdiag = GetFileAttributesA("psdiag.flag") != INVALID_FILE_ATTRIBUTES;
+    s_hw_psspec_off = GetFileAttributesA("psspec_off.flag") != INVALID_FILE_ATTRIBUTES;
+    if (!qf.QuadPart) { QueryPerformanceFrequency(&qf); t0 = q; lastq = q; return; }
+    if (n < 512) iv[n++] = (double)(q.QuadPart - lastq.QuadPart) * 1000.0 / (double)qf.QuadPart;
+    lastq = q;
+    if ((double)(q.QuadPart - t0.QuadPart) / (double)qf.QuadPart >= 1.0) {
+        double secs = (double)(q.QuadPart - t0.QuadPart) / (double)qf.QuadPart, sum = 0, mx = 0, p99;
+        int i, j, slow = 0;
+        FILETIME c, x, k, u; ULONGLONG cpu;
+        double ms = 1000.0 / (double)qf.QuadPart;
+        for (i = 0; i < n; i++) { sum += iv[i]; if (iv[i] > mx) mx = iv[i]; if (iv[i] > 50.0) slow++; }
+        for (i = 1; i < n; i++) { double v = iv[i]; for (j = i - 1; j >= 0 && iv[j] > v; j--) iv[j + 1] = iv[j]; iv[j + 1] = v; }
+        p99 = n ? iv[(int)((n - 1) * 0.99 + 0.5)] : 0;
+        GetProcessTimes(GetCurrentProcess(), &c, &x, &k, &u);
+        cpu = (((ULONGLONG)k.dwHighDateTime << 32) | k.dwLowDateTime) + (((ULONGLONG)u.dwHighDateTime << 32) | u.dwLowDateTime);
+        fprintf(stderr, "  [PERF] flips %d in %.2fs (%.1f fps) interval avg %.1f p99 %.1f max %.1f ms, >50ms %d; per s: present %.0f ms, executor %.0f ms, draws %.0f ms; psfb %ld; cpu %.2f cores\n",
+                n, secs, n / secs, n ? sum / n : 0.0, p99, mx, slow,
+                (double)(s_hw.present_ticks - pr0) * ms / secs, (double)(g_nv2a_exec_ticks - ex0) * ms / secs,
+                (double)(s_hw_stat_draw_ticks - dr0) * ms / secs, (long)InterlockedExchange(&s_hw_psv_fb, 0),
+                cpu0 ? (double)(cpu - cpu0) / 1e7 / secs : 0.0);
+        if (on >= 2) {   /* RECOMP_PERF=2: busiest threads this second (cores); the snapshot itself costs ~40 ms */
+            static struct { DWORD tid; ULONGLONG t; } prev[256]; static int np;
+            struct { DWORD tid; ULONGLONG d; } top[4] = {{0,0},{0,0},{0,0},{0,0}};
+            HANDLE sn = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            int nn = 0;
+            static struct { DWORD tid; ULONGLONG t; } cur[256];
+            if (sn != INVALID_HANDLE_VALUE) {
+                THREADENTRY32 te; te.dwSize = sizeof te;
+                if (Thread32First(sn, &te)) do {
+                    if (te.th32OwnerProcessID == GetCurrentProcessId() && nn < 256) {
+                        HANDLE th = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
+                        if (th) {
+                            FILETIME c2, x2, k2, u2;
+                            if (GetThreadTimes(th, &c2, &x2, &k2, &u2)) {
+                                ULONGLONG tt = (((ULONGLONG)k2.dwHighDateTime << 32) | k2.dwLowDateTime) + (((ULONGLONG)u2.dwHighDateTime << 32) | u2.dwLowDateTime);
+                                ULONGLONG d = tt; int q;
+                                for (q = 0; q < np; q++) if (prev[q].tid == te.th32ThreadID) { d = tt - prev[q].t; break; }
+                                cur[nn].tid = te.th32ThreadID; cur[nn].t = tt; nn++;
+                                for (q = 0; q < 4; q++) if (d > top[q].d) {
+                                    int z; for (z = 3; z > q; z--) top[z] = top[z - 1];
+                                    top[q].tid = te.th32ThreadID; top[q].d = d; break;
+                                }
+                            }
+                            CloseHandle(th);
+                        }
+                    }
+                } while (Thread32Next(sn, &te));
+                CloseHandle(sn);
+            }
+            memcpy(prev, cur, sizeof(cur[0]) * (size_t)nn); np = nn;
+            fprintf(stderr, "  [PERF-PSV] variants queued %d ready %ld failed %ld off %d\n", s_hw_psv_n,
+                    (long)s_hw_psv_ready, (long)s_hw_psv_failed, (int)(s_hw_psspec_off || s_hw_psspec_env == 0));
+            fprintf(stderr, "  [PERF-THR] exec-thread %lu; top:", (unsigned long)GetCurrentThreadId());
+            for (i = 0; i < 4; i++) fprintf(stderr, " %lu=%.2f", (unsigned long)top[i].tid, (double)top[i].d / 1e7 / secs);
+            fprintf(stderr, " cores\n");
+        }
+        cpu0 = cpu; pr0 = s_hw.present_ticks; ex0 = g_nv2a_exec_ticks; dr0 = s_hw_stat_draw_ticks;
+        n = 0; t0 = q;
+    }
+}
+
 static void hw_flip(void)
 {
     unsigned s_hw_framedraws_at_flip = s_hw_framedraws;
+    if (s_hw.pace_hz > 0.0) {
+        /* Presentation is paced here, by the console's rate, not by the host monitor:
+         * a 30 Hz or 144 Hz display must not change how often the title may flip.
+         * Sleep most of the wait, spin the rest. */
+        static LARGE_INTEGER pf, last;
+        LARGE_INTEGER q;
+        if (!pf.QuadPart) QueryPerformanceFrequency(&pf);
+        for (;;) {
+            double rem;
+            QueryPerformanceCounter(&q);
+            rem = (double)(last.QuadPart + (LONGLONG)((double)pf.QuadPart / s_hw.pace_hz) - q.QuadPart) * 1000.0 / (double)pf.QuadPart;
+            if (rem <= 0.0) break;
+            if (rem > 2.5) Sleep((DWORD)(rem - 2.0)); else YieldProcessor();
+        }
+        last = q;
+    }
     if (getenv("RECOMP_HW_FLICKERDBG")) {
         static unsigned prev; static DWORD last; static unsigned hits;
         unsigned d = s_hw_framedraws; DWORD now = GetTickCount();
@@ -2746,6 +3213,7 @@ static void hw_flip(void)
     }
     s_hw.last_flip_ms = GetTickCount();
     hw_present_locked(1);
+    hw_perf_flip();
     LeaveCriticalSection(&s_hw.lock);
 }
 

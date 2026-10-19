@@ -116,6 +116,62 @@ static int s_cpu_lock_on = -1;
 
 extern RECOMP_TLS uint32_t g_esp;
 void xbox_IrqlDumpHolders(void);
+
+/* RECOMP_IRQL_PROF=1: what the CPU lock costs. Per thread, every 5 s: acquisitions, total and longest time the lock
+ * was held (outermost hold), total and longest time spent waiting for it, and the guest return address at the
+ * longest hold / wait (which routine). Written to find who makes the game thread wait (battle FPS dips, 2026-10-18). */
+typedef struct { volatile LONG tid; LONG n; LONGLONG hold, wait, maxhold, maxwait; uint32_t hold_ra, wait_ra; } IrqlProf;
+static IrqlProf s_ip[24];
+static int s_ip_on = -1;
+static LARGE_INTEGER s_ip_f;
+static volatile LONGLONG s_ip_next;
+static XBOX_THREAD_LOCAL LONGLONG t_ip_t0;
+static XBOX_THREAD_LOCAL uint32_t t_ip_ra;
+
+static IrqlProf *irql_prof_slot(void)
+{
+    LONG me = (LONG)GetCurrentThreadId();
+    int i;
+    for (i = 0; i < 24; i++) {
+        LONG t = InterlockedCompareExchange(&s_ip[i].tid, 0, 0);
+        if (t == me) return &s_ip[i];
+        if (!t && InterlockedCompareExchange(&s_ip[i].tid, me, 0) == 0) return &s_ip[i];
+    }
+    return NULL;
+}
+
+static uint32_t irql_prof_guest_ra(void)
+{
+    return g_esp ? *(uint32_t *)((uintptr_t)g_xbox_mem_offset + g_esp) : 0;
+}
+
+static int irql_prof_on(void)
+{
+    if (s_ip_on < 0) {
+        const char *e = getenv("RECOMP_IRQL_PROF");
+        QueryPerformanceFrequency(&s_ip_f);
+        s_ip_on = e && atoi(e) ? 1 : 0;
+    }
+    return s_ip_on;
+}
+
+static void irql_prof_report(LONGLONG now)
+{
+    int i;
+    double ms = 1000.0 / (double)s_ip_f.QuadPart;
+    LONGLONG nx = s_ip_next;
+    if (now < nx || InterlockedCompareExchange64(&s_ip_next, now + 5 * s_ip_f.QuadPart, nx) != nx)
+        return;
+    for (i = 0; i < 24; i++) {
+        IrqlProf *p = &s_ip[i];
+        if (!p->tid || !p->n) continue;
+        fprintf(stderr, "  [IRQLPROF] tid %ld: %ld locks, held %.0f ms (max %.1f ms @guest %08X), waited %.0f ms (max %.1f ms @guest %08X)\n",
+                (long)p->tid, (long)p->n, p->hold * ms, p->maxhold * ms, p->hold_ra, p->wait * ms, p->maxwait * ms, p->wait_ra);
+        p->n = 0; p->hold = p->wait = p->maxhold = p->maxwait = 0;
+    }
+    fflush(stderr);
+}
+
 static void cpu_lock_init(void)
 {
     if (InterlockedCompareExchange(&g_cpu_cs_init, 1, 0) == 0) {
@@ -133,11 +189,24 @@ static void cpu_lock_enter(void)
 {
     DWORD t0 = 0;
     int contended = 0;
+    LARGE_INTEGER pq;
 
     cpu_lock_init();
+    if (irql_prof_on()) QueryPerformanceCounter(&pq);
     for (;;) {
         if (TryEnterCriticalSection(&g_cpu_cs)) {
             if (!s_cpu_lock_on) { LeaveCriticalSection(&g_cpu_cs); return; }
+            if (s_ip_on == 1) {
+                LARGE_INTEGER q; IrqlProf *ip;
+                QueryPerformanceCounter(&q);
+                if (!t_cpu_held) { t_ip_t0 = q.QuadPart; t_ip_ra = irql_prof_guest_ra(); }
+                ip = irql_prof_slot();
+                if (ip && !t_cpu_held) {
+                    LONGLONG w = q.QuadPart - pq.QuadPart;
+                    ip->n++; ip->wait += w;
+                    if (w > ip->maxwait) { ip->maxwait = w; ip->wait_ra = t_ip_ra; }
+                }
+            }
             t_cpu_held++;
             return;
         }
@@ -162,6 +231,20 @@ static void cpu_lock_enter(void)
 static void cpu_lock_leave(void)
 {
     if (t_cpu_held > 0) {
+        if (s_ip_on == 1 && t_cpu_held == 1) {
+            LARGE_INTEGER q; IrqlProf *ip;
+            QueryPerformanceCounter(&q);
+            ip = irql_prof_slot();
+            if (ip) {
+                LONGLONG h = q.QuadPart - t_ip_t0;
+                ip->hold += h;
+                if (h > ip->maxhold) { ip->maxhold = h; ip->hold_ra = t_ip_ra; }
+            }
+            t_cpu_held--;
+            LeaveCriticalSection(&g_cpu_cs);
+            irql_prof_report(q.QuadPart);
+            return;
+        }
         t_cpu_held--;
         LeaveCriticalSection(&g_cpu_cs);
     }

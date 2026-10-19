@@ -2103,7 +2103,21 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = dpc_va;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    { int _irql = xbox_IrqlEnterInterrupt(2); fn(); xbox_IrqlLeaveInterrupt(_irql); }
+    {
+        int _irql = xbox_IrqlEnterInterrupt(2);
+        static int prof = -1; LARGE_INTEGER t0, t1, f;
+        if (prof < 0) { const char *e = getenv("RECOMP_IRQL_PROF"); prof = e && atoi(e) ? 1 : 0; }
+        if (prof) QueryPerformanceCounter(&t0);
+        fn();
+        if (prof) {   /* RECOMP_IRQL_PROF=1: a DPC that runs long holds the CPU lock and stalls the game thread */
+            static volatile LONG nrep;
+            QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&f);
+            if ((t1.QuadPart - t0.QuadPart) * 1000 > 5 * f.QuadPart && InterlockedIncrement(&nrep) <= 300)
+                fprintf(stderr, "  [DPCLONG] routine %08X context %08X took %.1f ms\n", routine, context,
+                        (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart);
+        }
+        xbox_IrqlLeaveInterrupt(_irql);
+    }
     return 1;
 }
 
@@ -2361,8 +2375,17 @@ static void kernel_vblank_tick(void)
         QueryPerformanceCounter(&q);
         nowd = (double)q.QuadPart * 1000.0 / (double)qf.QuadPart;
         if (nowd < next_d) { g_vb_early++; return; }
-        next_d += 1000.0 / 60.0;                 /* 60 Hz, drift-free */
-        if (next_d < nowd - 50.0) next_d = nowd + 1000.0 / 60.0;
+        {   /* RECOMP_VBLANK_HZ (experiment): the emulated vblank rate, default 60. The title paces itself in vblanks. */
+            static double per = 0.0;
+            if (per == 0.0) {
+                const char *e = getenv("RECOMP_VBLANK_HZ");
+                double hz = e ? atof(e) : 60.0;
+                if (hz < 20.0 || hz > 240.0) hz = 60.0;
+                per = 1000.0 / hz;
+            }
+            next_d += per;                           /* drift-free */
+            if (next_d < nowd - 50.0) next_d = nowd + per;
+        }
         now = (long long)nowd; (void)now;
     }
 
@@ -2671,7 +2694,12 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         long long now;
         int i;
 
-        Sleep(10);
+        {   /* The vblank tick lives on this thread: a 10 ms sleep delivered 60 Hz vblanks on a 10 ms grid (intervals of 10 and 20 ms).
+             * With the vblank clock on, wake every RECOMP_TT_SLEEP_MS (default 1) so the ISR is at most ~1 ms late. */
+            static int slp = -1;
+            if (slp < 0) { const char *e = getenv("RECOMP_TT_SLEEP_MS"); slp = e ? atoi(e) : (getenv("RECOMP_VBLANK") ? 1 : 10); if (slp < 1) slp = 1; }
+            Sleep((DWORD)slp);
+        }
         {   /* bring-up: where the timer thread's time goes (RECOMP_TT_STATS=1) */
             static int tt = -1;
             static LARGE_INTEGER f, last, a0, a1;

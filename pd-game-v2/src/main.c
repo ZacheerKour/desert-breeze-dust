@@ -685,6 +685,37 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
 
 /* ── WinMain ───────────────────────────────────────────────── */
 
+/* Hybrid-CPU / power-throttling set-up, run first thing in WinMain (the exe is a WIN32-subsystem build: main() below is not its entry). */
+static void pd_cpu_setup(void)
+{
+    {   /* RECOMP_PCORES=1: keep the process on the performance cores of a hybrid CPU (experiment: E-core placement). */
+        const char *pc = getenv("RECOMP_PCORES");
+        if (pc && atoi(pc)) {
+            DWORD len = 0; BYTE *buf; DWORD_PTR mask = 0; BYTE maxclass = 0;
+            GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len);
+            buf = len ? (BYTE *)malloc(len) : NULL;
+            if (buf && GetLogicalProcessorInformationEx(RelationProcessorCore, (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)buf, &len)) {
+                DWORD off = 0;
+                for (off = 0; off < len; ) { PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX e = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)(buf + off); if (e->Processor.EfficiencyClass > maxclass) maxclass = e->Processor.EfficiencyClass; off += e->Size; }
+                for (off = 0; off < len; ) { PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX e = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)(buf + off); if (e->Processor.EfficiencyClass == maxclass) mask |= e->Processor.GroupMask[0].Mask; off += e->Size; }
+                if (mask) { SetProcessAffinityMask(GetCurrentProcess(), mask); fprintf(stderr, "[CPU] pinned to performance cores, mask %llx (class %u)\n", (unsigned long long)mask, (unsigned)maxclass); }
+            }
+            free(buf);
+        }
+    }
+    {   /* Hybrid CPUs (P/E cores): opt out of EcoQoS throttling, and keep the 1 ms timer
+         * resolution (vblank pacing) when the window is covered. RECOMP_THROTTLE=1 keeps Windows' default. */
+        const char *t = getenv("RECOMP_THROTTLE");
+        if (!(t && atoi(t))) {
+            PROCESS_POWER_THROTTLING_STATE st;
+            st.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+            st.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+            st.StateMask = 0;
+            SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &st, sizeof st);
+        }
+    }
+}
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                    LPSTR lpCmdLine, int nCmdShow)
 {
@@ -696,6 +727,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     (void)lpCmdLine;
     (void)nCmdShow;
 
+    pd_cpu_setup();
     /* Unbuffered output for immediate visibility during debugging */
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
@@ -885,6 +917,10 @@ static BOOL load_xbe(const char *path, void **out_data, size_t *out_size)
 }
 
 /* Console entry point (for debugging -- lets you see printf output) */
+/* Hybrid-GPU laptops: ask the NVIDIA Optimus / AMD PowerXpress drivers for the discrete GPU. */
+__declspec(dllexport) unsigned long NvOptimusEnablement = 1;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+
 int main(int argc, char **argv)
 {
     (void)argc;

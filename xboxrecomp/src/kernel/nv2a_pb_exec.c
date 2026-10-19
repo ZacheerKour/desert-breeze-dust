@@ -3086,9 +3086,13 @@ static void tex_stage_method(uint32_t method, uint32_t param)
         record_tex_reg(method, param);
 }
 
+extern void xbox_Nv2aAckPoll(void);
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
+    static unsigned poll_n;
+    if ((++poll_n & 7u) == 0)
+        xbox_Nv2aAckPoll();            /* answer a pending flush kick without waiting for the scan to end */
     if (!inited) {
         inited = 1;
         s_gpu.color_mask = 0x01010101u;           /* all channels, as reset */
