@@ -82,7 +82,8 @@ To update, unzip a new release over the old folder, or into a new folder and cop
 
 ## Known issues
 - Story progress beyond the first missions has had little testing. Crashes or hangs there are the most useful reports.
-- Under heavy load the controller can stop responding for a few seconds, then recover by itself.
+- An in-engine cutscene going black (picture flickering, then black, while the audio carries on) was reported on a fast desktop GPU. 0.1.3 contains a likely fix but it is not yet confirmed. If it happens, please report it with `pd-game-v2\run_user.err`: its `[PRESENT]` lines show what was on screen.
+- Skipping the opening movie and then also the second movie can leave that second movie black and silent until it ends. Waiting it out or skipping again continues the game.
 - The busiest hub areas run at about 50 FPS instead of 60.
 - Split Screen: Player 1 waits at "Please wait..." until a second controller signs in.
 - Xbox Live and System Link have no servers. "Go to Xbox Live" restarts the game.
