@@ -1,0 +1,7 @@
+# reboot -> tag q91
+{"id": 20, "mode": "chain", "status": "ok", "t_first": 8, "fps_min": 28.0, "fps_max": 31.0, "draws_max": 946, "notes": []}
+{"id": 21, "mode": "chain", "status": "crash", "t_first": null, "fps_min": 0, "fps_max": 0, "draws_max": 0, "notes": ["[CRASH] Access violation at RIP=0x7FF7642BBC4A, fault addr=0xBDAAB5D3 (read)", "    [esp+324 ] 0x0014596A\r", "  Native stack (first 8 return addrs):\r", "  [NV2A] DMA_PUT = 0x0003389C  DMA_GET = 0"]}
+# reboot -> tag q92
+{"id": 21, "mode": "fresh-retry", "status": "ok", "t_first": 7, "fps_min": 30.0, "fps_max": 31.0, "draws_max": 238, "notes": []}
+{"id": 22, "mode": "chain", "status": "crash", "t_first": 7, "fps_min": 0, "fps_max": 0, "draws_max": 0, "notes": ["[CRASH] Access violation at RIP=0x7FF7642BBC4A, fault addr=0xBC207475 (read)", "    [esp+324 ] 0x0014596A\r", "  Native stack (first 8 return addrs):\r", "  [NV2A] DMA_PUT = 0x000EDAD0  DMA_G"]}
+# reboot -> tag q93

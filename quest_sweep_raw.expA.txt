@@ -1,0 +1,6 @@
+# reboot -> tag q61
+{"id": 20, "mode": "chain", "status": "ok", "t_first": 10, "fps_min": 30.0, "fps_max": 31.0, "draws_max": 535, "notes": []}
+{"id": 21, "mode": "chain", "status": "crash", "t_first": null, "fps_min": 0, "fps_max": 0, "draws_max": 0, "notes": ["[CRASH] Access violation at RIP=0x7FF763270A48, fault addr=0xC48532B7 (read)", "    [esp+428 ] 0x000DECAD\r", "    [esp+436 ] 0x000B4324\r", "  Native stack (first 8 return addrs):"]}
+# reboot -> tag q62
+{"id": 21, "mode": "fresh-retry", "status": "load-timeout", "t_first": null, "fps_min": 0, "fps_max": 0, "draws_max": 0, "notes": []}
+# reboot -> tag q63

@@ -575,7 +575,11 @@ uint64_t mcpx_apu_vp_read(void *opaque, hwaddr addr, unsigned int size)
 
     switch (addr) {
     case NV1BA0_PIO_FREE:
-        return 0x80; /* Always pretend queue is empty */
+        /* Always pretend the queue is empty. pd-hang (2026-10-19): DirectSound's voice update (guest sub_001C0435 /
+         * sub_001C04CD) spins on `([PIO_FREE] >> 2) >= 6 * <channel count>`; 0x80 bytes = 32 words made any update with
+         * 6+ channels wait forever (game thread stuck in VEH-trapped reads, FPS 0, seen when ending a stage). The
+         * emulated queue is always empty, so report a size big enough for any update. */
+        return 0x800;
     default:
         break;
     }

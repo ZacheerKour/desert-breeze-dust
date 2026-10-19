@@ -340,15 +340,80 @@ void pd_inject_stage_b(int stage)
 extern void sub_000EB850(void);
 extern void sub_000EB930(void);
 extern void sub_000EB890(void);
+extern void sub_000EBAE0(void);   /* script native: load the quest-record table (Questdata) */
+extern void sub_000EBB40(void);   /* script native: returns 1 while that load is pending */
 volatile int g_pd_quest_phase = 0;
-static int pd_quest_calls, pd_quest_seen5, pd_quest_lastst = -1;   /* file scope so a second quest can reset them */
-void pd_quest_step(int req)
+static int pd_quest_req_pending = -1;   /* pd-k67: request waiting for the quest table load */
+static int pd_quest_calls, pd_quest_seen5, pd_quest_lastst = -1, pd_quest_wait;   /* file scope so a second quest can reset them */
+extern volatile int g_pd_hub_req, g_pd_hook_va;
+volatile int g_pd_hub_phase = 0;
+extern void sub_000EB8A0(void);   /* script native: begin the town (hub) scene */
+static int pd_hub_calls, pd_hub_seen5, pd_hub_lastst = -1, pd_hub_frames;
+/* Debug (pd-sweep): `hub` console command = leave the current stage the way a finished quest does and begin the town,
+ * so the next `quest <id>` starts from a real post-quest hub (the pd-k67 situation) instead of chaining battle->battle,
+ * which crashed in the HUD draw (stale per-character HUD tables). Phase 1: sub_000EB850 until the mode state has gone
+ * 5 -> 0; phase 2: sub_000EB8A0 (town); phase 3: wait for 40 consecutive hub frame-wrapper (sub_000DE980) hooks. */
+static void pd_hub_step(void)
 {
     uint32_t se = g_esp, sa = g_eax, sc = g_ecx, sd = g_edx, sb = g_ebx, ss = g_esi, sdi = g_edi, sbp = g_ebp;
+    uint32_t obj = MEM32(0x0037BE54);
+    unsigned st = MEM32(obj + 0x28) & 0xFF;
+    if (g_pd_hub_req) {
+        g_pd_hub_req = 0; g_pd_hub_phase = 1; pd_hub_calls = pd_hub_seen5 = pd_hub_frames = 0; pd_hub_lastst = -1;
+        if (g_pd_quest_phase == 2) g_pd_quest_phase = 0;
+    }
+    if (g_pd_hub_phase == 1) {
+        if (pd_hub_calls == 0) {
+            PUSH32(g_esp, 0); PUSH32(g_esp, 0);
+            sub_000EB850(); g_esp = se; pd_hub_calls = 1;
+            fprintf(stderr, "[HUB] end-stage native called, state=%u%c", (unsigned)(MEM32(obj + 0x28) & 0xFF), 10);
+        } else {
+            if ((int)st != pd_hub_lastst) { fprintf(stderr, "[HUB] mode state -> %u%c", st, 10); pd_hub_lastst = (int)st; }
+            if (st == 5) pd_hub_seen5 = 1;
+            if (pd_hub_seen5 && st == 0) {
+                fprintf(stderr, "[HUB] stage torn down; starting town%c", 10);
+                PUSH32(g_esp, 0); PUSH32(g_esp, 0);
+                sub_000EB8A0(); g_esp = se;
+                g_pd_hub_phase = 2; pd_hub_frames = 0;
+            }
+        }
+    } else if (g_pd_hub_phase == 2) {
+        if (g_pd_hook_va == 0xDE980) {
+            if (++pd_hub_frames >= 40) { fprintf(stderr, "[HUB] hub up%c", 10); g_pd_hub_phase = 0; }
+        }
+    }
+    g_esp = se; g_eax = sa; g_ecx = sc; g_edx = sd; g_ebx = sb; g_esi = ss; g_edi = sdi; g_ebp = sbp;
+}
+void pd_quest_step(int req)
+{
+    if (g_pd_hub_req || g_pd_hub_phase) { pd_hub_step(); if (req < 0) return; }
+    uint32_t se = g_esp, sa = g_eax, sc = g_ecx, sd = g_edx, sb = g_ebx, ss = g_esi, sdi = g_edi, sbp = g_ebp;
     if (req >= 0 && g_pd_quest_phase == 2) {   /* pd-nre: a new quest request after one has run (win -> hub -> next quest) */
-        g_pd_quest_phase = 0; pd_quest_calls = 0; pd_quest_seen5 = 0; pd_quest_lastst = -1;
+        g_pd_quest_phase = 0; pd_quest_calls = 0; pd_quest_seen5 = 0; pd_quest_lastst = -1; pd_quest_wait = 0;
+    }
+    /* pd-k67: the record table [0x39E754] is zeroed by every quest start (sub_000EBA80 / sub_00083FC0) and its buffer
+     * (0x82409000, shared with the stage heap) is overwritten by the battle; the hub scene only re-loads it when the
+     * mission terminal's script runs sub_000EBAE0. A request from a post-quest hub therefore copied "records" from
+     * address 0 (garbage stage -> black frame). Reload it with the same natives and wait for the load to finish. */
+    if (req >= 0 && g_pd_quest_phase == 0 && MEM32(0x0039E754) == 0) {
+        fprintf(stderr, "[QUEST] pd-k67: quest table not loaded, calling sub_000EBAE0%c", 10);
+        PUSH32(g_esp, 0); PUSH32(g_esp, 0);
+        sub_000EBAE0();
+        g_esp = se;
+        pd_quest_req_pending = req; req = -1; g_pd_quest_phase = 3;
+    }
+    if (g_pd_quest_phase == 3) {
+        uint32_t r;
+        g_esp = se; PUSH32(g_esp, 0); PUSH32(g_esp, 0);
+        sub_000EBB40();
+        r = g_eax; g_esp = se;
+        if (r == 0) {
+            fprintf(stderr, "[QUEST] pd-k67: quest table loaded @%08X%c", MEM32(0x0039E754), 10);
+            req = pd_quest_req_pending; pd_quest_req_pending = -1; g_pd_quest_phase = 0;
+        }
     }
     if (req >= 0 && g_pd_quest_phase == 0) {
+        pd_quest_calls = 0; pd_quest_seen5 = 0; pd_quest_lastst = -1; pd_quest_wait = 0;   /* fresh request (also after a `hub`) */
         uint32_t src = MEM32(0x0039E754) + (uint32_t)req * 0x520u, i, p;
         fprintf(stderr, "[QUEST] id %d record@%08X stage_field=%d\n", req, src, (int)(int16_t)(MEM32(src + 0x504) & 0xFFFF));
         for (i = 0; i < 0x148; i++) MEM32(0x00399B58 + i * 4) = MEM32(src + i * 4);
@@ -369,7 +434,9 @@ void pd_quest_step(int req)
         } else {
             if ((int)st != pd_quest_lastst) { fprintf(stderr, "[QUEST] mode state -> %u%c", st, 10); pd_quest_lastst = (int)st; }
             if (st == 5) pd_quest_seen5 = 1;
-            if (pd_quest_seen5 && st == 0) {
+            if (pd_quest_seen5 && st == 0 && pd_quest_wait++ < (getenv("RECOMP_QUEST_WAIT") ? atoi(getenv("RECOMP_QUEST_WAIT")) : 0)) {
+                /* pd-sweep: optional extra frames in state 0 before starting (chained battle->battle starts crashed in the HUD draw) */
+            } else if (pd_quest_seen5 && st == 0) {
                 fprintf(stderr, "[QUEST] stage torn down; starting quest%c", 10);
                 g_esp = se; PUSH32(g_esp, 0); PUSH32(g_esp, 0);
                 sub_000EB930();
@@ -386,4 +453,29 @@ void pd_quest_step(int req)
     }
 done:
     g_esp = se; g_eax = sa; g_ecx = sc; g_edx = sd; g_ebx = sb; g_esi = ss; g_edi = sdi; g_ebp = sbp;
+}
+
+/* pd-reg (2026-10-19): the game keeps loaded resource images in a global singly linked list (head [0x32FA3C], next at
+ * +0x10): sub_001A9B80 registers (and relocates) one, sub_001A9BE0 unregisters it (and un-relocates). Registering an
+ * image that is still listed makes a cycle (A->B->A) and the next unregister spins forever (hang at stage teardown,
+ * found by the quest sweep). Called from the mode-5 function hook at entry of both functions: logs the call and makes
+ * the register idempotent by unregistering a still-listed image first (the register then redoes the relocation). */
+extern void sub_001A9BE0(void);
+void pd_reg_hook(uint32_t va)
+{
+    static int nlog;
+    uint32_t ret = MEM32(g_esp), arg = MEM32(g_esp + 4), n = MEM32(0x0032FA3C), k = 0;
+    int listed = 0;
+    while (n && k++ < 64) { if (n == arg) { listed = 1; break; } n = MEM32(n + 0x10); }
+    if (nlog < 6000) {
+        nlog++;
+        fprintf(stderr, "[REG] %s %08X ret=%06X listed=%d%c", va == 0x1A9B80u ? "register  " : "unregister", arg, ret, listed, 10);
+    }
+    if (va == 0x1A9B80u && listed && !getenv("RECOMP_NO_REGFIX")) {
+        uint32_t se = g_esp, sa = g_eax, sc = g_ecx, sd = g_edx, sb = g_ebx, ss = g_esi, sdi = g_edi, sbp = g_ebp;
+        fprintf(stderr, "[REG] pd-reg: image %08X is already registered, unregistering it first%c", arg, 10);
+        PUSH32(g_esp, arg); PUSH32(g_esp, 0);
+        sub_001A9BE0();
+        g_esp = se; g_eax = sa; g_ecx = sc; g_edx = sd; g_ebx = sb; g_esi = ss; g_edi = sdi; g_ebp = sbp;
+    }
 }

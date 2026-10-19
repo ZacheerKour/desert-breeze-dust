@@ -1,0 +1,86 @@
+# reboot -> tag q41
+{"id": 3, "mode": "chain", "status": "ok", "t_first": 7, "fps_min": 26.6, "fps_max": 31.0, "draws_max": 1053, "notes": []}
+{"id": 4, "mode": "chain", "status": "ok", "t_first": 5, "fps_min": 26.0, "fps_max": 30.0, "draws_max": 1086, "notes": []}
+{"id": 5, "mode": "chain", "status": "ok", "t_first": 5, "fps_min": 29.5, "fps_max": 30.5, "draws_max": 930, "notes": []}
+{"id": 6, "mode": "chain", "status": "ok", "t_first": 5, "fps_min": 29.0, "fps_max": 31.0, "draws_max": 996, "notes": []}
+{"id": 7, "mode": "chain", "status": "ok", "t_first": 5, "fps_min": 29.0, "fps_max": 31.0, "draws_max": 1005, "notes": []}
+{"id": 8, "mode": "chain", "status": "ok", "t_first": 5, "fps_min": 24.6, "fps_max": 30.0, "draws_max": 1116, "notes": []}
+{"id": 9, "mode": "chain", "status": "ok", "t_first": 5, "fps_min": 29.0, "fps_max": 31.0, "draws_max": 1260, "notes": []}
+{"id": 10, "mode": "chain", "status": "ok", "t_first": 5, "fps_min": 28.0, "fps_max": 31.0, "draws_max": 1299, "notes": []}
+{"id": 11, "mode": "chain", "status": "ok", "t_first": 5, "fps_min": 26.0, "fps_max": 30.0, "draws_max": 1138, "notes": []}
+{"id": 12, "mode": "chain", "status": "ok", "t_first": 5, "fps_min": 29.0, "fps_max": 31.0, "draws_max": 1154, "notes": []}
+{"id": 13, "mode": "chain", "status": "ok", "t_first": 5, "fps_min": 18.0, "fps_max": 30.0, "draws_max": 1231, "notes": []}
+{"id": 14, "mode": "chain", "status": "ok", "t_first": 5, "fps_min": 29.0, "fps_max": 31.0, "draws_max": 1444, "notes": []}
+{"id": 15, "mode": "chain", "status": "load-timeout", "t_first": null, "fps_min": 0, "fps_max": 0, "draws_max": 0, "notes": []}
+# reboot -> tag q42
+{"id": 15, "mode": "fresh-retry", "status": "ok", "t_first": 8, "fps_min": 26.0, "fps_max": 31.0, "draws_max": 932, "notes": []}
+{"id": 16, "mode": "chain", "status": "ok", "t_first": 5, "fps_min": 11.0, "fps_max": 31.0, "draws_max": 1032, "notes": []}
+{"id": 17, "mode": "chain", "status": "crash", "t_first": 5, "fps_min": 30.0, "fps_max": 30.0, "draws_max": 595, "notes": ["[CRASH] Access violation at RIP=0x7FF61BF9BC4A, fault addr=0xBD0899B2 (read)", "    [esp+300 ] 0x00145AA5\r", "    [esp+316 ] 0x0014596A\r", "  Native stack (first 8 return addrs):"]}
+# reboot -> tag q43
+{"id": 17, "mode": "fresh-retry", "status": "ok", "t_first": 5, "fps_min": 20.0, "fps_max": 30.0, "draws_max": 1243, "notes": []}
+{"id": 18, "mode": "chain", "status": "load-timeout", "t_first": null, "fps_min": 0, "fps_max": 0, "draws_max": 0, "notes": []}
+# reboot -> tag q44
+{"id": 18, "mode": "fresh-retry", "status": "load-timeout", "t_first": null, "fps_min": 0, "fps_max": 0, "draws_max": 0, "notes": []}
+# reboot -> tag q45
+{"id": 19, "mode": "chain", "status": "ok", "t_first": 8, "fps_min": 28.0, "fps_max": 31.0, "draws_max": 1107, "notes": []}
+{"id": 20, "mode": "chain", "status": "ok", "t_first": 8, "fps_min": 29.0, "fps_max": 31.0, "draws_max": 941, "notes": []}
+{"id": 21, "mode": "chain", "status": "crash", "t_first": null, "fps_min": 0, "fps_max": 0, "draws_max": 0, "notes": ["[CRASH] Access violation at RIP=0x7FF61ACC5CF1, fault addr=0xFC2B425C (read)", "    [esp+256 ] 0x00145AA5\r", "  Native stack (first 8 return addrs):\r", "  [NV2A] DMA_PUT = 0x001DA1C0  DM"]}
+# reboot -> tag q46
+{"id": 21, "mode": "fresh-retry", "status": "ok", "t_first": 8, "fps_min": 29.0, "fps_max": 31.0, "draws_max": 234, "notes": []}
+{"id": 22, "mode": "chain", "status": "crash", "t_first": 8, "fps_min": 0, "fps_max": 0, "draws_max": 0, "notes": ["[CRASH] Access violation at RIP=0x7FF61BF9BC4A, fault addr=0xBD36A851 (read)", "    [esp+300 ] 0x00145AA5\r", "    [esp+316 ] 0x0014596A\r", "  Native stack (first 8 return addrs):"]}
+# reboot -> tag q47
+{"id": 22, "mode": "fresh-retry", "status": "ok", "t_first": 8, "fps_min": 22.0, "fps_max": 30.0, "draws_max": 1971, "notes": []}
+{"id": 23, "mode": "chain", "status": "ok", "t_first": 8, "fps_min": 22.0, "fps_max": 31.0, "draws_max": 2296, "notes": []}
+{"id": 24, "mode": "chain", "status": "crash", "t_first": null, "fps_min": 0, "fps_max": 0, "draws_max": 0, "notes": ["[CRASH] Access violation at RIP=0x7FF61BF9BC4A, fault addr=0xBD5EA256 (read)", "    [esp+304 ] 0x00145AA5\r", "    [esp+320 ] 0x0014596A\r", "  Native stack (first 8 return addrs):"]}
+# reboot -> tag q48
+{"id": 24, "mode": "fresh-retry", "status": "ok", "t_first": 7, "fps_min": 28.0, "fps_max": 31.0, "draws_max": 881, "notes": []}
+{"id": 25, "mode": "chain", "status": "crash", "t_first": null, "fps_min": 0, "fps_max": 0, "draws_max": 0, "notes": ["[CRASH] Access violation at RIP=0x7FF61ACC5CF1, fault addr=0xFC2B425C (read)", "    [esp+244 ] 0x00145B72\r", "    [esp+256 ] 0x00145AA5\r", "  Native stack (first 8 return addrs):"]}
+# reboot -> tag q49
+{"id": 25, "mode": "fresh-retry", "status": "ok", "t_first": 8, "fps_min": 1.0, "fps_max": 31.0, "draws_max": 847, "notes": []}
+{"id": 26, "mode": "chain", "status": "ok", "t_first": 7, "fps_min": 27.0, "fps_max": 31.0, "draws_max": 935, "notes": []}
+{"id": 27, "mode": "chain", "status": "ok", "t_first": 5, "fps_min": 29.0, "fps_max": 31.0, "draws_max": 629, "notes": []}
+{"id": 28, "mode": "chain", "status": "crash", "notes": ["hub step after the previous quest failed"]}
+# reboot -> tag q50
+{"id": 28, "mode": "fresh-retry", "status": "ok", "t_first": 8, "fps_min": 29.0, "fps_max": 31.0, "draws_max": 1130, "notes": []}
+{"id": 29, "mode": "chain", "status": "ok", "t_first": 5, "fps_min": 29.0, "fps_max": 31.0, "draws_max": 965, "notes": []}
+{"id": 30, "mode": "chain", "status": "ok", "t_first": 5, "fps_min": 25.0, "fps_max": 31.0, "draws_max": 1009, "notes": []}
+{"id": 31, "mode": "chain", "status": "ok", "t_first": 5, "fps_min": 29.0, "fps_max": 31.0, "draws_max": 1023, "notes": []}
+{"id": 32, "mode": "chain", "status": "ok", "t_first": 5, "fps_min": 19.0, "fps_max": 30.0, "draws_max": 1218, "notes": []}
+{"id": 33, "mode": "chain", "status": "ok", "t_first": 5, "fps_min": 29.0, "fps_max": 31.0, "draws_max": 1166, "notes": []}
+{"id": 34, "mode": "chain", "status": "ok", "t_first": 7, "fps_min": 26.0, "fps_max": 31.0, "draws_max": 1129, "notes": []}
+{"id": 35, "mode": "chain", "status": "ok", "t_first": 5, "fps_min": 29.0, "fps_max": 31.0, "draws_max": 1145, "notes": []}
+{"id": 36, "mode": "chain", "status": "ok", "t_first": 5, "fps_min": 18.0, "fps_max": 29.0, "draws_max": 861, "notes": []}
+{"id": 37, "mode": "chain", "status": "ok", "t_first": 8, "fps_min": 29.0, "fps_max": 31.0, "draws_max": 1483, "notes": []}
+{"id": 38, "mode": "chain", "status": "crash", "notes": ["hub step after the previous quest failed"]}
+# reboot -> tag q51
+{"id": 38, "mode": "fresh-retry", "status": "ok", "t_first": 5, "fps_min": 23.6, "fps_max": 30.0, "draws_max": 864, "notes": []}
+{"id": 39, "mode": "chain", "status": "crash", "t_first": 5, "fps_min": 31.0, "fps_max": 31.0, "draws_max": 1163, "notes": ["[CRASH] Access violation at RIP=0x7FF61ACC5CF1, fault addr=0xFC2B425C (read)", "    [esp+244 ] 0x00145B72\r", "    [esp+256 ] 0x00145AA5\r", "  Native stack (first 8 return addrs):"]}
+# reboot -> tag q52
+{"id": 39, "mode": "fresh-retry", "status": "ok", "t_first": 5, "fps_min": 29.0, "fps_max": 30.5, "draws_max": 1167, "notes": []}
+{"id": 40, "mode": "chain", "status": "crash", "t_first": 5, "fps_min": 29.0, "fps_max": 29.0, "draws_max": 649, "notes": ["[CRASH] Access violation at RIP=0x7FF61BF9BC4A, fault addr=0xBD807BAB (read)", "    [esp+300 ] 0x00145AA5\r", "    [esp+316 ] 0x0014596A\r", "  Native stack (first 8 return addrs):"]}
+# reboot -> tag q53
+{"id": 40, "mode": "fresh-retry", "status": "ok", "t_first": 5, "fps_min": 21.0, "fps_max": 30.0, "draws_max": 1197, "notes": []}
+{"id": 41, "mode": "chain", "status": "ok", "t_first": 5, "fps_min": 29.0, "fps_max": 30.5, "draws_max": 1222, "notes": []}
+{"id": 42, "mode": "chain", "status": "ok", "t_first": 8, "fps_min": 29.0, "fps_max": 31.0, "draws_max": 1248, "notes": []}
+{"id": 43, "mode": "chain", "status": "ok", "t_first": 5, "fps_min": 29.0, "fps_max": 31.0, "draws_max": 716, "notes": []}
+{"id": 44, "mode": "chain", "status": "ok", "t_first": 5, "fps_min": 29.0, "fps_max": 31.0, "draws_max": 997, "notes": []}
+{"id": 45, "mode": "chain", "status": "crash", "t_first": 5, "fps_min": 0, "fps_max": 0, "draws_max": 0, "notes": ["[CRASH] Access violation at RIP=0x7FF61ACC5CF1, fault addr=0xFC2B425C (read)", "    [esp+244 ] 0x00145B72\r", "    [esp+256 ] 0x00145AA5\r", "  Native stack (first 8 return addrs):"]}
+# reboot -> tag q54
+{"id": 45, "mode": "fresh-retry", "status": "ok", "t_first": 5, "fps_min": 25.0, "fps_max": 30.0, "draws_max": 1049, "notes": []}
+{"id": 46, "mode": "chain", "status": "crash", "t_first": 8, "fps_min": 0, "fps_max": 0, "draws_max": 0, "notes": ["[CRASH] Access violation at RIP=0x7FF61BF9BC4A, fault addr=0xBC97AA2D (read)", "    [esp+300 ] 0x00145AA5\r", "    [esp+316 ] 0x0014596A\r", "  Native stack (first 8 return addrs):"]}
+# reboot -> tag q55
+{"id": 46, "mode": "fresh-retry", "status": "ok", "t_first": 8, "fps_min": 25.0, "fps_max": 30.0, "draws_max": 1109, "notes": []}
+{"id": 47, "mode": "chain", "status": "ok", "t_first": 5, "fps_min": 29.0, "fps_max": 31.0, "draws_max": 919, "notes": []}
+{"id": 48, "mode": "chain", "status": "ok", "t_first": 5, "fps_min": 27.0, "fps_max": 30.0, "draws_max": 891, "notes": []}
+{"id": 49, "mode": "chain", "status": "crash", "t_first": 5, "fps_min": 29.0, "fps_max": 29.0, "draws_max": 447, "notes": ["[CRASH] Access violation at RIP=0x7FF61BF9BC4A, fault addr=0xBD048FC7 (read)", "    [esp+308 ] 0x00145AA5\r", "    [esp+324 ] 0x0014596A\r", "  Native stack (first 8 return addrs):"]}
+# reboot -> tag q56
+{"id": 49, "mode": "fresh-retry", "status": "ok", "t_first": 5, "fps_min": 27.0, "fps_max": 31.0, "draws_max": 1000, "notes": []}
+{"id": 50, "mode": "chain", "status": "ok", "t_first": 5, "fps_min": 29.0, "fps_max": 31.0, "draws_max": 929, "notes": []}
+{"id": 51, "mode": "chain", "status": "ok", "t_first": 5, "fps_min": 23.0, "fps_max": 30.0, "draws_max": 1096, "notes": []}
+{"id": 52, "mode": "chain", "status": "ok", "t_first": 5, "fps_min": 28.0, "fps_max": 31.0, "draws_max": 1067, "notes": []}
+{"id": 53, "mode": "chain", "status": "ok", "t_first": 5, "fps_min": 27.0, "fps_max": 30.0, "draws_max": 1018, "notes": []}
+{"id": 54, "mode": "chain", "status": "crash", "t_first": 5, "fps_min": 0, "fps_max": 0, "draws_max": 0, "notes": ["[CRASH] Access violation at RIP=0x7FF61ACC6E50, fault addr=0xC408E399 (read)", "    [esp+316 ] 0x00145B72\r", "    [esp+328 ] 0x00145AA5\r", "  Native stack (first 8 return addrs):"]}
+# reboot -> tag q57
+{"id": 54, "mode": "fresh-retry", "status": "ok", "t_first": 5, "fps_min": 29.0, "fps_max": 31.0, "draws_max": 994, "notes": []}
+{"id": 55, "mode": "chain", "status": "crash", "t_first": 5, "fps_min": 0, "fps_max": 0, "draws_max": 0, "notes": ["[CRASH] Access violation at RIP=0x7FF61ACC5CF1, fault addr=0xFC2B425C (read)", "    [esp+244 ] 0x00145B72\r", "    [esp+256 ] 0x00145AA5\r", "  Native stack (first 8 return addrs):"]}
+# reboot -> tag q58

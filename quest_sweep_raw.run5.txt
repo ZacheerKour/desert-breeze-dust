@@ -1,0 +1,8 @@
+# reboot -> tag q22
+{"id": 3, "mode": "chain", "status": "ok", "t_first": 7, "fps_min": 24.0, "fps_max": 31.0, "draws_max": 1050, "notes": []}
+{"id": 4, "mode": "chain", "status": "crash", "t_first": null, "fps_min": 0, "fps_max": 0, "draws_max": 0, "notes": ["[CRASH] Access violation at RIP=0x7FF6A0978BBA, fault addr=0xEA34750E (read)", "    [esp+588 ] 0x00145B72\r", "    [esp+600 ] 0x00145AA5\r", "  Native stack (first 8 return addrs):"]}
+# reboot -> tag q23
+{"id": 4, "mode": "fresh-retry", "status": "ok", "t_first": 8, "fps_min": 23.0, "fps_max": 30.0, "draws_max": 1000, "notes": []}
+{"id": 9, "mode": "chain", "status": "ok", "t_first": 8, "fps_min": 29.0, "fps_max": 31.0, "draws_max": 1092, "notes": []}
+{"id": 10, "mode": "chain", "status": "crash", "t_first": null, "fps_min": 0, "fps_max": 0, "draws_max": 0, "notes": ["[CRASH] Access violation at RIP=0x7FF6A0978BBA, fault addr=0xC634750E (read)", "    [esp+588 ] 0x00145B72\r", "    [esp+600 ] 0x00145AA5\r", "  Native stack (first 8 return addrs):"]}
+# reboot -> tag q24
