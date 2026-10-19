@@ -89,7 +89,7 @@ To update, unzip a new release over the old folder, or into a new folder and cop
 - One custom soundtrack at a time.
 
 ## Reporting bugs
-Open an issue with what you were doing, where you were in the game (mission name), a screenshot, and `pd-game-v2\run_user.err`. `WATCHER_PROMPT.md` is a ready-made prompt for a Claude Code session that watches a play session and writes bug reports for you.
+Open an issue with what you were doing, where you were in the game (mission name), a screenshot, and `pd-game-v2\run_user.err`. `docs/WATCHER_PROMPT.md` (also in the release zip) is a ready-made prompt for a Claude Code session that watches a play session and writes bug reports for you.
 
 ## Building from source
 For development, or if you prefer not to use the prebuilt executable.
@@ -106,7 +106,7 @@ The installer checks the prerequisites and never installs anything silently. The
 1. downloads the pinned `xdvdfs` disc tool;
 2. extracts and verifies your disc;
 3. creates a Python environment with `capstone`;
-4. regenerates the C code from your `default.xbe` (`pd_pipeline.py`);
+4. regenerates the C code from your `default.xbe` (`tools/pipeline/pd_pipeline.py`);
 5. builds `pd-game-v2\build\pd_recomp.exe` with CMake and Ninja (10-30 minutes; `-Jobs N` limits parallel jobs).
 
 It is safe to re-run, and the log is `install.log`. A release zip is made with `make_release.ps1 -Version x.y.z`.
@@ -114,11 +114,13 @@ It is safe to re-run, and the log is `install.log`. A release zip is made with `
 | Path | Purpose |
 |---|---|
 | `install.ps1`, `INSTALL.bat` | Setup (build from source, or the extract-only mode of a release) |
-| `pd_pipeline.py` | `default.xbe` to generated C |
+| `tools/pipeline/` | `default.xbe` to generated C (`pd_pipeline.py` and the stages it runs) |
+| `tools/analysis/` | Research scripts: file formats, models, textures, disassembly helpers, Ghidra scripts |
+| `dev/` | Test and automation scripts used while developing (game boot/drive helpers, screenshots, soak tests) |
 | `pd-game-v2/` | The game project: host entry and debug console (`src/main.c`), hand-written overrides (`src/recomp_manual.c`), seed tables, CMake |
 | `xboxrecomp/` | Vendored recompiler toolkit and Xbox runtime, with this project's changes |
 | `make_soundtrack.py` | Custom soundtrack builder |
-| `RECOMP_ANALYSIS.md` | Engineering log: how problems were found and fixed |
+| `docs/` | `RECOMP_ANALYSIS.md` (engineering log: how problems were found and fixed), file formats, notes, roadmap, test results |
 
 ## How it works
 `default.xbe` is disassembled and every function is translated to C, which keeps the game's own logic exact. The generated code runs on a runtime that answers the Xbox kernel calls and services the hardware the game expects. GPU pushbuffers are executed and rendered with Direct3D 11, including the register-combiner pixel pipeline as generated shaders. The APU is emulated for audio, and the USB controller stack is driven from XInput. The 60 FPS mode records each real frame's draw calls and replays them blended halfway toward the next frame. The game itself still runs at its original 30 FPS, so nothing speeds up.

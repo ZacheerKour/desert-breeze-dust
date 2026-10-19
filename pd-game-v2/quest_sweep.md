@@ -1,6 +1,6 @@
 # Quest sweep (worker q, 2026-10-19)
 
-Method: one process, `quest N` console hook; between quests the `hub` console command (stage end + town) then `quest N` (battle->battle chaining crashed in the HUD draw). 15 s settle with `a` presses, screenshot a, 55 s walk/lock/cast input, screenshot b. A chain crash is retried once as the first quest after a fresh boot. Run was PAUSED at quest 55 (see RECOMP_ANALYSIS.md): ids 56-145, 150, 151, 245, 0-2 are NOT swept yet. FPS = game FPS (min/max of 1.6 s samples, machine shared with the PM's builds).
+Method: one process, `quest N` console hook; between quests the `hub` console command (stage end + town) then `quest N` (battle->battle chaining crashed in the HUD draw). 15 s settle with `a` presses, screenshot a, 55 s walk/lock/cast input, screenshot b. A chain crash is retried once as the first quest after a fresh boot. Run was PAUSED at quest 55 (see docs/RECOMP_ANALYSIS.md): ids 56-145, 150, 151, 245, 0-2 are NOT swept yet. FPS = game FPS (min/max of 1.6 s samples, machine shared with the PM's builds).
 
 | id | result | first frame (s) | FPS | max draws | notes |
 |---|---|---|---|---|---|
@@ -62,5 +62,5 @@ Notes
 - 18: record stage field 0, no `com/st00`, game shows its own "problem with the disc" screen (black, 11 draws); not a playable battle. Same on a fresh boot.
 - 21: stage 24, only 127-234 draws, black void with a white fog band (shot_qs_21_a/b.png): suspected missing geometry (not confirmed against hardware).
 - 17 (stage 13), 20 (stage 23), 21, 22 ... use stage ids up to 26; ids 0-2, 150, 151, 245 and 56-145 not swept.
-- Crash signature in chain mode (13 of ~66 starts): AV in the game thread (entry 0x14596A) at sub_00157780/sub_0007B670/sub_00012E70 reading garbage (see RECOMP_ANALYSIS.md).
+- Crash signature in chain mode (13 of ~66 starts): AV in the game thread (entry 0x14596A) at sub_00157780/sub_0007B670/sub_00012E70 reading garbage (see docs/RECOMP_ANALYSIS.md).
 - Quest ids map 1:1 to `Event/en/questNNN.ssb` (battle scripts); record at [0x39E754]+id*0x520, stage at +0x504.
