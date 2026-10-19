@@ -1919,6 +1919,27 @@ static HwSurface *hw_bind_draw_state(const HwVsp *prog)
             pc.tscale[st][0] = 1.0f / (float)t->width;
             pc.tscale[st][1] = 1.0f / (float)t->height;
         }
+        /* A render surface used as a texture covers its own registered shape, which
+         * can differ from the shape the stage declares (the display buffer is at
+         * times registered 640x512 because a glow pass clips 512 rows into it).
+         * Normalising by the declared 480 rows then samples row v*512/480: the title's
+         * glow and any full-screen copy slide upward, a ghost of the picture above
+         * itself that flickers as the two display buffers alternate. Scale by the
+         * surface's own size instead. RECOMP_HW_ALIAS_TSCALE=0 restores the old way. */
+        {
+            static int on = -1;
+            const HwSurface *as = alias_sel[st];
+            if (on < 0) on = !(getenv("RECOMP_HW_ALIAS_TSCALE") && *getenv("RECOMP_HW_ALIAS_TSCALE") == '0');
+            if (on && as && t->valid && as->w && as->h && (as->w != t->width || as->h != t->height)) {
+                if (!tex_size_from_format(t->color)) {        /* texel coordinates */
+                    pc.tscale[st][0] = 1.0f / (float)as->w;
+                    pc.tscale[st][1] = 1.0f / (float)as->h;
+                } else {                                       /* normalised to the declared size */
+                    pc.tscale[st][0] = (float)t->width / (float)as->w;
+                    pc.tscale[st][1] = (float)t->height / (float)as->h;
+                }
+            }
+        }
         pc.tscale[st][2] = srv[st] ? 1.0f : 0.0f;
         if (!srv[st]) {
             if (t->valid && (s_gpu.rc_seen ? (mode >= 1 && mode <= 3) : st == 0)) s_hw_fmt[t->color & 255].white++;
@@ -3333,7 +3354,10 @@ static void hw_flip(void)
         }
         /* Nothing of the display shape was drawn this frame and the biggest
          * surface is not a video mode (an effect alias): keep the last picture. */
-        s_hw.alias_only = !best && !video_mode && s_hw.disp_w && !anyshape;
+        /* One of the two display buffers is often registered a little taller
+         * (640x512 for 640x480; cropped below): that is the picture, not an alias. */
+        s_hw.alias_only = !best && !video_mode && s_hw.disp_w && !anyshape
+            && !(s_hw.biggest->w == s_hw.disp_w && s_hw.biggest->h > s_hw.disp_h && s_hw.biggest->h <= s_hw.disp_h + 64);
         if (best && best != s_hw.biggest) {
             if (getenv("RECOMP_HW_FLICKERDBG"))
                 fprintf(stderr, "  [FLK] present %08X %ux%u instead of %08X %ux%u\n", (unsigned)best->offset, (unsigned)best->w, (unsigned)best->h,
