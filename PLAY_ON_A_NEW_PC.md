@@ -4,7 +4,7 @@
 1. You need access to the private repo (the owner adds your GitHub account under Settings > Collaborators) and your own Phantom Dust (USA) disc image (`.iso` or `Phantom Dust (USA) (En,Ja).7z`).
 2. Download the newest `PhantomDust-PC-<version>.zip` from the repo's **Releases** page (github.com/ZacheerKour/desert-breeze-dust/releases), and unzip it somewhere simple like `C:\Games`.
 3. Drag your disc file onto `INSTALL.bat`.
-4. Play: double-click `pd-game-v2\play_watched.bat`. Controls and known issues are in the zip's README.
+4. Play: double-click `PLAY.bat`. Controls and known issues are in the zip's README.
 
 The rest of this page is the build-from-source route (for development).
 

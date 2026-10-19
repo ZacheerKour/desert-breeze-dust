@@ -28,7 +28,12 @@ Copy-Item $exe "$stage\pd-game-v2\build\"
 Copy-Item $redist.FullName "$stage\pd-game-v2\build\"
 foreach ($f in 'INSTALL.bat', 'install.ps1', 'LICENSE', 'WATCHER_PROMPT.md', 'capwin_i.ps1') { Copy-Item (Join-Path $Root $f) $stage }
 foreach ($f in 'play_watched.bat', 'run_game.bat') { Copy-Item (Join-Path $Root "pd-game-v2\$f") "$stage\pd-game-v2\" }
-Copy-Item (Join-Path $Root 'RELEASE_README.md') "$stage\README.md"
+Copy-Item (Join-Path $Root 'README.md') "$stage\README.md"
+Copy-Item (Join-Path $Root 'PLAY.bat') $stage
+# Licence texts of code compiled into the exe: xboxrecomp (MIT) and its xemu-derived parts (LGPL-2.1-or-later).
+New-Item -ItemType Directory -Force "$stage\licenses\xboxrecomp" | Out-Null
+foreach ($f in 'LICENSE', 'NOTICE') { Copy-Item (Join-Path $Root "xboxrecomp\$f") "$stage\licenses\xboxrecomp\" }
+Copy-Item (Join-Path $Root 'xboxrecomp\LICENSES') "$stage\licenses\xboxrecomp\" -Recurse
 
 # Disc tools, bundled so the install needs no downloads: xdvdfs (MIT, the installer's pinned build) and 7zr (LGPL, .7z only).
 $xd = Join-Path $Root 'tools\xdvdfs'

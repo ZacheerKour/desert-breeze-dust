@@ -191,7 +191,7 @@ try {
     if ($Prebuilt) {
         Step 'finish'
         Write-Host ''
-        Write-Host 'Install complete. Start the game by double-clicking:  pd-game-v2\play_watched.bat' -ForegroundColor Green
+        Write-Host 'Install complete. Start the game by double-clicking:  PLAY.bat' -ForegroundColor Green
         Write-Host 'Keys (laptop layout): WASD move, Space jump, Tab lock on, 1-4 skills, Enter pause. A controller also works.'
         try { Stop-Transcript | Out-Null } catch { }
         exit 0

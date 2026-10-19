@@ -1,130 +1,132 @@
-# Phantom Dust PC port (static recompilation)
+# Phantom Dust PC
 
-A work-in-progress Windows port of **Phantom Dust** (Microsoft Game Studios / Majesco, original Xbox, 2004) built by
-statically recompiling the game's x86 executable into C and linking it against a Windows runtime (Xbox kernel emulation,
-NV2A graphics translated to Direct3D 11, audio on XAudio2, input via XInput/keyboard). It is not an emulator and it is
-not finished.
+A native Windows port of **Phantom Dust** (original Xbox, 2004), made by static recompilation: the game's x86 executable is translated into C and linked against a Windows runtime. That runtime emulates the Xbox kernel, translates the NV2A GPU to Direct3D 11, runs the MCPX audio on XAudio2, and maps input to XInput and the keyboard. It is not an emulator, and it runs only with game files from your own disc.
 
-**This repository contains no game data and no code generated from the game.** You need your own legally obtained
-copy of the USA retail disc. The installer extracts your disc locally and generates and builds everything on your PC.
+> **You need your own copy of the game.** This project contains no game assets. The installer reads them from your Phantom Dust (USA) disc image. See [Legal](#legal).
 
-## Requirements
+**Status: playable test builds.** The opening missions, menus, hub, movies, saving and the game's own mission flow have been tested. Long play-throughs past the first missions have not been done yet, and bug reports from real play are very welcome. See [Known issues](#known-issues).
 
-- Windows 10 or 11, 64-bit. A GPU with Direct3D 11 support.
-- About 20 GB of free disk space (disc image 4.3 GB, extracted game 4 GB, generated sources, build output).
-- [Python](https://www.python.org/downloads/) 3.10 or newer.
-- Visual Studio 2022 or Build Tools 2022 with the *Desktop development with C++* workload and the *C++ CMake tools for
-  Windows* component (this provides CMake and Ninja).
-- [7-Zip](https://www.7-zip.org/), only if your disc is a `.7z` archive.
-- Internet access during setup (downloads the pinned `xdvdfs` tool and the `capstone` Python package).
-- Your disc image: **Phantom Dust (USA)** `default.xbe` with SHA-256
-  `fbac4829a44f87a2399e623e2d6347c54839184efd6dce7307deb52391f9b910`. Other regions and revisions are refused.
+## Features
+- Native Windows executable, Direct3D 11 renderer, internal resolution follows the window size.
+- **60 FPS presentation.** The game logic runs at its original 30 FPS, and the port draws an interpolated in-between frame, so motion is smooth at correct game speed. It falls back to 30 automatically where a scene is too heavy.
+- Borderless full screen (F11 or Alt+Enter); experimental widescreen (`RECOMP_HW_ASPECT=16:9`).
+- Xbox/XInput controllers and a full keyboard layout that also works on laptops without a numpad.
+- **Custom soundtracks:** the game's Music Manager works as on the Xbox, and a bundled tool turns any folder of music into a soundtrack.
+- Saves (player profiles and arsenals) in a plain folder you can back up.
 
-The installer checks all of this and tells you what is missing; it never installs anything silently.
+## Download and play
+1. **Get the game files:** your own **Phantom Dust (USA)** disc image, either a `.iso`/`.xiso` or the common `Phantom Dust (USA) (En,Ja).7z`. Only the USA retail release is supported; the installer checks it.
+2. **Download** the newest `PhantomDust-PC-<version>.zip` from [Releases](../../releases) and unzip it to a simple location, e.g. `C:\Games\PhantomDust`. Avoid OneDrive, Program Files and paths that need admin rights.
+3. **Install:** drag your disc file onto `INSTALL.bat`. It extracts the game files into `extracted\` and verifies them. Nothing else needs to be installed.
+4. **Play:** double-click `PLAY.bat`. At the title press Enter or Start, then *Create New Player*.
 
-## Install
+### Requirements
+- Windows 10 or 11, 64-bit.
+- A GPU with Direct3D 11 support. Laptops should be plugged in.
+- About 10 GB of free disk space.
+
+## Controls
+**Controller:** any Xbox/XInput pad works, with the original layout.
+
+**Keyboard** (the default "MMO" layout, designed for laptops):
+
+| Key | Xbox control | In game |
+|---|---|---|
+| W A S D | Left stick | Move |
+| Q / E, R / F | Right stick | Turn / tilt camera |
+| Space | Left stick click | Jump |
+| Tab or right mouse | Right trigger | Lock on |
+| Shift | Left trigger | |
+| Ctrl | Right stick click | |
+| 1 2 3 4 | A B X Y | Skill slots (1 / left mouse also confirms) |
+| Enter or Esc | Start | Pause |
+| Backspace | Back / B | Cancel |
+| Arrow keys | D-pad | Menus |
+| Z / C | White / Black | |
+
+To use the original keypad layout instead, remove the line `set RECOMP_KEYS=mmo` from `play_watched.bat`. That layout is: arrows = d-pad, Z X A S = A B X Y, numpad = left stick, I/J/K/L = right stick, 1/3 = triggers, Enter = Start.
+
+## Custom soundtracks
+1. Put up to 84 songs (mp3, flac, wav, ogg, m4a, aac, wma or opus) in a folder. The folder name becomes the soundtrack name.
+2. Drag the folder onto `make_soundtrack.bat`. It converts the songs to the Xbox format (WMA) with the bundled ffmpeg.
+3. In the game, open **Options Mode > Music Manager**, choose a stage, then your soundtrack and a song. It plays in every battle on that stage.
+
+Running the tool again replaces the soundtrack. One custom soundtrack at a time is supported for now.
+
+## Settings
+Add these as `set NAME=value` lines in `play_watched.bat`, before the line that starts the exe:
+
+| Setting | Effect |
+|---|---|
+| `RECOMP_INTERP=0` | Turn off the 60 FPS in-between frames (plain 30 FPS) |
+| `RECOMP_HW_ASPECT=16:9` | Widescreen (experimental) |
+| `RECOMP_HW_SCALE=n` | Fixed internal render scale 1-8 (default: follows the window) |
+| `RECOMP_KEYS=` (empty) | Original keyboard layout |
+
+The window title shows the frame rate. `FPS: 60.0 (game 30.0)` means interpolation is active.
+
+## Saves and files
+- **Profiles and arsenals:** `extracted\UDATA`. Back this folder up; updating the port never touches it.
+- **Custom soundtrack:** `extracted\TDATA\FFFE0000\MUSIC`.
+- **Shader cache:** `pd-game-v2\bin\shadercache`. The first minutes of play may stutter briefly while it fills.
+- **Logs:** `pd-game-v2\run_user.err`. Please attach it to bug reports.
+
+To update, unzip a new release over the old folder, or into a new folder and copy `extracted\` across. You don't need to run INSTALL.bat again.
+
+## Known issues
+- Story progress beyond the first missions has had little testing. Crashes or hangs there are the most useful reports.
+- Under heavy load the controller can stop responding for a few seconds, then recover by itself.
+- The busiest hub areas run at about 50 FPS instead of 60.
+- Split Screen: Player 1 waits at "Please wait..." until a second controller signs in.
+- Xbox Live and System Link have no servers. "Go to Xbox Live" restarts the game.
+- One custom soundtrack at a time.
+
+## Reporting bugs
+Open an issue with what you were doing, where you were in the game (mission name), a screenshot, and `pd-game-v2\run_user.err`. `WATCHER_PROMPT.md` is a ready-made prompt for a Claude Code session that watches a play session and writes bug reports for you.
+
+## Building from source
+For development, or if you prefer not to use the prebuilt executable.
+
+Requirements: Visual Studio 2022 or Build Tools 2022 with *Desktop development with C++* and *C++ CMake tools for Windows*, Python 3.10+, and 7-Zip if your disc is a `.7z`. About 20 GB free.
 
 ```
-git clone <this repository>
-cd <clone folder>
+git clone https://github.com/<owner>/<repo>.git
+cd <repo>
 INSTALL.bat "C:\path\to\Phantom Dust (USA) (En,Ja).7z"
 ```
 
-You can also drag the disc file onto `INSTALL.bat`, or call `powershell -File install.ps1 "<path>"`. The source may be a
-`.7z` containing an ISO, an `.iso`/`.xiso`, or a folder that already holds an extracted disc (`default.xbe` at its top).
+The installer checks the prerequisites and never installs anything silently. Then it:
+1. downloads the pinned `xdvdfs` disc tool;
+2. extracts and verifies your disc;
+3. creates a Python environment with `capstone`;
+4. regenerates the C code from your `default.xbe` (`pd_pipeline.py`);
+5. builds `pd-game-v2\build\pd_recomp.exe` with CMake and Ninja (10-30 minutes; `-Jobs N` limits parallel jobs).
 
-The installer does the following, stopping with `INSTALL FAILED at step: <name>` on any error:
-
-1. checks prerequisites;
-2. downloads `xdvdfs` 0.8.3 into `tools\` and verifies its SHA-256;
-3. extracts the disc into `extracted\` (skipped when already done);
-4. verifies `default.xbe` against the accepted SHA-256;
-5. creates `.venv-recomp` with a pinned `capstone`;
-6. runs the recompiler pipeline (`pd_pipeline.py`) to generate C into `pd-game-v2\src\recomp\gen` (a few minutes);
-7. configures and builds with CMake + Ninja (10-30 minutes; `-Jobs N` limits parallel compile jobs, default 4);
-8. reports where the game is.
-
-It is safe to re-run; finished steps are skipped. The log is `install.log`. `.\install.ps1 -SkipBuild` stops after code
-generation.
-
-## Run
-
-```
-pd-game-v2\run_game.bat
-```
-
-On the developer PC, boot to the title takes about 20 seconds once the caches are warm; the first run after install is slower (in the clean-install test the title screen was showing when checked about 90 seconds after launch). The game reads its data from `extracted\`, so do not move it.
-
-### Controls
-
-| Key | Action |
-|---|---|
-| Enter | Start |
-| Z | A (confirm) |
-| X | B (cancel) |
-| Arrow keys | D-pad |
-| Backspace | Back |
-| Shift | Left stick press |
-
-Xbox-style USB/XInput pads are also supported. Alt+Enter or F11 toggles borderless fullscreen; Alt+F4 or closing the
-window quits.
-
-### Useful switches
-
-`run_game.bat` already sets the defaults the port needs (`RECOMP_HW=1` for the GPU path and so on). Set these before
-launching to change behaviour:
-
-| Variable | Effect |
-|---|---|
-| `RECOMP_HW_SCALE=n` | Internal render scale 1-8 (default: follows window size) |
-| `RECOMP_HW_ASPECT=16:9` | Widen the picture (default 4:3) |
-| `RECOMP_HW_VSYNC=0` | Disable vsync |
-| `RECOMP_HW_NOGLOW=1` | Skip the glow effect pass |
-| `RECOMP_HW_NOCULL=1` | Ignore the cull state (debugging) |
-| `RECOMP_WATCHDOG_SECS=n` | Report a hang after n seconds without progress |
-
-Console output (stderr) is large; redirect it: `run_game.bat 2> run_err.txt`.
-
-Custom soundtrack: `make_soundtrack.py` (see the script header).
-
-## Status
-
-Working: boots, intro movies, title, profile create/load, main menu, the Clinic hub (free roam, NPC dialogue and
-cutscenes), pad and keyboard input, audio, glow/stencil/decals, window-driven render scale.
-
-First battle: reached through a developer debug hook (`quest <id>` command, see `RECOMP_ANALYSIS.md`), not yet through
-the normal Mission Terminal flow.
-
-Known issues (tracked in `.beads/issues.jsonl`):
-
-- Battles run at about 2.5-6 FPS (hub: 30 FPS) (pd-pc7).
-- White glyph block in the top-left of battle frames; stale sky rectangle in some cutscenes (pd-js7, pd-42q).
-- Normal story progression to a battle, arsenal/Lab, battle audio, skills, AI and win/lose are untested (pd-ab1, pd-i0w).
-- Split-screen waits for player 2 sign-in (pd-srj); title-screen audio stutter until a profile loads (pd-089).
-- Save round-trips across restarts are not yet verified; a damaged test profile exists on the developer machine (pd-5tj, pd-lu8).
-- Remaining Options screens and most movies untested; frame pacing dips (pd-4y6, pd-55f, pd-m2k).
-- No long-run stability testing yet (pd-ecu).
-
-Do not expect a finished, polished port.
-
-## Layout
+It is safe to re-run, and the log is `install.log`. A release zip is made with `make_release.ps1 -Version x.y.z`.
 
 | Path | Purpose |
 |---|---|
-| `install.ps1`, `INSTALL.bat` | One-command setup |
-| `pd_pipeline.py` | default.xbe to generated C (the stages `xbe_parser`, `disasm`, `extend`, `func_id`, `abi_analysis`, `recomp`) |
-| `pd-game-v2/` | The game project: `src/main.c` (host entry, debug consoles), `src/recomp_manual.c` (hand-written overrides), seed tables, CMake |
-| `xboxrecomp/` | Vendored toolkit (lifter and runtime libraries) with local patches |
-| `RECOMP_ANALYSIS.md`, `NOTES.md` | Engineering log and findings |
+| `install.ps1`, `INSTALL.bat` | Setup (build from source, or the extract-only mode of a release) |
+| `pd_pipeline.py` | `default.xbe` to generated C |
+| `pd-game-v2/` | The game project: host entry and debug console (`src/main.c`), hand-written overrides (`src/recomp_manual.c`), seed tables, CMake |
+| `xboxrecomp/` | Vendored recompiler toolkit and Xbox runtime, with this project's changes |
+| `make_soundtrack.py` | Custom soundtrack builder |
+| `RECOMP_ANALYSIS.md` | Engineering log: how problems were found and fixed |
 
-## Licensing
+## How it works
+`default.xbe` is disassembled and every function is translated to C, which keeps the game's own logic exact. The generated code runs on a runtime that answers the Xbox kernel calls and services the hardware the game expects. GPU pushbuffers are executed and rendered with Direct3D 11, including the register-combiner pixel pipeline as generated shaders. The APU is emulated for audio, and the USB controller stack is driven from XInput. The 60 FPS mode records each real frame's draw calls and replays them blended halfway toward the next frame. The game itself still runs at its original 30 FPS, so nothing speeds up.
 
-- This repository's own code: MIT (see `LICENSE`).
-- `xboxrecomp/` is the [sp00nznet/xboxrecomp](https://github.com/sp00nznet/xboxrecomp) toolkit, MIT, except the
-  xemu-derived APU and NV2A register sources which are LGPL-2.1-or-later (texts in `xboxrecomp/LICENSES/`, file list in
-  its `NOTICE`). Local changes follow the same terms.
-- The Direct3D 11 hardware renderer, vertex-program-to-HLSL translator and some executor hooks were ported from the
-  [rePOP](https://github.com/FulGerNet/rePOP) project (MIT). No rePOP-generated game code is used.
-- `xdvdfs` (MIT, antangelo) is downloaded at install time and not redistributed here.
-- **No rights to Phantom Dust are granted or implied.** Phantom Dust is the property of its respective owners. This
-  project ships no game assets, executables or code generated from them; you must supply your own copy.
+## Credits
+- [xboxrecomp](https://github.com/sp00nznet/xboxrecomp) by sp00nznet: the recompiler toolkit and Xbox runtime this port is built on (MIT).
+- [xemu](https://github.com/xemu-project/xemu): the MCPX APU and NV2A register sources used by the runtime (LGPL-2.1-or-later; see `xboxrecomp/NOTICE`).
+- [rePOP](https://github.com/FulGerNet/rePOP) by FulGerNet: the Direct3D 11 renderer design and vertex-program translator were ported from it (MIT). None of rePOP's generated game code is used.
+- [xdvdfs](https://github.com/antangelo/xdvdfs) by antangelo (MIT), [7-Zip](https://www.7-zip.org/) by Igor Pavlov (`7zr`, LGPL), and [FFmpeg](https://ffmpeg.org/) (GPL build by gyan.dev), all bundled unmodified in releases with their licences.
+
+## Legal
+Phantom Dust is © Microsoft Corporation, published by Majesco. This project is not affiliated with or endorsed by Microsoft or Majesco, and no rights to the game are granted or implied.
+
+- **This repository** contains only original code, the third-party code credited above, and tools. It contains no game assets and no code generated from the game.
+- **Release downloads** contain the compiled port executable, which is built from code translated from the game's executable. They contain no game assets: no models, textures, audio, movies, text or scripts. Everything the game shows and plays is read at run time from the disc image you supply.
+- You must own the game and use your own legally obtained copy. Do not ask for or share game files.
+
+This project's own code is MIT licensed (`LICENSE`). Third-party components keep their own licences.
