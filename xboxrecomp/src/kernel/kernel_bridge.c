@@ -3356,6 +3356,8 @@ static void bridge_NtOpenFile(void)
  * dropped rather than risk changing this shared path for the other titles.
  */
 recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);
+static RECOMP_TLS struct { uint32_t r, c, s; } t_apc_q[64];
+static RECOMP_TLS int t_apc_n;
 
 static void deliver_one_apc(uint32_t apc_routine, uint32_t apc_context,
                             uint32_t iostatus)
@@ -3396,7 +3398,26 @@ static void bridge_complete_file_io(uint32_t event_token, uint32_t apc_routine,
         if (ev) SetEvent(ev);
     }
     if (apc_routine) {
-        deliver_one_apc(apc_routine, apc_context, iostatus);
+        /* pd-dz0 (2026-10-19): RECOMP_APC_DEFER=1 queues the completion APC (per thread) and runs it at the thread's
+         * next kernel call instead of inside NtReadFile, i.e. after the game's own ReadFile bookkeeping, as on
+         * hardware where the APC fires after the disc read. */
+        static int defer = -1;
+        if (defer < 0) { const char *e = getenv("RECOMP_APC_DEFER"); defer = e && atoi(e) ? 1 : 0; }
+        if (defer && t_apc_n < 64) {
+            t_apc_q[t_apc_n].r = apc_routine; t_apc_q[t_apc_n].c = apc_context; t_apc_q[t_apc_n].s = iostatus; t_apc_n++;
+        } else {
+            deliver_one_apc(apc_routine, apc_context, iostatus);
+        }
+    }
+}
+
+static void bridge_drain_apcs(void)
+{
+    while (t_apc_n > 0) {
+        uint32_t r = t_apc_q[0].r, c = t_apc_q[0].c, s = t_apc_q[0].s; int i;
+        for (i = 1; i < t_apc_n; i++) t_apc_q[i - 1] = t_apc_q[i];
+        t_apc_n--;
+        deliver_one_apc(r, c, s);
     }
 }
 
@@ -3600,6 +3621,11 @@ static int bridge_async_io_enabled(void)
 /* ── NtReadFile (ordinal 219, 8 args = 32 bytes) ──────── */
 static void bridge_NtReadFile(void)
 {
+    {   /* pd-dz0 experiment (2026-10-19): RECOMP_READ_DELAY_MS slows every read */
+        static int dly = -1;
+        if (dly < 0) { const char *e = getenv("RECOMP_READ_DELAY_MS"); dly = e ? atoi(e) : 0; }
+        if (dly > 0) Sleep((DWORD)dly);
+    }
     HANDLE   handle    = bridge_resolve_handle(STACK_ARG(0));
     uint32_t iostatus  = STACK_ARG(4);
     uint32_t buffer_va = STACK_ARG(5);
@@ -9709,6 +9735,7 @@ static void kernel_thunk_dispatch_body(void)
     ordinal = g_slot_ordinals[slot];
     bridge = g_slot_bridges[slot];
 
+    if (t_apc_n > 0 && ordinal != 219 && ordinal != 236) bridge_drain_apcs();
     g_kernel_call_count++;
     if (ordinal < XBOX_KERNEL_THUNK_TABLE_SIZE)
         g_ordinal_calls[ordinal]++;

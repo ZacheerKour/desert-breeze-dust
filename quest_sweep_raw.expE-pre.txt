@@ -1,0 +1,5 @@
+# reboot -> tag q92
+{"id": 20, "mode": "chain", "status": "ok", "t_first": 8, "fps_min": 27.0, "fps_max": 30.5, "draws_max": 917, "notes": []}
+{"id": 21, "mode": "chain", "status": "crash", "t_first": null, "fps_min": 0, "fps_max": 0, "draws_max": 0, "notes": ["[CRASH] Access violation at RIP=0x7FF6E492BE0A, fault addr=0xBDCB0A1F (read)", "  [DUMP ecx=003C22A0] 002880A8 002BB5D8 00FAA671 011F7E60 81D8B504 81D8B47C 42400000 42400000 00000000 42400000 42880000 00000000 00000000 81D89260 011F14E0 000", "  [DUMP edx=011F7E60] 011F7D20 81D89B88 81D89260 81D8B504 81D8B47C 011F7EA0 00000000 42B6A7BD 00000000 00000000 002E82B0 002E8320 00000000 011F7EC0 00000000 3F8", "  Native stack (first 8 return addrs):"]}
+# reboot -> tag q93
+{"id": 21, "mode": "fresh-retry", "status": "ok", "t_first": 7, "fps_min": 21.0, "fps_max": 31.0, "draws_max": 240, "notes": []}

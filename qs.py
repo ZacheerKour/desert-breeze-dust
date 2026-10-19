@@ -36,8 +36,8 @@ def title():
     P = ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
     user32.EnumWindows(P(cb), 0)
     for t in res:
-        m = re.search(r'FPS: ([\d.]+) \| draws: (\d+)', t)
-        if m: return float(m.group(1)), int(m.group(2))
+        m = re.search(r'FPS: ([\d.]+)(?: \(game ([\d.]+)\))? \| draws: (\d+)', t)
+        if m: return float(m.group(2) or m.group(1)), int(m.group(3))
     return None
 
 def pad(s):
@@ -70,7 +70,8 @@ def go_hub():
     while time.time() - t0 < 120:
         time.sleep(2)
         if not pids(): return 'crash'
-        if '[HUB] hub up' in errtxt()[base:]: return 'ok'
+        if '[HUB] hub up' in errtxt()[base:]:
+            time.sleep(float(os.environ.get('QS_HUBWAIT', '0'))); return 'ok'
         pad('a:100') if time.time() - t0 > 30 and int(time.time() - t0) % 7 == 0 else None
     return 'hub-timeout'
 

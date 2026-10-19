@@ -699,6 +699,19 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
         fprintf(stderr, "  Xbox VA of fault: 0x%08X\n",
             (uint32_t)(fault_addr - (uintptr_t)g_xbox_mem_offset));
         print_guest_context((void *)ep->ContextRecord->Rip);
+        { /* pd-dz0 (2026-10-19): dump the memory the crashing registers point at */
+            uint32_t rr[5] = { g_esi, g_edi, g_ebx, g_ecx, g_edx }; const char *rn[5] = { "esi", "edi", "ebx", "ecx", "edx" }; int q, w;
+            for (q = 0; q < 5; q++) {
+                uint32_t va = rr[q];
+                if (!((va >= 0x10000u && va < 0x04000000u) || (va >= 0x80010000u && va < 0x84000000u))) continue;
+                __try {
+                    fprintf(stderr, "  [DUMP %s=%08X]", rn[q], va);
+                    for (w = 0; w < 16; w++) fprintf(stderr, " %08X", *(volatile uint32_t *)((uint8_t *)g_xbox_mem_offset + va + w * 4));
+                    fprintf(stderr, "%c", 10);
+                } __except (EXCEPTION_EXECUTE_HANDLER) { fprintf(stderr, " (unreadable)%c", 10); }
+            }
+        }
+
 
         /*
          * TODO: Add game-specific diagnostics here. Examples:

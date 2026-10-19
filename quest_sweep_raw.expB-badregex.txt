@@ -1,0 +1,10 @@
+# reboot -> tag q62
+{"id": 20, "mode": "chain", "status": "load-timeout", "t_first": null, "fps_min": 0, "fps_max": 0, "draws_max": 0, "notes": []}
+# reboot -> tag q63
+{"id": 20, "mode": "fresh-retry", "status": "load-timeout", "t_first": null, "fps_min": 0, "fps_max": 0, "draws_max": 0, "notes": []}
+# reboot -> tag q64
+{"id": 21, "mode": "chain", "status": "load-timeout", "t_first": null, "fps_min": 0, "fps_max": 0, "draws_max": 0, "notes": []}
+# reboot -> tag q65
+{"id": 21, "mode": "fresh-retry", "status": "load-timeout", "t_first": null, "fps_min": 0, "fps_max": 0, "draws_max": 0, "notes": []}
+# reboot -> tag q66
+{"id": 22, "mode": "chain", "status": "ok", "t_first": 40, "fps_min": 0, "fps_max": 0, "draws_max": 0, "notes": []}
