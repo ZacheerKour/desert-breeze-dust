@@ -139,12 +139,25 @@ static void keyboard_state_mmo(XBOX_INPUT_STATE *pState)
     pState->Gamepad.sThumbRY = axis_from_keys('F', 'R');
 }
 
+volatile int g_pd_text_input = 0;   /* set by the title while a name-entry screen is active (see pd-game-v2/src/main.c) */
+
 static void keyboard_state(XBOX_INPUT_STATE *pState)
 {
     static DWORD packet;
     WORD b = 0;
 
     memset(pState, 0, sizeof(*pState));
+
+    if (g_pd_text_input) {
+        /* A text-entry screen (pd name entry) is being typed into: the letters must not also drive the pad. Arrows still move. */
+        if (key_down(VK_UP))     b |= XBOX_GAMEPAD_DPAD_UP;
+        if (key_down(VK_DOWN))   b |= XBOX_GAMEPAD_DPAD_DOWN;
+        if (key_down(VK_LEFT))   b |= XBOX_GAMEPAD_DPAD_LEFT;
+        if (key_down(VK_RIGHT))  b |= XBOX_GAMEPAD_DPAD_RIGHT;
+        pState->Gamepad.wButtons = b;
+        pState->dwPacketNumber = ++packet;
+        return;
+    }
 
     if (keyboard_mmo()) {
         keyboard_state_mmo(pState);

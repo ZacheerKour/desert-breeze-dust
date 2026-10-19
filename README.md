@@ -54,16 +54,23 @@ To use the original keypad layout instead, remove the line `set RECOMP_KEYS=mmo`
 Running the tool again replaces the soundtrack. One custom soundtrack at a time is supported for now.
 
 ## Settings
-Add these as `set NAME=value` lines in `play_watched.bat`, before the line that starts the exe:
+Run `Settings.bat` (or open `settings.ini` next to `PLAY.bat` in Notepad), edit, save, and start the game again. Missing lines use the defaults.
 
-| Setting | Effect |
-|---|---|
-| `RECOMP_INTERP=0` | Turn off the 60 FPS in-between frames (plain 30 FPS) |
-| `RECOMP_HW_ASPECT=16:9` | Widescreen (experimental) |
-| `RECOMP_HW_SCALE=n` | Fixed internal render scale 1-8 (default: follows the window) |
-| `RECOMP_KEYS=` (empty) | Original keyboard layout |
+| Line in `settings.ini` | Values (default first) | Effect |
+|---|---|---|
+| `fullscreen` | `0` / `1` | Start in borderless full screen |
+| `window` | `auto` / `1280x960` / `1920x1080` / `2560x1440` ... | Window size in pixels (`auto` = 1280 wide) |
+| `render_scale` | `auto` / `1`-`8` | Internal render resolution as a multiple of 640x480 (`auto` follows the window) |
+| `aspect` | `4:3` / `16:9` | Picture aspect ratio (16:9 is experimental) |
+| `interpolation` | `1` / `0` | 60 FPS in-between frames; `0` = plain 30 FPS |
+| `vsync` | `1` / `0` | Wait for the monitor refresh |
+| `keys` | `mmo` / `classic` | Keyboard layout (see Controls) |
 
-The window title shows the frame rate. `FPS: 60.0 (game 30.0)` means interpolation is active.
+F11 or Alt+Enter toggles borderless full screen at any time. The window title shows the frame rate. `FPS: 60.0 (game 30.0)` means interpolation is active.
+
+Advanced: any `RECOMP_*` switch can still be added as a `set NAME=value` line in `play_watched.bat`; a switch set there wins over `settings.ini`.
+
+**Typing a profile name:** on the NAME ENTRY screen the physical keyboard types directly: letters, digits and Space, Backspace deletes, Enter = OK, Esc = back (Shift for capitals). The on-screen keyboard and the pad still work.
 
 ## Saves and files
 - **Profiles and arsenals:** `extracted\UDATA`. Back this folder up; updating the port never touches it.
