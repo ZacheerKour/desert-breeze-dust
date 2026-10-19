@@ -1,5 +1,13 @@
 # Phantom Dust PC port: install and play on a fresh Windows PC
 
+## Easiest: the prebuilt release (no compiler, about 5 minutes)
+1. You need access to the private repo (the owner adds your GitHub account under Settings > Collaborators) and your own Phantom Dust (USA) disc image (`.iso` or `Phantom Dust (USA) (En,Ja).7z`).
+2. Download the newest `PhantomDust-PC-<version>.zip` from the repo's **Releases** page (github.com/ZacheerKour/desert-breeze-dust/releases), and unzip it somewhere simple like `C:\Games`.
+3. Drag your disc file onto `INSTALL.bat`.
+4. Play: double-click `pd-game-v2\play_watched.bat`. Controls and known issues are in the zip's README.
+
+The rest of this page is the build-from-source route (for development).
+
 Status and known issues: see "Known issues" at the end (kept current by the PM).
 
 ## 1. Install the tools (one time, about 30-45 minutes, mostly downloads)

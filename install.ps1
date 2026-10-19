@@ -21,6 +21,9 @@ param(
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $Root
+# A release zip ships pd-game-v2\build\pd_recomp.exe and a PREBUILT.txt marker: then only the disc is extracted and
+# verified (no Python, no Visual Studio, no code generation, no build).
+$Prebuilt = (Test-Path (Join-Path $Root 'PREBUILT.txt')) -and (Test-Path (Join-Path $Root 'pd-game-v2\build\pd_recomp.exe'))
 
 # ---- pinned inputs ----------------------------------------------------------------------------------------------
 $Xdvdfs = @{
@@ -60,6 +63,7 @@ try {
     # ---------------------------------------------------------------------------------------------------------
     Step 'prerequisites'
     $missing = @()
+    if ($Prebuilt) { Write-Host 'Prebuilt release: no compiler or Python needed.' }
     # Python 3.10+
     $py = $null
     foreach ($cand in @(@('py', '-3'), @('python'), @('python3'))) {
@@ -75,14 +79,16 @@ try {
             break
         }
     }
-    if (-not $py) { $missing += "Python 3.10 or newer (python.org installer; tick 'Add python.exe to PATH', or install the 'py' launcher)." }
+    if (-not $py -and -not $Prebuilt) { $missing +="Python 3.10 or newer (python.org installer; tick 'Add python.exe to PATH', or install the 'py' launcher)." }
     # Visual Studio 2022 C++ tools + CMake + Ninja
     $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
     $vsRoot = $null
     if (Test-Path $vswhere) {
         $vsRoot = & $vswhere -latest -products * -version '[17.0,18.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
     }
-    if ($vsRoot) {
+    if ($Prebuilt) {
+        # nothing to build
+    } elseif ($vsRoot) {
         $vsRoot = ($vsRoot | Select-Object -First 1)
         Write-Host "Visual Studio 2022: $vsRoot"
         $cmake = Join-Path $vsRoot 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
@@ -147,7 +153,7 @@ try {
             $extn = [IO.Path]::GetExtension($Source).ToLower()
             if ($extn -eq '.7z') {
                 $sz = $null
-                foreach ($c in @((Get-Command 7z -ErrorAction SilentlyContinue).Source, "$env:ProgramFiles\7-Zip\7z.exe", "${env:ProgramFiles(x86)}\7-Zip\7z.exe")) {
+                foreach ($c in @((Get-Command 7z -ErrorAction SilentlyContinue).Source, "$env:ProgramFiles\7-Zip\7z.exe", "${env:ProgramFiles(x86)}\7-Zip\7z.exe", (Join-Path $Root 'tools\7zr\7zr.exe'))) {
                     if ($c -and (Test-Path $c)) { $sz = $c; break }
                 }
                 if (-not $sz) { Fail 'your disc is a .7z but 7-Zip was not found. Install 7-Zip from https://www.7-zip.org/ and re-run (or extract the .7z yourself and pass the .iso)' }
@@ -182,6 +188,14 @@ try {
     }
 
     # ---------------------------------------------------------------------------------------------------------
+    if ($Prebuilt) {
+        Step 'finish'
+        Write-Host ''
+        Write-Host 'Install complete. Start the game by double-clicking:  pd-game-v2\play_watched.bat' -ForegroundColor Green
+        Write-Host 'Keys (laptop layout): WASD move, Space jump, Tab lock on, 1-4 skills, Enter pause. A controller also works.'
+        try { Stop-Transcript | Out-Null } catch { }
+        exit 0
+    }
     Step 'python venv'
     $venv = Join-Path $Root '.venv-recomp'
     $vpy = Join-Path $venv 'Scripts\python.exe'
