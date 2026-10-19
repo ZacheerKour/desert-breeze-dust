@@ -507,11 +507,21 @@ static void pad_live_poll(unsigned long t)
     fclose(f);
 }
 
+/* Buttons held by the title's own code (pd name-entry typing): digital byte 2 bits and analog button bits of pad 0. */
+volatile unsigned g_pd_pulse_dig = 0, g_pd_pulse_ana = 0;
+
 static void pad_script_apply(int pad, uint8_t *out)
 {
     static unsigned long t0;
     unsigned long now, t;
     int i, j;
+
+    if (pad == 0 && (g_pd_pulse_dig || g_pd_pulse_ana)) {
+        out[2] |= (uint8_t)g_pd_pulse_dig;
+        for (j = 0; j < 8; j++)
+            if (g_pd_pulse_ana & (1u << j))
+                out[4 + j] = 0xFF;
+    }
 
     if (s_script_len < 0)
         pad_script_load();

@@ -26,7 +26,7 @@ New-Item -ItemType Directory -Force "$stage\pd-game-v2\build", "$stage\tools\xdv
 
 Copy-Item $exe "$stage\pd-game-v2\build\"
 Copy-Item $redist.FullName "$stage\pd-game-v2\build\"
-foreach ($f in 'INSTALL.bat', 'install.ps1', 'LICENSE', 'WATCHER_PROMPT.md', 'capwin_i.ps1') { Copy-Item (Join-Path $Root $f) $stage }
+foreach ($f in 'settings.ini', 'Settings.bat', 'INSTALL.bat', 'install.ps1', 'LICENSE', 'WATCHER_PROMPT.md', 'capwin_i.ps1') { Copy-Item (Join-Path $Root $f) $stage }
 foreach ($f in 'play_watched.bat', 'run_game.bat') { Copy-Item (Join-Path $Root "pd-game-v2\$f") "$stage\pd-game-v2\" }
 Copy-Item (Join-Path $Root 'README.md') "$stage\README.md"
 Copy-Item (Join-Path $Root 'PLAY.bat') $stage

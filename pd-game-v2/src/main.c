@@ -743,6 +743,160 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
 
 /* ── WinMain ───────────────────────────────────────────────── */
 
+/* settings.ini (next to PLAY.bat): read at startup, turned into the RECOMP_* switches the runtime already understands.
+ * A switch already present in the environment (set in a .bat) wins over the file. Keys, one per line, `key=value`, `;`/`#` comments:
+ *   fullscreen=0|1  window=auto|WxH  render_scale=auto|1..8  aspect=4:3|16:9  interpolation=1|0  vsync=1|0  keys=mmo|classic */
+static void pd_setenv_default(const char *name, const char *val)
+{
+    if (getenv(name)) return;
+    _putenv_s(name, val);
+}
+static int pd_truthy(const char *v) { return atoi(v) || !_stricmp(v, "on") || !_stricmp(v, "yes") || !_stricmp(v, "true"); }
+static void pd_load_settings(void)
+{
+    static const char *paths[] = { "../settings.ini", "settings.ini" };
+    FILE *f = NULL; char line[256]; int i;
+    for (i = 0; i < 2 && !f; i++) f = fopen(paths[i], "r");
+    if (!f) { fprintf(stderr, "[SETTINGS] no settings.ini%c", 10); return; }
+    fprintf(stderr, "[SETTINGS] reading settings.ini%c", 10);
+    pd_setenv_default("RECOMP_KEYS", "mmo");
+    while (fgets(line, sizeof line, f)) {
+        char *k = line, *v, *e;
+        while (*k == ' ' || *k == '\t') k++;
+        if (*k == ';' || *k == '#' || *k == '[' || !(v = strchr(k, '='))) continue;
+        *v++ = 0;
+        for (e = k + strlen(k); e > k && (e[-1] == ' ' || e[-1] == '\t'); ) *--e = 0;
+        while (*v == ' ' || *v == '\t') v++;
+        for (e = v + strlen(v); e > v && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '\n'); ) *--e = 0;
+        fprintf(stderr, "[SETTINGS] %s=%s%c", k, v, 10);
+        if (!_stricmp(k, "fullscreen")) pd_setenv_default("RECOMP_HW_FULLSCREEN", pd_truthy(v) ? "1" : "0");
+        else if (!_stricmp(k, "window")) { if (_stricmp(v, "auto") && *v) pd_setenv_default("RECOMP_WINDOW_SIZE", v); }
+        else if (!_stricmp(k, "render_scale")) { if (_stricmp(v, "auto") && *v) pd_setenv_default("RECOMP_HW_SCALE", v); }
+        else if (!_stricmp(k, "aspect")) { if (strcmp(v, "4:3") && *v) pd_setenv_default("RECOMP_HW_ASPECT", v); }
+        else if (!_stricmp(k, "interpolation")) pd_setenv_default("RECOMP_INTERP", pd_truthy(v) ? "1" : "0");
+        else if (!_stricmp(k, "vsync")) pd_setenv_default("RECOMP_HW_VSYNC", pd_truthy(v) ? "1" : "0");
+        else if (!_stricmp(k, "keys")) { if (!_stricmp(v, "classic")) _putenv_s("RECOMP_KEYS", ""); else if (!_stricmp(v, "mmo")) _putenv_s("RECOMP_KEYS", "mmo"); }
+    }
+    fclose(f);
+}
+
+/* ---- Name entry typing (2026-10-19) --------------------------------------------------------------------------------------------
+ * The profile NAME ENTRY screen (menu script playdatasel_en.ssb) is an on-screen keyboard. With the physical keyboard, letters, digits,
+ * Space, Backspace, Enter (= OK) and Esc (= back) are translated into the game's own pad input: the cursor is walked over the grid with
+ * d-pad pulses and A is pressed, closed loop on the cursor index the game keeps in its screen object. Nothing is poked into the name buffer.
+ * Screen object (guest heap, found by the label string "PLAYER :" at +0x20 from the cursor word; address varies):
+ *   cursor-0x14,-0x10,-0x0C = 1,1,1 while the keyboard has the input (0,x,3 after Back, 0,1,2 on the overwrite prompt)
+ *   cursor  = 0-9 digits, 10-35 a-z, 36 Space, 37 Caps, 38 Backspace, 39 OK;  +4 = name length;  +8 = caps flag;  +0x14 = name bytes
+ * g_pd_text_input switches the layout's letter keys off while the screen is active, so typing does not also move the pad. */
+extern volatile int g_pd_text_input;
+extern volatile unsigned g_pd_pulse_dig, g_pd_pulse_ana;
+extern int xbox_FramebufferKeyDown(int vk);
+#define NEM(a) (*(volatile uint32_t *)((uint8_t *)g_xbox_mem_offset + (a)))
+static uint32_t g_ne_base;
+static int g_ne_q[64], g_ne_qn;
+static int ne_valid(uint32_t b)
+{
+    int ok = 0;
+    if (!b || b < 0x100000u || b > 0x03F00000u) return 0;
+    __try {
+        ok = NEM(b - 0x14) == 1 && NEM(b - 0x10) <= 1 && NEM(b - 0x0C) == 1 && NEM(b) < 40 && NEM(b + 4) <= 32 &&
+             NEM(b + 0x20) == 0x59414C50u && NEM(b + 0x24) == 0x3A205245u;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { ok = 0; }
+    return ok;
+}
+static uint32_t ne_find(void)
+{
+    uint32_t a;
+    __try {
+        for (a = 0x00100000u; a < 0x03F00000u; a += 4)
+            if (NEM(a) == 0x59414C50u && NEM(a + 4) == 0x3A205245u && ne_valid(a - 0x20)) return a - 0x20;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { }
+    return 0;
+}
+/* edge detection of the keys we turn into characters; pushes codes: 0-9 digit, 10-35 letter (+100 = Shift held), 36 space, 50 back, 51 enter, 52 esc */
+static void ne_poll_keys(void)
+{
+    static unsigned char prev[256];
+    static const int vks[] = { VK_SPACE, VK_BACK, VK_RETURN, VK_ESCAPE };
+    int v, i;
+    for (v = 0; v < 256; v++) {
+        int is = (v >= '0' && v <= '9') || (v >= 'A' && v <= 'Z');
+        for (i = 0; i < 4; i++) if (v == vks[i]) is = 1;
+        if (!is) continue;
+        {
+            int d = xbox_FramebufferKeyDown(v) ? 1 : 0;
+            if (d && !prev[v] && g_ne_qn < 64) {
+                int code = v >= '0' && v <= '9' ? v - '0' : v >= 'A' && v <= 'Z' ? 10 + v - 'A' : v == VK_SPACE ? 36 : v == VK_BACK ? 50 : v == VK_RETURN ? 51 : 52;
+                if (code >= 10 && code < 36 && (xbox_FramebufferKeyDown(VK_LSHIFT) || xbox_FramebufferKeyDown(VK_RSHIFT))) code += 100;
+                g_ne_q[g_ne_qn++] = code;
+            }
+            prev[v] = (unsigned char)d;
+        }
+    }
+}
+static void ne_wait(int ms)
+{
+    int t;
+    for (t = 0; t < ms; t += 5) { Sleep(5); ne_poll_keys(); }
+}
+static void ne_press_ms(unsigned dig, unsigned ana, int hold)
+{
+    g_pd_pulse_dig = dig; g_pd_pulse_ana = ana;
+    ne_wait(hold);
+    g_pd_pulse_dig = 0; g_pd_pulse_ana = 0;
+    ne_wait(70);
+}
+static void ne_press(unsigned dig, unsigned ana) { ne_press_ms(dig, ana, 90); }
+static int ne_row(int i) { return i < 36 ? i / 10 : i == 36 ? 3 : 4; }
+static int ne_x2(int i) { return i < 36 ? (i % 10) * 2 : i == 36 ? 15 : i == 37 ? 2 : i == 38 ? 8 : 15; }
+static int ne_goto(uint32_t b, int tgt)
+{
+    int iter, retry = 0;
+    for (iter = 0; iter < 60; iter++) {
+        int cur = (int)NEM(b), before = cur, t;
+        unsigned d;
+        if (!ne_valid(b)) return 0;
+        if (cur == tgt) return 1;
+        if (ne_row(cur) != ne_row(tgt)) d = ne_row(tgt) > ne_row(cur) ? 2u : 1u;
+        else d = ne_x2(tgt) < ne_x2(cur) ? 4u : 8u;
+        ne_press(d, 0);
+        for (t = 0; t < 300 && (int)NEM(b) == before; t += 10) ne_wait(10);
+        if ((int)NEM(b) == before && ++retry > 3) return 0;
+    }
+    return 0;
+}
+static DWORD WINAPI pd_nameentry_thread(LPVOID unused)
+{
+    static DWORD lastscan;
+    (void)unused;
+    for (;;) {
+        Sleep(4);
+        ne_poll_keys();
+        if (g_ne_base && !ne_valid(g_ne_base)) g_ne_base = 0;
+        if (!g_ne_base && g_ne_qn > 0 && GetTickCount() - lastscan > 1500) { lastscan = GetTickCount(); g_ne_base = ne_find(); fprintf(stderr, "[NAME] scan: base=%08X (%d keys queued)%c", g_ne_base, g_ne_qn, 10); }
+        g_pd_text_input = g_ne_base ? 1 : 0;
+        if (!g_ne_base) { g_ne_qn = 0; continue; }
+        while (g_ne_qn > 0 && g_ne_base && ne_valid(g_ne_base)) {
+            uint32_t b = g_ne_base; int code = g_ne_q[0], i, upper = 0;
+            for (i = 1; i < g_ne_qn; i++) g_ne_q[i - 1] = g_ne_q[i];
+            g_ne_qn--;
+            if (code >= 100) { code -= 100; upper = 1; }
+            if (code == 50) { ne_press_ms(0, 0x04, 45); ne_wait(150); }                   /* X = Backspace */
+            else if (code == 52) ne_press(0, 0x02);              /* B = back */
+            else if (code == 51) { if (ne_goto(b, 39)) ne_press(0, 0x01); }
+            else {
+                uint32_t len0 = NEM(b + 4);
+                if (code < 36 && (int)NEM(b + 8) != (code >= 10 ? upper : 0)) {   /* digits only exist on the lower-case page */
+                    int t; ne_press(0, 0x08);                    /* Y = Caps */
+                    for (t = 0; t < 400 && (int)NEM(b + 8) != (code >= 10 ? upper : 0); t += 10) ne_wait(10);
+                }
+                if (ne_goto(b, code)) { ne_press(0, 0x01); for (i = 0; i < 300 && NEM(b + 4) == len0; i += 10) ne_wait(10); }
+            }
+        }
+    }
+    return 0;
+}
+
 /* Hybrid-CPU / power-throttling set-up, run first thing in WinMain (the exe is a WIN32-subsystem build: main() below is not its entry). */
 /* pd-vnc: D3D's make-space wait (sub_00246261) blocks on the event at miniport (0x2532A8) + 0x1A4, which the graphics interrupt sets
  * for software method 5 (pushbuffer method 0x100, data 5). The executor now hands such methods to this hook. Needs
@@ -800,6 +954,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     (void)nCmdShow;
 
     pd_cpu_setup();
+    pd_load_settings();
     {   /* restarted by the "Go to Xbox Live" hand-off (kernel_bridge.c): wait for the old process to be gone first */
         char pb[32];
         if (GetEnvironmentVariableA("PD_RELAUNCH_PARENT", pb, sizeof pb)) {
@@ -932,6 +1087,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     { const char *f6 = getenv("RECOMP_FPS60"); g_fps60 = f6 && atoi(f6); if (g_fps60 && !g_fn_watch_on) g_fn_watch_on = 7; }
     if (getenv("RECOMP_SAMPLE")) CreateThread(NULL, 0, pd_sampler, NULL, 0, NULL);
     if (getenv("RECOMP_MEM_LIVE")) CreateThread(NULL, 0, pd_mem_live, NULL, 0, NULL);
+    if (getenv("RECOMP_KEYBOARD")) CreateThread(NULL, 0, pd_nameentry_thread, NULL, 0, NULL);
 
     /* Step 7: Call the recompiled entry point */
     printf("\nStarting game...\n");

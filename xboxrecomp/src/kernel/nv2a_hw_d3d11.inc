@@ -669,6 +669,10 @@ static int hw_init(void)
          * 1280x960 at 4:3, the same width and less height when wider. */
         wr.left = 0; wr.top = 0; wr.right = 1280;
         wr.bottom = (LONG)(1280.0f / s_hw.aspect + 0.5f);
+        {   /* settings.ini window=WxH (client size) -> RECOMP_WINDOW_SIZE */
+            const char *ws = getenv("RECOMP_WINDOW_SIZE"); int ww = 0, wh = 0;
+            if (ws && sscanf(ws, "%d%*[xX]%d", &ww, &wh) == 2 && ww >= 320 && wh >= 240 && ww <= 7680 && wh <= 4320) { wr.right = ww; wr.bottom = wh; }
+        }
         AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
         SetWindowPos(s_hw.hwnd, NULL, 0, 0, wr.right - wr.left, wr.bottom - wr.top,
                      SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
