@@ -1347,6 +1347,7 @@ static void bridge_ExQueryNonVolatileSetting(void)
 static void bridge_HalReturnToFirmware(void)
 {
     uint32_t routine = STACK_ARG(0);
+    int dash_launch = 0;            /* the title is handing off to the Xbox dashboard (Xbox Live sign-up etc.) */
 
     /* Routine 2 is a quick reboot, which on Xbox is how a title hands off to
      * another image: XLaunchNewImage fills the launch data page and reboots.
@@ -1365,6 +1366,8 @@ static void bridge_HalReturnToFirmware(void)
                 path[i] = (char)c;
             }
             path[i] = 0;
+            if (strstr(path, "dash") || strstr(path, "xboxdash"))
+                dash_launch = 1;
             fprintf(stderr, "  [KERNEL] launch data page 0x%08X:"
                             " type=%u titleid=0x%08X path='%s'\n",
                     page, BRIDGE_MEM32(page), BRIDGE_MEM32(page + 4), path);
@@ -1430,6 +1433,51 @@ static void bridge_HalReturnToFirmware(void)
         if (waited)
             fprintf(stderr, "  [KERNEL] waited %dms for the video to finish\n",
                     waited);
+    }
+
+    /* pd-4y6: "Go to Xbox Live" > Sign-up (and any other dashboard hand-off) ends here with routine 2 and a launch data page naming
+     * the dashboard. On the console that reboots into the dashboard; on the PC the window would just vanish like a crash. The
+     * dashboard does not exist, so restart the game instead: it comes back at the title screen (the console would, after the
+     * dashboard, too). Start the new process first and let it wait for this one to exit (PD_RELAUNCH_PARENT), at most 3 times in a
+     * row (PD_RELAUNCHES) so a title that asks for it during boot cannot loop. RECOMP_NO_RELAUNCH=1 = old behaviour (exit). A
+     * window close / Alt+F4 does not come through here and still ends the process. */
+    if (dash_launch && routine == 2 && !getenv("RECOMP_NO_RELAUNCH")) {
+        char cnt_s[16] = "0", pid_s[32];
+        int cnt;
+        WCHAR exe[MAX_PATH];
+        STARTUPINFOW si;
+        PROCESS_INFORMATION pi;
+        DWORD n = GetEnvironmentVariableA("PD_RELAUNCHES", cnt_s, sizeof cnt_s);
+        (void)n;
+        cnt = atoi(cnt_s);
+        {   /* a process that ran for more than two minutes is not a boot loop */
+            FILETIME ct, xt, kt, ut, nt;
+            ULARGE_INTEGER c, nn;
+            if (GetProcessTimes(GetCurrentProcess(), &ct, &xt, &kt, &ut)) {
+                GetSystemTimeAsFileTime(&nt);
+                c.LowPart = ct.dwLowDateTime; c.HighPart = ct.dwHighDateTime;
+                nn.LowPart = nt.dwLowDateTime; nn.HighPart = nt.dwHighDateTime;
+                if (nn.QuadPart - c.QuadPart > 120ull * 10000000ull) cnt = 0;
+            }
+        }
+        if (cnt < 3 && GetModuleFileNameW(NULL, exe, MAX_PATH)) {
+            WCHAR *cl = _wcsdup(GetCommandLineW());
+            sprintf(cnt_s, "%d", cnt + 1);
+            sprintf(pid_s, "%lu", (unsigned long)GetCurrentProcessId());
+            SetEnvironmentVariableA("PD_RELAUNCHES", cnt_s);
+            SetEnvironmentVariableA("PD_RELAUNCH_PARENT", pid_s);
+            memset(&si, 0, sizeof si); si.cb = sizeof si;
+            memset(&pi, 0, sizeof pi);
+            fprintf(stderr, "  [KERNEL] dashboard launch requested: restarting the game (relaunch %d)\n", cnt + 1);
+            fflush(stderr);
+            if (cl && CreateProcessW(exe, cl, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+                CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+                free(cl);
+                ExitProcess(0);
+            }
+            free(cl);
+            fprintf(stderr, "  [KERNEL] relaunch failed (%lu), exiting\n", (unsigned long)GetLastError());
+        }
     }
 
     xbox_HalReturnToFirmware(routine);
@@ -2002,7 +2050,7 @@ static void bridge_AvSetDisplayMode(void)
      * PCRTC_START itself, so without this there is nothing that says where the
      * guest believes its picture is. */
     fprintf(stderr, "  [AV] SetDisplayMode mode=0x%08X format=0x%08X"
-                    " pitch=%u fb=0x%08X\n", mode, format, pitch, fb);
+                    " pitch=%u fb=0x%08X tick=%lu\n", mode, format, pitch, fb, (unsigned long)GetTickCount());
     fflush(stderr);
 
     {

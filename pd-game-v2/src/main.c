@@ -264,8 +264,8 @@ void recomp_fn_watch_hit(uint32_t va)
             if ((++k % 60u) == 1) {
                 const uint8_t *t = (const uint8_t *)g_xbox_mem_offset + g_ecx;
                 const uint32_t *w = (const uint32_t *)t;
-                fprintf(stderr, "[XMVST] this=%08X +2c=%X +38=%X +3c=%X +48=%X +60=%X +64=%X +b0=%X +b4=%X +b8=%X%c", (unsigned)g_ecx,
-                        w[0x2c/4], w[0x38/4], w[0x3c/4], w[0x48/4], w[0x60/4], w[0x64/4], w[0xb0/4], w[0xb4/4], w[0xb8/4], 10);
+                fprintf(stderr, "[XMVST] this=%08X +2c=%X +38=%X +3c=%X +48=%X +60=%X +64=%X +b0=%X +b4=%X +b8=%X tick=%lu%c", (unsigned)g_ecx,
+                        w[0x2c/4], w[0x38/4], w[0x3c/4], w[0x48/4], w[0x60/4], w[0x64/4], w[0xb0/4], w[0xb4/4], w[0xb8/4], (unsigned long)GetTickCount(), 10);
             }
         }
         return;
@@ -800,6 +800,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     (void)nCmdShow;
 
     pd_cpu_setup();
+    {   /* restarted by the "Go to Xbox Live" hand-off (kernel_bridge.c): wait for the old process to be gone first */
+        char pb[32];
+        if (GetEnvironmentVariableA("PD_RELAUNCH_PARENT", pb, sizeof pb)) {
+            HANDLE ph = OpenProcess(SYNCHRONIZE, FALSE, (DWORD)atoi(pb));
+            if (ph) { WaitForSingleObject(ph, 15000); CloseHandle(ph); }
+            SetEnvironmentVariableA("PD_RELAUNCH_PARENT", NULL);
+        }
+    }
     /* Unbuffered output for immediate visibility during debugging */
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);

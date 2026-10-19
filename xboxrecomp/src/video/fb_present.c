@@ -503,6 +503,22 @@ static void overlay_latch(int buf)
         s_ovl_out_w = so & 0xFFFu;  s_ovl_out_h = (so >> 16) & 0xFFFu;
     }
     InterlockedIncrement(&s_ovl_serial);
+    {   /* RECOMP_XMV_STAT=1: distinct movie frames per second (sampled hash of the source surface) */
+        static int on = -1; static uint32_t lasth; static unsigned distinct, ticks; static DWORD t0;
+        if (on < 0) on = getenv("RECOMP_XMV_STAT") != NULL;
+        if (on) {
+            uint32_t hsh = 2166136261u, i, n = h * pitch / 4, stepw = n > 4096 ? n / 4096 : 1;
+            DWORD now = GetTickCount();
+            for (i = 0; i < n; i += stepw) hsh = (hsh ^ ((const uint32_t *)src)[i]) * 16777619u;
+            ticks++;
+            if (hsh != lasth) { distinct++; lasth = hsh; }
+            if (!t0) t0 = now;
+            if (now - t0 >= 1000) {
+                fprintf(stderr, "  [XMV] t=%lu overlay %ux%u: %u distinct frames, %u latches in %lu ms\n", (unsigned long)now, w, h, distinct, ticks, (unsigned long)(now - t0));
+                distinct = ticks = 0; t0 = now;
+            }
+        }
+    }
     if (!s_ovl_active) {
         fprintf(stderr, "  [FBWIN] video overlay on: %ux%u %s at 0x%08X ->"
                         " %ux%u+%u+%u\n", w, h, yuy2 ? "YUY2" : "UYVY",
