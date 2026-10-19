@@ -1558,6 +1558,51 @@ static void bridge_RtlLeaveCriticalSection(void)
 }
 
 /* ── KeQueryPerformanceCounter / Frequency (ordinals 126, 127) ─ */
+/* pd-ojl follow-up: where is the vblank DPC while it holds the CPU lock for a long time? A watcher thread samples the DPC thread's
+ * host RIP (offset into the exe, resolve with the link map) every 5 ms once the routine has run for more than 30 ms.
+ * Only armed with RECOMP_DPC_WATCH=1. */
+static volatile LONG g_dpc_tid;
+static volatile LONGLONG g_dpc_t0;
+static DWORD WINAPI dpc_watch_thread(LPVOID u)
+{
+    LARGE_INTEGER f; (void)u;
+    QueryPerformanceFrequency(&f);
+    for (;;) {
+        LONGLONG t0 = g_dpc_t0; LONG tid = g_dpc_tid;
+        Sleep(5);
+        if (t0 && tid && t0 == g_dpc_t0) {
+            LARGE_INTEGER q; QueryPerformanceCounter(&q);
+            if ((q.QuadPart - t0) * 1000 > 30 * f.QuadPart) {
+                HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, (DWORD)tid);
+                static volatile LONG n;
+                if (h && InterlockedIncrement(&n) <= 400) {
+                    if (SuspendThread(h) != (DWORD)-1) {
+                        CONTEXT c; c.ContextFlags = CONTEXT_CONTROL;
+                        if (GetThreadContext(h, &c)) {
+                            uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
+                            const unsigned long long *sp = (const unsigned long long *)c.Rsp; unsigned long long v; SIZE_T got; int k, shown = 0;
+                            fprintf(stderr, "  [DPCWATCH] %.0f ms in: rip=+%llX", (double)(q.QuadPart - t0) * 1000.0 / (double)f.QuadPart, (unsigned long long)(c.Rip - base));
+                            for (k = 0; k < 256 && shown < 6; k++)
+                                if (ReadProcessMemory(GetCurrentProcess(), sp + k, &v, sizeof v, &got) && got == sizeof v && v > base && v - base < 0x4000000ull) { fprintf(stderr, " +%llX", (unsigned long long)(v - base)); shown++; }
+                            fprintf(stderr, "\n");
+                        }
+                        ResumeThread(h);
+                    }
+                }
+                if (h) CloseHandle(h);
+            }
+        }
+    }
+    return 0;
+}
+static void dpc_watch_begin(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("RECOMP_DPC_WATCH"); on = e && atoi(e); if (on) CloseHandle(CreateThread(NULL, 0, dpc_watch_thread, NULL, 0, NULL)); }
+    if (on) { LARGE_INTEGER q; QueryPerformanceCounter(&q); g_dpc_tid = (LONG)GetCurrentThreadId(); g_dpc_t0 = q.QuadPart; }
+}
+static void dpc_watch_end(void) { g_dpc_t0 = 0; }
+
 static void bridge_KeQueryPerformanceCounter(void)
 {
     LARGE_INTEGER li = xbox_KeQueryPerformanceCounter();
@@ -2204,10 +2249,19 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
     {
         int _irql = xbox_IrqlEnterInterrupt(2);
         static int prof = -1; LARGE_INTEGER t0, t1, f;
-        if (prof < 0) { const char *e = getenv("RECOMP_IRQL_PROF"); prof = e && atoi(e) ? 1 : 0; }
-        if (prof) QueryPerformanceCounter(&t0);
+        if (prof < 0) { const char *e = getenv("RECOMP_IRQL_PROF"); prof = e && atoi(e) ? 1 : 2; }   /* 2: always timed, only >50 ms logged */
+        QueryPerformanceCounter(&t0);
+        dpc_watch_begin();
         fn();
-        if (prof) {   /* RECOMP_IRQL_PROF=1: a DPC that runs long holds the CPU lock and stalls the game thread */
+        dpc_watch_end();
+        if (prof == 2) {
+            static volatile LONG nlong;
+            QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&f);
+            if ((t1.QuadPart - t0.QuadPart) * 1000 > 50 * f.QuadPart && InterlockedIncrement(&nlong) <= 60)
+                fprintf(stderr, "  [DPCLONG] routine %08X context %08X took %.0f ms\n", routine, context,
+                        (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart);
+        }
+        if (prof == 1) {   /* RECOMP_IRQL_PROF=1: a DPC that runs long holds the CPU lock and stalls the game thread */
             static volatile LONG nrep;
             QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&f);
             if ((t1.QuadPart - t0.QuadPart) * 1000 > 5 * f.QuadPart && InterlockedIncrement(&nrep) <= 300)
