@@ -1151,6 +1151,11 @@ static ID3D11ShaderResourceView *hw_texture(int stage, const HwSurface *target)
      * shape (the demo's glow chain reuses 0x806C0000 as 640x480 and as
      * 320x240): take the one whose width the stage declares, else the one
      * drawn into most recently. */
+    /* Not for YUV (movie) textures: they are written by the CPU decoder and are never a render target. Phantom
+     * Dust decodes its movies into 0x82589000, the memory of a 512x512 glow target, and while the glow pass had run
+     * in the last few frames the movie quad sampled that glow target instead: a flat, blurred colour on every movie
+     * frame without a subtitle (pd-5id; the subtitle frames skip the glow pass, so only they showed the picture). */
+    if (t->color != 0x24 && t->color != 0x25)
     {
         HwSurface *best = NULL;
         for (i = 0; i < HW_MAX_SURFACES; i++) {
@@ -1284,7 +1289,7 @@ static ID3D11ShaderResourceView *hw_texture(int stage, const HwSurface *target)
         for (i = 0; i < t->width * t->height; i += 37) { uint32_t g = (px[i] >> 8) & 255; if (g < mn) mn = g; if (g > mx) mx = g; sum += g; }
         if (n % 60 == 31) {
             char fn[64]; FILE *bf; uint32_t hd[13], y2, x2;
-            snprintf(fn, sizeof fn, "yuv_%03u.bmp", n);
+            snprintf(fn, sizeof fn, "yuv_%03u_%08X.bmp", n, (unsigned)t->offset);
             bf = fopen(fn, "wb");
             if (bf) {
                 memset(hd, 0, sizeof hd); hd[0] = 54 + t->width * 3 * t->height; hd[2] = 54; hd[3] = 40; hd[4] = t->width; hd[5] = t->height; hd[6] = 1 | (24u << 16);
@@ -1295,7 +1300,7 @@ static ID3D11ShaderResourceView *hw_texture(int stage, const HwSurface *target)
         }
         if ((n++ % 30) == 0) {
             const uint8_t *raw = (const uint8_t *)xbox_GetMemoryOffset() + t->offset;
-            fprintf(stderr, "[YUV] upload #%u %ux%u G min %u max %u mean %u; raw bytes %02X %02X %02X %02X %02X %02X %02X %02X ... mid %02X %02X %02X %02X\n", n, (unsigned)t->width, (unsigned)t->height, mn, mx,
+            fprintf(stderr, "[YUV] upload #%u off %08X %ux%u G min %u max %u mean %u; raw bytes %02X %02X %02X %02X %02X %02X %02X %02X ... mid %02X %02X %02X %02X\n", n, (unsigned)t->offset, (unsigned)t->width, (unsigned)t->height, mn, mx,
                     (unsigned)(sum / (t->width * t->height / 37 + 1)), raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
                     raw[t->pitch * (t->height / 2)], raw[t->pitch * (t->height / 2) + 1], raw[t->pitch * (t->height / 2) + 2], raw[t->pitch * (t->height / 2) + 3]);
         }
@@ -2068,11 +2073,15 @@ static HwSurface *hw_bind_draw_state(const HwVsp *prog)
         s_hw.biggest_area = area;
     }
     {   /* RECOMP_HW_DRAWDBG=<hex texture offset>: log the state of draws that sample that texture (first 6) */
-        static int init; static uint32_t want; static unsigned n;
-        if (!init) { const char *e = getenv("RECOMP_HW_DRAWDBG"); init = 1; want = e ? (uint32_t)strtoul(e, NULL, 16) : 0; }
-        if (want && n < 12) {
+        static int init; static uint32_t want; static unsigned n, cap = 12;
+        if (!init) { const char *e = getenv("RECOMP_HW_DRAWDBG"); init = 1; want = e ? (uint32_t)strtoul(e, NULL, 16) : 0; e = getenv("RECOMP_HW_DRAWDBG_N"); if (e) cap = (unsigned)atoi(e); }
+        static int flag_was;
+        int flag_now = want == 0xFFFFFFFFu && GetFileAttributesA("drawdbg.flag") != INVALID_FILE_ATTRIBUTES;
+        if (flag_now && !flag_was) n = 0;   /* re-arm on each new flag file */
+        flag_was = flag_now;
+        if (want && n < cap) {
             int k, hit = 0;
-            if (want == 0xFFFFFFFFu && GetFileAttributesA("drawdbg.flag") != INVALID_FILE_ATTRIBUTES) hit = 1;
+            if (flag_now) hit = 1;
             for (k = 0; k < 4; k++) if (s_gpu.texs[k].valid && s_gpu.texs[k].offset == want && (s_gpu.rc_seen ? (((s_gpu.rc.stage_program >> (k * 5)) & 0x1F) >= 1 && ((s_gpu.rc.stage_program >> (k * 5)) & 0x1F) <= 3) : k == 0)) hit = 1;
             if (hit) {
                 n++;
@@ -2831,6 +2840,7 @@ static void hw_clear(uint32_t param)
                 memcpy(map.pData, &pc, sizeof pc);
                 ID3D11DeviceContext_Unmap(s_hw.ctx, (ID3D11Resource *)s_hw.ps_cb, 0);
             }
+            s_hw.ps_last_valid = 0;   /* ps_cb no longer holds the last draw's constants */
             memset(&bd, 0, sizeof bd);
             /* CLEAR_SURFACE bits: 0x10 R, 0x20 G, 0x40 B, 0x80 A. */
             bd.RenderTarget[0].RenderTargetWriteMask =
@@ -3030,6 +3040,10 @@ static void hw_present_locked(int vsync)
             memcpy(map.pData, &pcb, sizeof pcb);
             ID3D11DeviceContext_Unmap(s_hw.ctx, (ID3D11Resource *)s_hw.ps_cb, 0);
         }
+        /* pd-5id: this border fill overwrites ps_cb every flip. Without invalidating the cache, a frame whose
+         * first draw has the same constants as the previous frame's last draw (a movie frame with no subtitle)
+         * skipped its upload and ran on these constants: flat-colour movie frames. */
+        s_hw.ps_last_valid = 0;
         r[0].left = (LONG)mx;  r[0].right = (LONG)(mx + mw);  r[0].top = (LONG)py;  r[0].bottom = (LONG)(y0 + 0.5f);   /* top */
         r[1].left = (LONG)mx;  r[1].right = (LONG)(mx + mw);  r[1].top = (LONG)(y1 + 0.5f);  r[1].bottom = (LONG)(py + ph); /* bottom */
         r[2].left = (LONG)mx;  r[2].right = (LONG)(x0 + 0.5f);  r[2].top = (LONG)py;  r[2].bottom = (LONG)(py + ph);  /* left */
