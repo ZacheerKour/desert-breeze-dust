@@ -1112,6 +1112,27 @@ static ID3D11ShaderResourceView *hw_self_shadow(const HwSurface *best)
     return s_hw_shadow[idx].srv;
 }
 
+/* Movie playback statistics, always on while a movie texture (YUY2/UYVY) is drawn: one [MOVIE] line per second
+ * with the flips, the flips that drew the movie, the decoded frames uploaded (= new pictures) and how many of those
+ * were black. Tells "the decoder is too slow" (few uploads) from "decoded but not drawn" (few drawing flips) on a
+ * player's machine from their run_user.err alone. */
+static struct { uint32_t used_frame, flips, flips_drawn, uploads, dark_uploads, lines; DWORD t0; } s_hw_mv;
+
+static void hw_movie_stats_flip(void)
+{
+    DWORD now = GetTickCount();
+    if (s_hw.frame - s_hw_mv.used_frame > 60) { s_hw_mv.t0 = 0; return; }   /* no movie lately */
+    if (!s_hw_mv.t0) { s_hw_mv.t0 = now; s_hw_mv.flips = s_hw_mv.flips_drawn = s_hw_mv.uploads = s_hw_mv.dark_uploads = 0; }
+    s_hw_mv.flips++;
+    if (s_hw_mv.used_frame == s_hw.frame) s_hw_mv.flips_drawn++;
+    if (now - s_hw_mv.t0 >= 1000) {
+        if (s_hw_mv.lines++ < 3000)
+            fprintf(stderr, "  [MOVIE] %lu ms: flips %u, drew movie %u, new frames %u (black %u)\n", (unsigned long)(now - s_hw_mv.t0),
+                    s_hw_mv.flips, s_hw_mv.flips_drawn, s_hw_mv.uploads, s_hw_mv.dark_uploads);
+        s_hw_mv.t0 = now; s_hw_mv.flips = s_hw_mv.flips_drawn = s_hw_mv.uploads = s_hw_mv.dark_uploads = 0;
+    }
+}
+
 static ID3D11ShaderResourceView *hw_texture(int stage, const HwSurface *target)
 {
     const Texture *t = &s_gpu.texs[stage];
@@ -1119,6 +1140,9 @@ static ID3D11ShaderResourceView *hw_texture(int stage, const HwSurface *target)
     uint32_t i, slot, hash, x, y, *px;
     D3D11_TEXTURE2D_DESC td;
     int mips;
+
+    if (t->valid && (t->color == 0x24 || t->color == 0x25))
+        s_hw_mv.used_frame = s_hw.frame;
 
     if (!t->valid || t->width > 4096 || t->height > 4096)
         return NULL;
@@ -1225,6 +1249,12 @@ static ID3D11ShaderResourceView *hw_texture(int stage, const HwSurface *target)
             }
             px[(size_t)y * t->width + x] = argb;
         }
+    if (t->color == 0x24 || t->color == 0x25) {   /* movie frame: counted for the [MOVIE] line (hw_movie_stats) */
+        uint32_t i, n = t->width * t->height, step = n > 4096 ? n / 4096 : 1; uint64_t sum = 0; uint32_t cnt = 0;
+        for (i = 0; i < n; i += step) { uint32_t v = px[i]; sum += ((v >> 16) & 255) + ((v >> 8) & 255) + (v & 255); cnt++; }
+        s_hw_mv.uploads++;
+        if (cnt && sum / (3u * cnt) < 6u) s_hw_mv.dark_uploads++;
+    }
     /* pd-s27 experiment (RECOMP_HW_DXT1DILATE=1): colour of the one-bit-transparent DXT1 texels = mean of the block's
      * opaque texels instead of black, so bilinear filtering does not pull black into the cut-out edges. */
     {
@@ -3275,6 +3305,7 @@ static void hw_flip(void)
 {
     unsigned s_hw_framedraws_at_flip = s_hw_framedraws;
     const HwSurface *ip_disp = NULL; UINT ip_pw = 0, ip_ph = 0;
+    hw_movie_stats_flip();
     if (s_hw.pace_hz > 0.0) {
         /* Presentation is paced here, by the console's rate, not by the host monitor:
          * a 30 Hz or 144 Hz display must not change how often the title may flip.

@@ -8,7 +8,7 @@ A native Windows port of **Phantom Dust** (original Xbox, 2004), made by static 
 
 ## Features
 - Native Windows executable, Direct3D 11 renderer, internal resolution follows the window size.
-- **60 FPS presentation.** The game logic runs at its original 30 FPS, and the port draws an interpolated in-between frame, so motion is smooth at correct game speed. It falls back to 30 automatically where a scene is too heavy.
+- **Experimental 60 FPS presentation** (off by default, `interpolation=1` in settings.ini). The game logic runs at its original 30 FPS, and the port draws an interpolated in-between frame. On some fast PCs it currently causes black cutscenes and camera shake, so leave it off for normal play.
 - Borderless full screen (F11 or Alt+Enter); experimental widescreen (`RECOMP_HW_ASPECT=16:9`).
 - Xbox/XInput controllers and a full keyboard layout that also works on laptops without a numpad.
 - **Custom soundtracks:** the game's Music Manager works as on the Xbox, and a bundled tool turns any folder of music into a soundtrack.
@@ -62,7 +62,7 @@ Run `Settings.bat` (or open `settings.ini` next to `PLAY.bat` in Notepad), edit,
 | `window` | `auto` / `1280x960` / `1920x1080` / `2560x1440` ... | Window size in pixels (`auto` = 1280 wide) |
 | `render_scale` | `auto` / `1`-`8` | Internal render resolution as a multiple of 640x480 (`auto` follows the window) |
 | `aspect` | `4:3` / `16:9` | Picture aspect ratio (16:9 is experimental) |
-| `interpolation` | `1` / `0` | 60 FPS in-between frames; `0` = plain 30 FPS |
+| `interpolation` | `0` / `1` | Experimental 60 FPS in-between frames (default `0`, the original 30 FPS) |
 | `vsync` | `1` / `0` | Wait for the monitor refresh |
 | `keys` | `mmo` / `classic` | Keyboard layout (see Controls) |
 
@@ -82,7 +82,7 @@ To update, unzip a new release over the old folder, or into a new folder and cop
 
 ## Known issues
 - Story progress beyond the first missions has had little testing. Crashes or hangs there are the most useful reports.
-- An in-engine cutscene going black (picture flickering, then black, while the audio carries on) was reported on a fast desktop GPU. 0.1.3 contains a likely fix but it is not yet confirmed. If it happens, please report it with `pd-game-v2\run_user.err`: its `[PRESENT]` lines show what was on screen.
+- With the experimental 60 FPS mode on (`interpolation=1`), cutscenes can go black (the audio carries on) and the camera can shake on fast PCs. It is off by default since 0.1.4. If you see black cutscenes with it off, please report it with `pd-game-v2\run_user.err`.
 - Skipping the opening movie and then also the second movie can leave that second movie black and silent until it ends. Waiting it out or skipping again continues the game.
 - The busiest hub areas run at about 50 FPS instead of 60.
 - Split Screen: Player 1 waits at "Please wait..." until a second controller signs in.

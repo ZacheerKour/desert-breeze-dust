@@ -126,7 +126,7 @@ static void ip_init(void)
     e = getenv("RECOMP_INTERP");
     /* On by default (60 presented frames over the title's 30, game speed unchanged; the governor
      * falls back to 30 where the guest cannot hold its own frame rate). RECOMP_INTERP=0 turns it off. */
-    s_ip.enabled = s_ip.env_on = !(e && *e == '0');
+    s_ip.enabled = s_ip.env_on = (e && *e && *e != '0');   /* experimental: off unless RECOMP_INTERP=1 (black cutscenes and shaking on fast GPUs, 0.1.3) */
     e = getenv("RECOMP_INTERP_DEFER"); s_ip.defer = !(e && *e == '0');
     s_ip.slice_ms = (e = getenv("RECOMP_INTERP_SLICE")) ? atof(e) : 0.4;
     s_ip.target_scale = (e = getenv("RECOMP_INTERP_SCALE")) ? atoi(e) : 2;
