@@ -331,6 +331,7 @@ static struct {
     int xf_nfmt, xf_seeded;
     uint32_t depth_test, depth_func, depth_mask;
     uint32_t zeta_offset, zstencil_clear;
+    uint32_t zminmax;           /* SET_ZMIN_MAX_CONTROL (0x1D78); 0xFFFFFFFF = never set */
     /* Stencil (NV097 0x032C enable, 0x0360 write mask, 0x0364 func, 0x0368 ref,
      * 0x036C func mask, 0x0370/74/78 fail/zfail/zpass ops, GL enums). */
     uint32_t stencil_enable, stencil_wmask, stencil_func, stencil_ref, stencil_fmask;
@@ -3115,6 +3116,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     if (!inited) {
         inited = 1;
         s_gpu.color_mask = 0x01010101u;           /* all channels, as reset */
+        s_gpu.zminmax = 0xFFFFFFFFu;
         s_gpu.stencil_func = 0x207; s_gpu.stencil_fmask = s_gpu.stencil_wmask = 0xFFFFFFFFu;
         s_gpu.stencil_op_fail = s_gpu.stencil_op_zfail = s_gpu.stencil_op_zpass = 0x1E00;
         {
@@ -3524,6 +3526,18 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x035C: s_gpu.depth_mask = param; break; /* DEPTH_MASK */
     case 0x0214: s_gpu.zeta_offset = param; break;/* SURFACE_ZETA_OFFSET */
     case 0x1D8C: s_gpu.zstencil_clear = param; break; /* ZSTENCIL_CLEAR_VALUE */
+    case 0x1D78: case 0x0394: case 0x0398: {          /* ZMIN_MAX_CONTROL, CLIP_MIN, CLIP_MAX: logged only (pd-7gy) */
+        static uint32_t last[3] = { 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu }; static unsigned nlog;
+        int k = method == 0x1D78 ? 0 : method == 0x0394 ? 1 : 2;
+        if (param != last[k] && nlog < 60 && getenv("RECOMP_ZCTL_TRACE")) {
+            nlog++;
+            fprintf(stderr, "  [ZCTL] %s = %08X (%g)\n", k == 0 ? "ZMIN_MAX_CONTROL" : k == 1 ? "CLIP_MIN" : "CLIP_MAX",
+                    (unsigned)param, (double)*(const float *)&param);
+        }
+        last[k] = param;
+        if (k == 0) s_gpu.zminmax = param;
+        break;
+    }
 
     /* RE-SoT: GPU fences. XDK D3D (5558, sub_0029D1E0 in the PoP demo) ends
      * every fence with BACK_END_WRITE_SEMAPHORE_RELEASE carrying its "time",

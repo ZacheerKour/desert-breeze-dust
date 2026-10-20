@@ -190,6 +190,7 @@ static struct {
     int nds;
     ID3D11RasterizerState *rs[3];        /* none, back, front (front = CW) */
     ID3D11RasterizerState *rs_ccw[3];    /* same with front = CCW */
+    ID3D11RasterizerState *rs_zc[3], *rs_ccw_zc[3];   /* same with depth clipping on (pd-7gy) */
     ID3D11RasterizerState *rs_blit;
     HwSurface surf[HW_MAX_SURFACES];
     HwDepth depth[HW_MAX_DEPTHS];
@@ -241,7 +242,7 @@ static const char s_hw_hlsl_vs_common[] =
  * it to retain the existing left anchor; ws.w is zero for other batches. */
 "  if (flat) x += ws.w;\n"
 "  o.pos = float4((x * vp.x - 1.0) * w, (1.0 - y * vp.y) * w,\n"
-"                 saturate(p.z * vp.z) * w, w);\n"
+"                 (vp.w > 0.5 ? p.z * vp.z : saturate(p.z * vp.z)) * w, w);\n"
 "  o.d0 = saturate(d0); o.d1 = saturate(d1); o.fog = float4(fog, 0, 0, 0);\n"
 "  o.t0 = t0; o.t1 = t1; o.t2 = t2; o.t3 = t3; return o; }\n";
 
@@ -849,6 +850,11 @@ static int hw_init(void)
             ID3D11Device_CreateRasterizerState(s_hw.dev, &rd, &s_hw.rs[i]);
             rd.FrontCounterClockwise = TRUE;
             ID3D11Device_CreateRasterizerState(s_hw.dev, &rd, &s_hw.rs_ccw[i]);
+            rd.DepthClipEnable = TRUE;
+            ID3D11Device_CreateRasterizerState(s_hw.dev, &rd, &s_hw.rs_ccw_zc[i]);
+            rd.FrontCounterClockwise = FALSE;
+            ID3D11Device_CreateRasterizerState(s_hw.dev, &rd, &s_hw.rs_zc[i]);
+            rd.DepthClipEnable = FALSE;
         }
         rd.CullMode = D3D11_CULL_NONE;
         rd.ScissorEnable = FALSE;
@@ -907,6 +913,17 @@ static int hw_active(void)
             s_hw.ok = hw_init();
     }
     return s_hw.ok;
+}
+
+/* pd-7gy: SET_ZMIN_MAX_CONTROL (0x1D78) bit 0 = CULL_NEAR_FAR_EN, bit 4 = ZCLAMP_EN. Phantom Dust sets 1: depth is
+ * clipped at the near/far planes, not clamped. The renderer used to clamp always (DepthClipEnable off and a per-vertex
+ * saturate), which keeps the far ends of z-fail shadow volumes that the console clips away. Off by default
+ * (RECOMP_HW_ZCLIP=1 turns it on): in the st09 hub it changed no pixel, and other scenes are untested. */
+static int hw_zclip(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("RECOMP_HW_ZCLIP"); on = e && *e && *e != '0'; }
+    return on && s_gpu.zminmax != 0xFFFFFFFFu && (s_gpu.zminmax & 1u) && !(s_gpu.zminmax & 0x10u);
 }
 
 static uint32_t hw_zmax_bits(void)
@@ -1851,6 +1868,7 @@ static HwSurface *hw_bind_draw_state(const HwVsp *prog)
     {
         int mode = 0;
         ID3D11RasterizerState **set = s_hw.front_face == 0x901 ? s_hw.rs_ccw : s_hw.rs;
+        if (hw_zclip()) set = s_hw.front_face == 0x901 ? s_hw.rs_ccw_zc : s_hw.rs_zc;
         if (s_hw.cull_enable && !s_hw.nocull)
             mode = s_hw.cull_face == 0x404 ? 2 : (s_hw.cull_face == 0x405 ? 1 : 0);
         rs_sel = set[mode];
@@ -2027,6 +2045,7 @@ static HwSurface *hw_bind_draw_state(const HwVsp *prog)
     memset(hdr, 0, sizeof hdr);
     hdr[0] = 2.0f / (float)s->w; hdr[1] = 2.0f / (float)s->h;
     hdr[2] = 1.0f / (float)hw_zmax_bits();
+    hdr[3] = hw_zclip() ? 1.0f : 0.0f;   /* vs_finish: clip depth instead of clamping it per vertex */
     hdr[4] = s_gpu.fog_param[0]; hdr[5] = s_gpu.fog_param[1];
     hdr[6] = (float)s_gpu.fog_mode; hdr[7] = s_gpu.fog_enable ? 1.0f : 0.0f;
     {
