@@ -1002,11 +1002,27 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                      * little short of the true end costs the same commands
                      * that were being lost anyway. */
                     static uint32_t put_lo, put_hi;
+                    static int wrap_old = -1;
+                    if (wrap_old < 0) wrap_old = getenv("RECOMP_PB_WRAP_OLD") != NULL;
                     if (!put_lo || put < put_lo) put_lo = put;
                     if (put > put_hi) put_hi = put;
                     if (last_put && put > last_put) {
                         nv2a_pb_scan(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
                                      XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
+                    } else if (last_put && put < last_put && !wrap_old) {
+                        /* pd-dfu: follow the ring's JUMP like the GPU. The learned put_hi is only
+                         * the highest PUT seen, not the ring's end: whatever the title wrote past it
+                         * before jumping back was cut off mid-command (a truncated index list, then
+                         * the following draws and constant loads lost), every lap of the ring. */
+                        extern void nv2a_pb_scan_to(uint32_t, uint32_t);
+                        if (getenv("RECOMP_PB_WRAP_TRACE")) {
+                            static unsigned wt;
+                            if (wt++ < 40)
+                                fprintf(stderr, "  [NV2A] wrap 0x%08X -> 0x%08X (learned ring 0x%08X..0x%08X)\n",
+                                        last_put, put, put_lo, put_hi);
+                        }
+                        nv2a_pb_scan_to(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
+                                        XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
                     } else if (last_put && put < last_put) {
                         if (put_hi > last_put)
                             nv2a_pb_scan(

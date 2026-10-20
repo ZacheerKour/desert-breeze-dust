@@ -254,6 +254,7 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
 uint64_t g_nv2a_exec_ticks;     /* RE-SoT: QPC ticks spent in nv2a_pb_scan_to */
 
 static void pb_scan_to(uint32_t start_va, uint32_t put_va);
+static int s_wrap_trace = -1;
 
 void nv2a_pb_scan_to(uint32_t start_va, uint32_t put_va)
 {
@@ -288,6 +289,17 @@ static void pb_scan_to(uint32_t start_va, uint32_t put_va)
         if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {    /* JUMP */
             uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu)
                                              : (w & 0x1FFFFFFCu);
+            if ((target & 0x0FFFFFFFu) >= 0x04000000u || jumps >= 8) {   /* not RAM, or not a ring: stop */
+                unknown++;
+                break;
+            }
+            if (s_wrap_trace < 0) s_wrap_trace = getenv("RECOMP_PB_WRAP_TRACE") != NULL;
+            if (s_wrap_trace) {
+                static unsigned nt;
+                if (nt++ < 40)
+                    fprintf(stderr, "  [PBJUMP] jump at %08X -> %08X (walk %08X..%08X)\n",
+                            va - 4, XBOX_CONTIG_BASE | (target & 0x0FFFFFFFu), start_va, put_va);
+            }
             va = XBOX_CONTIG_BASE | (target & 0x0FFFFFFFu);
             jumps++;
             continue;
@@ -296,6 +308,10 @@ static void pb_scan_to(uint32_t start_va, uint32_t put_va)
             continue;
         if ((w & 3u) == 2u) {                                        /* CALL */
             uint32_t sub = XBOX_CONTIG_BASE | ((w & 0xFFFFFFFCu) & 0x0FFFFFFFu);
+            if ((w & 0x0FFFFFFCu) >= 0x04000000u) {                  /* not RAM */
+                unknown++;
+                continue;
+            }
             s_tot_calls++;
             words += pb_walk(sub, sub + 0x400000u, 1, &jumps, &unknown);
             continue;
