@@ -597,27 +597,43 @@ typedef struct {
     HANDLE file_handle;
     HANDLE find_handle;
     BOOL   first_done;
+    BOOL   in_use;      /* slot taken (set under the lock when handed out) */
     WIN32_FIND_DATAW find_data;
 } DIR_CONTEXT;
 
+/* The save list is read by several guest threads at once (one per profile), each listing the same
+ * directory. A free slot used to be recognised by find_handle == NULL, which is only set after
+ * FindFirstFileW, outside the lock: two threads creating a listing at the same moment got the same
+ * slot and overwrote each other's search, so a profile loader saw a wrong file list and the profile
+ * came up as _ERROR_ / "damaged" in some runs (2026-10-20). Slots are now claimed with in_use under
+ * the lock, and the lock is created once, thread-safely. */
 static DIR_CONTEXT s_dir_contexts[MAX_DIR_CONTEXTS];
 static CRITICAL_SECTION s_dir_cs;
-static BOOL s_dir_cs_init = FALSE;
+static INIT_ONCE s_dir_cs_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK dir_cs_init_cb(PINIT_ONCE o, PVOID p, PVOID *c)
+{
+    (void)o; (void)p; (void)c;
+    InitializeCriticalSection(&s_dir_cs);
+    return TRUE;
+}
+static void dir_cs_init(void) { InitOnceExecuteOnce(&s_dir_cs_once, dir_cs_init_cb, NULL, NULL); }
 
 static DIR_CONTEXT* find_or_create_dir_context(HANDLE FileHandle, BOOL create)
 {
-    if (!s_dir_cs_init) { InitializeCriticalSection(&s_dir_cs); s_dir_cs_init = TRUE; }
+    dir_cs_init();
     EnterCriticalSection(&s_dir_cs);
     for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
-        if (s_dir_contexts[i].file_handle == FileHandle && s_dir_contexts[i].find_handle != NULL) {
+        if (s_dir_contexts[i].in_use && s_dir_contexts[i].file_handle == FileHandle) {
             LeaveCriticalSection(&s_dir_cs);
             return &s_dir_contexts[i];
         }
     }
     if (!create) { LeaveCriticalSection(&s_dir_cs); return NULL; }
     for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
-        if (s_dir_contexts[i].find_handle == NULL) {
+        if (!s_dir_contexts[i].in_use) {
+            s_dir_contexts[i].in_use = TRUE;
             s_dir_contexts[i].file_handle = FileHandle;
+            s_dir_contexts[i].find_handle = NULL;
             s_dir_contexts[i].first_done = FALSE;
             LeaveCriticalSection(&s_dir_cs);
             return &s_dir_contexts[i];
@@ -627,23 +643,37 @@ static DIR_CONTEXT* find_or_create_dir_context(HANDLE FileHandle, BOOL create)
     return NULL;
 }
 
+/* Ends a listing: closes the search and frees the slot. */
+static void dir_context_release(DIR_CONTEXT *ctx)
+{
+    dir_cs_init();
+    EnterCriticalSection(&s_dir_cs);
+    if (ctx->find_handle && ctx->find_handle != INVALID_HANDLE_VALUE)
+        FindClose(ctx->find_handle);
+    ctx->find_handle = NULL;
+    ctx->file_handle = NULL;
+    ctx->first_done = FALSE;
+    ctx->in_use = FALSE;
+    LeaveCriticalSection(&s_dir_cs);
+}
+
 /* A closed directory handle takes its enumeration with it. Host handle values
  * are reused, and a search abandoned part-way (a title that stops at the first
  * match) otherwise carried on under the next directory opened at the same
  * value: its first answer was the old search's next entry. */
 void xbox_dir_context_drop(HANDLE FileHandle)
 {
-    if (!s_dir_cs_init)
-        return;
+    dir_cs_init();
     EnterCriticalSection(&s_dir_cs);
     for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
-        if (s_dir_contexts[i].file_handle == FileHandle) {
+        if (s_dir_contexts[i].in_use && s_dir_contexts[i].file_handle == FileHandle) {
             if (s_dir_contexts[i].find_handle &&
                 s_dir_contexts[i].find_handle != INVALID_HANDLE_VALUE)
                 FindClose(s_dir_contexts[i].find_handle);
             s_dir_contexts[i].find_handle = NULL;
             s_dir_contexts[i].file_handle = NULL;
             s_dir_contexts[i].first_done = FALSE;
+            s_dir_contexts[i].in_use = FALSE;
         }
     }
     LeaveCriticalSection(&s_dir_cs);
@@ -681,6 +711,7 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         DWORD path_len = GetFinalPathNameByHandleW(FileHandle, dir_path, MAX_PATH,
                                                    FILE_NAME_NORMALIZED);
         if (path_len == 0 || path_len >= MAX_PATH) {
+            dir_context_release(ctx);
             IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
             return STATUS_UNSUCCESSFUL;
         }
@@ -699,15 +730,14 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         ctx->find_handle = FindFirstFileW(search_path, &ctx->find_data);
         if (ctx->find_handle == INVALID_HANDLE_VALUE) {
             ctx->find_handle = NULL;
+            dir_context_release(ctx);
             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
             return STATUS_NO_MORE_FILES;
         }
         ctx->first_done = TRUE;
     } else {
         if (!FindNextFileW(ctx->find_handle, &ctx->find_data)) {
-            FindClose(ctx->find_handle);
-            ctx->find_handle = NULL;
-            ctx->file_handle = NULL;
+            dir_context_release(ctx);
             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
             return STATUS_NO_MORE_FILES;
         }
@@ -717,9 +747,7 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     while (!wcscmp(ctx->find_data.cFileName, L".") ||
            !wcscmp(ctx->find_data.cFileName, L"..")) {
         if (!FindNextFileW(ctx->find_handle, &ctx->find_data)) {
-            FindClose(ctx->find_handle);
-            ctx->find_handle = NULL;
-            ctx->file_handle = NULL;
+            dir_context_release(ctx);
             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
             return STATUS_NO_MORE_FILES;
         }

@@ -458,10 +458,30 @@ static RECOMP_TLS int g_is_spawned_thread = 0;
  * path is the rare one. */
 static RECOMP_TLS uint32_t g_thread_stack_top = 0;
 
+/* Spawn handshake (2026-10-20, profile list _ERROR_). The Xbox has one CPU: a title that creates a worker and
+ * raises its priority (XAPI SetThreadPriority) gets preempted by it at once, and the worker reads the parameters
+ * it was handed before the creator goes on. Here the creator kept running in parallel and sometimes changed
+ * them first: the profile list loads each profile on a new thread with one shared parameter block, and a loader
+ * that started late found the save directory handle already closed and quit (status 1), so that profile showed
+ * as _ERROR_ or "damaged" in roughly one run in four. The creator now waits until the new thread reaches its
+ * first kernel call (or ends), at most 50 ms. RECOMP_SPAWN_HANDSHAKE=0 turns it off. */
+struct spawn_gate { HANDLE ev; volatile LONG refs; };
+static void spawn_gate_put(struct spawn_gate *g)
+{
+    if (g && InterlockedDecrement(&g->refs) == 0) { CloseHandle(g->ev); free(g); }
+}
+static RECOMP_TLS struct spawn_gate *t_spawn_gate;   /* set on a new thread until its first kernel call */
+static void spawn_gate_release_self(void)
+{
+    struct spawn_gate *g = t_spawn_gate;
+    if (g) { t_spawn_gate = NULL; SetEvent(g->ev); spawn_gate_put(g); }
+}
+
 struct bridge_thread_start {
     recomp_func_t fn;
     uint32_t ctx1, ctx2, stack_top;
     uint32_t eth;                 /* fake ETHREAD for this thread, or 0 */
+    struct spawn_gate *gate;
 };
 
 /* Fake ETHREAD blocks. XAPI's GetExitCodeThread does
@@ -484,8 +504,10 @@ static uint32_t bridge_thread_obj_for(HANDLE h)
     return 0;
 }
 
+static void spawn_gate_release_self(void);
 static void bridge_thread_finish(uint32_t status)
 {
+    spawn_gate_release_self();
     if (g_cur_eth) {
         BRIDGE_MEM32(g_cur_eth + 0x120) = status;
         BRIDGE_MEM8(g_cur_eth + 4) = 1;           /* Header.SignalState */
@@ -533,6 +555,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
      * holding the lock the other wanted. */
     g_is_spawned_thread = 1;
     g_cur_eth = s->eth;
+    t_spawn_gate = s->gate;
     g_esp = s->stack_top;
     g_thread_stack_top = s->stack_top;
     {
@@ -568,13 +591,32 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
 
     if (!s) return NULL;
     s->fn = fn; s->ctx1 = ctx1; s->ctx2 = ctx2; s->stack_top = stack_top; s->eth = eth;
+    s->gate = NULL;
+    {
+        static int hs = -1;
+        if (hs < 0) { const char *e = getenv("RECOMP_SPAWN_HANDSHAKE"); hs = !(e && *e == '0'); }
+        if (hs) {
+            struct spawn_gate *g = (struct spawn_gate *)malloc(sizeof *g);
+            if (g) { g->ev = CreateEventA(NULL, TRUE, FALSE, NULL); g->refs = 2; if (!g->ev) { free(g); g = NULL; } }
+            s->gate = g;
+        }
+    }
 
-    th = CreateThread(NULL, 0, bridge_thread_main, s, 0, NULL);
-    if (!th) free(s);
+    {
+        struct spawn_gate *g = s->gate;   /* read before the thread starts: s is the new thread's to free */
+        th = CreateThread(NULL, 0, bridge_thread_main, s, 0, NULL);
+        if (!th) {
+            if (g) { CloseHandle(g->ev); free(g); }
+            free(s);
+        } else if (g) {
+            WaitForSingleObject(g->ev, 50);
+            spawn_gate_put(g);
+        }
+    }
     /* Record the game thread so a host-tick-driven title's watchdog can sample
      * it via xbox_thread_debug_handle. Harmless for default-model titles: they
      * spawn workers too, but never read it back. See kernel_thread.c. */
-    else {
+    if (th) {
         int i;
         xbox_set_game_thread(th);
         for (i = 0; i < BRIDGE_THREAD_OBJS; i++)
@@ -3117,11 +3159,13 @@ static uint32_t bridge_handle_token(HANDLE h)
     if (!h || h == INVALID_HANDLE_VALUE) return 0;
     for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
         if (s_handle_table[i] == h) return BRIDGE_HANDLE_TAG | (uint32_t)i;
+    /* Claimed atomically: guest threads open files at the same time (the profile list loads every
+     * profile on its own thread), and a plain "find empty, store" let two of them take the same slot,
+     * so one thread's handle then named the other's file (_ERROR_ / "damaged" profiles, 2026-10-20). */
     for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
-        if (s_handle_table[i] == NULL) {
-            s_handle_table[i] = h;
+        if (s_handle_table[i] == NULL
+            && InterlockedCompareExchangePointer((PVOID volatile *)&s_handle_table[i], h, NULL) == NULL)
             return BRIDGE_HANDLE_TAG | (uint32_t)i;
-        }
     fprintf(stderr, "  [BRIDGE] handle table full\n");
     return 0;
 }
@@ -3178,11 +3222,8 @@ static HANDLE bridge_take_handle(uint32_t token)
 {
     if ((token & 0xFF000000u) == BRIDGE_HANDLE_TAG) {
         uint32_t i = token & BRIDGE_HANDLE_MASK;
-        if (i > 0 && i < BRIDGE_HANDLE_MAX) {
-            HANDLE h = s_handle_table[i];
-            s_handle_table[i] = NULL;
-            return h;
-        }
+        if (i > 0 && i < BRIDGE_HANDLE_MAX)
+            return (HANDLE)InterlockedExchangePointer((PVOID volatile *)&s_handle_table[i], NULL);
     }
     return NULL;   /* untagged -> not a table handle, do not close */
 }
@@ -3843,6 +3884,9 @@ static void bridge_NtWriteFile(void)
 }
 
 /* ── NtQueryInformationFile (ordinal 211, 5 args = 20 bytes) */
+/* RECOMP_FILEDBG=1: per-call trace of the file calls (thread, handle token, result) */
+static int filedbg_on(void) { static int on = -1; if (on < 0) on = getenv("RECOMP_FILEDBG") != NULL; return on; }
+
 static void bridge_NtQueryInformationFile(void)
 {
     HANDLE   handle    = bridge_resolve_handle(STACK_ARG(0));
@@ -3862,6 +3906,10 @@ static void bridge_NtQueryInformationFile(void)
                 XBOX_TO_NATIVE(info_va), length,
                 (XBOX_FILE_INFORMATION_CLASS)infoclass);
     bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
+    if (filedbg_on())
+        fprintf(stderr, "  [FDBG] tid %lu QueryInfo tok %08X class %u len %u -> %08X  %08X %08X %08X %08X\n", GetCurrentThreadId(), STACK_ARG(0),
+                infoclass, length, g_eax, length >= 4 ? BRIDGE_MEM32(info_va) : 0, length >= 8 ? BRIDGE_MEM32(info_va + 4) : 0,
+                length >= 12 ? BRIDGE_MEM32(info_va + 8) : 0, length >= 16 ? BRIDGE_MEM32(info_va + 12) : 0);
 }
 
 /* ── NtSetInformationFile (ordinal 226, 5 args = 20 bytes) ─ */
@@ -3972,6 +4020,13 @@ static void bridge_NtQueryDirectoryFile(void)
                 XBOX_TO_NATIVE(info_va), length, (XBOX_FILE_INFORMATION_CLASS)info_class,
                 pfn, (BOOLEAN)restart);
     bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
+    if (filedbg_on()) {
+        char pat[64] = ""; char nm[64] = ""; uint32_t nl;
+        if (pfn) { int k = fn.Length < 63 ? fn.Length : 63; memcpy(pat, fn.Buffer, k); pat[k] = 0; }
+        nl = g_eax == 0 ? BRIDGE_MEM32(info_va + 0x3C) : 0;   /* FileNameLength in FILE_DIRECTORY_INFORMATION */
+        if (g_eax == 0 && nl < 63) { memcpy(nm, XBOX_TO_NATIVE(info_va + 0x40), nl); nm[nl] = 0; }
+        fprintf(stderr, "  [FDBG] tid %lu QueryDir tok %08X pat '%s' restart %u -> %08X '%s'\n", GetCurrentThreadId(), STACK_ARG(0), pat, restart, g_eax, nm);
+    }
 }
 
 /* ── NtOpenSymbolicLinkObject (ordinal 203, 2 args = 8 bytes) */
@@ -9805,6 +9860,7 @@ void guest_cpu_part(void)
 static void kernel_thunk_dispatch(void)
 {
     int held = t_guest_held;
+    if (t_spawn_gate) spawn_gate_release_self();   /* a new thread's first kernel call: its creator may go on */
     if (held) {                        /* let other guest threads run meanwhile */
         t_guest_held = 0;
         LeaveCriticalSection(&g_guest_cpu);
