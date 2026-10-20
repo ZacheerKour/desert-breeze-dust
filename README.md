@@ -1,5 +1,10 @@
 # Phantom Dust PC
 
+Do you remember popping in a Linkin Park CD into your Xbox, attaching it to some random game from the 2000s, and throwing desert dust at people? No? Well I do, so here's a decomp/recomp of that Xbox game that no one but me asked for. Is this AI assisted? Yes. Did I review the code, play test myself? Yes. Everything below this line is Claude's take of the readme, only because I wanted it to look like the other decomp projects. I will be constantly updating this until I get a fully playable version, and after that, it's up to god or something. If you want to clone and work on it, feel free. I don't care, I just want to pop hybrid theory in and pretend like I'm 10 years old again.
+
+
+---
+
 A native Windows port of **Phantom Dust** (original Xbox, 2004), made by static recompilation: the game's x86 executable is translated into C and linked against a Windows runtime. That runtime emulates the Xbox kernel, translates the NV2A GPU to Direct3D 11, runs the MCPX audio on XAudio2, and maps input to XInput and the keyboard. It is not an emulator, and it runs only with game files from your own disc.
 
 > **You need your own copy of the game.** This project contains no game assets. The installer reads them from your Phantom Dust (USA) disc image. See [Legal](#legal).
