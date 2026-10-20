@@ -75,3 +75,7 @@ _Add a brief overview of your project architecture_
 ## Conventions & Patterns
 
 _Add your project-specific conventions here_
+
+## README ownership
+
+The opening paragraph of `README.md` (everything above the first `---` line) is the project owner's own text. Never edit, reword, move or remove it. Edits to the README go below that line only, and every README change must keep that paragraph byte-for-byte. Check with `git diff README.md` before committing.
