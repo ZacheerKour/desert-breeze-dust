@@ -215,6 +215,10 @@ static struct {
     int batch_hud;                       /* RE-SoT: flat upper-left demo HUD */
 } s_hw;
 
+/* pd-dfu: per-draw records of the current frame, written beside each seq dump frame */
+typedef struct { uint32_t n, surf, prog, gen, chash, cmask, sten, ops, cull, dm, blend, tex0, ahash, white, ps, srv0, vh, nvx; } HwDrawRec;
+static HwDrawRec s_seq_rec[4096]; static unsigned s_seq_n; static int s_seq_on; static uint32_t seq_vh;
+
 /* Shared by every vertex shader: the constants and what a vertex leaves as.
  * vs_finish is the tail of the pipeline -- the program's oPos is already in
  * screen space (pixels, depth-buffer z, clip w), so this only maps it to
@@ -1121,7 +1125,16 @@ static struct { uint32_t used_frame, flips, flips_drawn, uploads, dark_uploads, 
 static void hw_movie_stats_flip(void)
 {
     DWORD now = GetTickCount();
-    if (s_hw.frame - s_hw_mv.used_frame > 60) { s_hw_mv.t0 = 0; return; }   /* no movie lately */
+    static unsigned long long sub_d0; static int sub_on = -1; static DWORD mv_start;
+    unsigned long long fd = (unsigned long long)s_hw.draws - sub_d0;
+    sub_d0 = (unsigned long long)s_hw.draws;
+    if (s_hw.frame - s_hw_mv.used_frame > 60) { s_hw_mv.t0 = 0; mv_start = 0; sub_on = -1; return; }   /* no movie lately */
+    if (!mv_start) mv_start = now;
+    {   /* [SUB]: subtitle overlay on/off times from the movie's first frame (a movie frame with subtitle text has more than one draw) */
+        int on = fd > 1;
+        if (on != sub_on && s_hw_mv.lines < 3000) fprintf(stderr, "  [SUB] +%lu ms %s (draws %llu)\n", (unsigned long)(now - mv_start), on ? "on" : "off", fd);
+        sub_on = on;
+    }
     if (!s_hw_mv.t0) { s_hw_mv.t0 = now; s_hw_mv.flips = s_hw_mv.flips_drawn = s_hw_mv.uploads = s_hw_mv.dark_uploads = 0; }
     s_hw_mv.flips++;
     if (s_hw_mv.used_frame == s_hw.frame) s_hw_mv.flips_drawn++;
@@ -1152,9 +1165,9 @@ static ID3D11ShaderResourceView *hw_texture(int stage, const HwSurface *target)
      * 320x240): take the one whose width the stage declares, else the one
      * drawn into most recently. */
     /* Not for YUV (movie) textures: they are written by the CPU decoder and are never a render target. Phantom
-     * Dust decodes its movies into 0x82589000, the memory of a 512x512 glow target, and while the glow pass had run
-     * in the last few frames the movie quad sampled that glow target instead: a flat, blurred colour on every movie
-     * frame without a subtitle (pd-5id; the subtitle frames skip the glow pass, so only they showed the picture). */
+     * Dust decodes its movies into 0x82589000, the memory of a 512x512 glow target, so a recent glow pass could
+     * otherwise be taken for the movie picture. (The flat movie frames of pd-5id had another cause, the stale
+     * pixel-constant cache; this guard is kept because the alias is real.) */
     if (t->color != 0x24 && t->color != 0x25)
     {
         HwSurface *best = NULL;
@@ -1183,6 +1196,18 @@ static ID3D11ShaderResourceView *hw_texture(int stage, const HwSurface *target)
             if (lim < 0) { const char *e = getenv("RECOMP_HW_ALIAS_STALE"); lim = e ? atoi(e) : 30; }
             if (best && lim > 0 && s_hw.frame > best->drawn_frame + (uint32_t)lim)
                 best = NULL;
+        }
+        {   /* RECOMP_HW_ALIASDBG=<hex offset>: which render surface a texture at that address resolves to */
+            static int ad = -1; static uint32_t aoff;
+            if (ad < 0) { const char *e = getenv("RECOMP_HW_ALIASDBG"); ad = e != NULL; aoff = e ? (uint32_t)strtoul(e, NULL, 16) : 0; }
+            if (ad && t->offset == aoff && target && target->w >= 640) {
+                int k, cand = 0;
+                for (k = 0; k < HW_MAX_SURFACES; k++) if (s_hw.surf[k].tex && s_hw.surf[k].offset == t->offset) cand++;
+                fprintf(stderr, "  [ALIAS] frame %u tex %08X %ux%u fmt %02X into %08X: %s %ux%u drawn_frame %u (candidates %d)\n",
+                        (unsigned)s_hw.frame, (unsigned)t->offset, (unsigned)t->width, (unsigned)t->height, (unsigned)t->color,
+                        (unsigned)target->offset, best ? "surface" : "NONE (guest memory)", best ? (unsigned)best->w : 0u,
+                        best ? (unsigned)best->h : 0u, best ? (unsigned)best->drawn_frame : 0u, cand);
+            }
         }
         if (best) {
             static int dbg = -1; if (dbg < 0) dbg = getenv("RECOMP_HW_TEXDBG") ? 1 : 0;
@@ -2072,6 +2097,24 @@ static HwSurface *hw_bind_draw_state(const HwVsp *prog)
         s_hw.biggest = s;
         s_hw.biggest_area = area;
     }
+    if (s_seq_on && s_seq_n < 4096) {
+        HwDrawRec *r = &s_seq_rec[s_seq_n++];
+        const uint32_t *cc = (const uint32_t *)nv2a_vsh_constants(); uint32_t h = 2166136261u; int q;
+        for (q = 0; q < 192 * 4; q++) h = (h ^ cc[q]) * 16777619u;
+        r->chash = h;
+        h = 2166136261u;
+        for (q = 0; q < 16 * 4; q++) h = (h ^ ((const uint32_t *)s_gpu.imm_attr)[q % (sizeof s_gpu.imm_attr / 4)]) * 16777619u;
+        r->ahash = h;
+        r->n = (uint32_t)s_gpu.idx_count; r->surf = (uint32_t)s->offset; r->prog = (uint32_t)(uintptr_t)prog;
+        r->gen = nv2a_vsh_constant_generation(); r->cmask = s_gpu.color_mask; r->sten = s_gpu.stencil_enable;
+        r->ops = (s_gpu.stencil_op_zfail << 16) | (s_gpu.stencil_op_zpass & 0xFFFF);
+        r->cull = (s_hw.cull_enable << 24) | (s_hw.cull_face << 8) | (s_hw.front_face & 0xFF);
+        r->dm = s_gpu.depth_mask | (s_gpu.depth_test << 4); r->blend = s_gpu.blend_enable;
+        r->tex0 = s_gpu.texs[0].valid ? s_gpu.texs[0].offset : 0;
+        r->white = (srv[0] == s_hw.white) | ((srv[1] == s_hw.white) << 1) | ((srv[2] == s_hw.white) << 2) | ((srv[3] == s_hw.white) << 3)
+                 | ((srv[0] == NULL) << 4);
+        r->ps = (uint32_t)(uintptr_t)ps_sel; r->srv0 = (uint32_t)(uintptr_t)srv[0];
+    }
     {   /* RECOMP_HW_DRAWDBG=<hex texture offset>: log the state of draws that sample that texture (first 6) */
         static int init; static uint32_t want; static unsigned n, cap = 12;
         if (!init) { const char *e = getenv("RECOMP_HW_DRAWDBG"); init = 1; want = e ? (uint32_t)strtoul(e, NULL, 16) : 0; e = getenv("RECOMP_HW_DRAWDBG_N"); if (e) cap = (unsigned)atoi(e); }
@@ -2082,16 +2125,24 @@ static HwSurface *hw_bind_draw_state(const HwVsp *prog)
         if (want && n < cap) {
             int k, hit = 0;
             if (flag_now) hit = 1;
+            {   /* RECOMP_HW_DRAWDBG_STENCIL=1: with the flag, only draws that use stencil or mask colour writes */
+                static int so = -1; if (so < 0) so = getenv("RECOMP_HW_DRAWDBG_STENCIL") != NULL;
+                if (so && hit && !s_gpu.stencil_enable && (s_gpu.color_mask & 0x01010101u) == 0x01010101u) hit = 0;
+            }
             for (k = 0; k < 4; k++) if (s_gpu.texs[k].valid && s_gpu.texs[k].offset == want && (s_gpu.rc_seen ? (((s_gpu.rc.stage_program >> (k * 5)) & 0x1F) >= 1 && ((s_gpu.rc.stage_program >> (k * 5)) & 0x1F) <= 3) : k == 0)) hit = 1;
             if (hit) {
                 n++;
-                fprintf(stderr, "[DRAW] #%u surf %08X %ux%u prog %s n=%u atest %u func %X ref %02X blend %u %X/%X eq %X cmask %08X depth t%u m%u f%X rc_seen %d ctl %08X stg %08X fin %08X/%08X\n", n,
+                fprintf(stderr, "[DRAW] #%u fr %u surf %08X %ux%u prog %s n=%u atest %u func %X ref %02X blend %u %X/%X eq %X cmask %08X depth t%u m%u f%X rc_seen %d ctl %08X stg %08X fin %08X/%08X\n", n, (unsigned)s_hw.frame,
                         (unsigned)s->offset, (unsigned)s->w, (unsigned)s->h, prog ? "gpu" : "cpu", (unsigned)s_gpu.idx_count,
                         (unsigned)s_gpu.alpha_test, (unsigned)s_gpu.alpha_func, (unsigned)s_gpu.alpha_ref,
                         (unsigned)s_gpu.blend_enable, (unsigned)s_gpu.blend_sfactor, (unsigned)s_gpu.blend_dfactor, (unsigned)s_gpu.blend_equation,
                         (unsigned)s_gpu.color_mask, (unsigned)s_gpu.depth_test, (unsigned)s_gpu.depth_mask, (unsigned)s_gpu.depth_func,
                         (int)s_gpu.rc_seen, (unsigned)s_gpu.rc.control, (unsigned)s_gpu.rc.stage_program,
                         (unsigned)s_gpu.rc.final0, (unsigned)s_gpu.rc.final1);
+                fprintf(stderr, "[DRAW]   stencil en %u func %X ref %02X fmask %02X wmask %02X ops %X/%X/%X | cull %u face %X front %X | dsv %d%c",
+                        (unsigned)s_gpu.stencil_enable, (unsigned)s_gpu.stencil_func, (unsigned)(s_gpu.stencil_ref & 0xFF), (unsigned)(s_gpu.stencil_fmask & 0xFF),
+                        (unsigned)(s_gpu.stencil_wmask & 0xFF), (unsigned)s_gpu.stencil_op_fail, (unsigned)s_gpu.stencil_op_zfail, (unsigned)s_gpu.stencil_op_zpass,
+                        (unsigned)s_hw.cull_enable, (unsigned)s_hw.cull_face, (unsigned)s_hw.front_face, d != NULL, 10);
                 for (k = 0; k < 4; k++) {
                     const Texture *t = &s_gpu.texs[k];
                     if (t->valid)
@@ -2578,6 +2629,7 @@ static int hw_draw_program_batch(void)
         vrec = vst; irec = ist;
     }
 
+    seq_vh = 2166136261u;
     if (++batch_id == 0) {
         memset(stamp, 0, sizeof stamp);
         batch_id = 1;
@@ -2594,6 +2646,7 @@ static int hw_draw_program_batch(void)
         for (; a < HW_VSP_SLOTS; a++)
             in[a][0] = in[a][1] = in[a][2] = in[a][3] = 0.0f;
         memcpy(vout[nv * HW_VSP_SLOTS], in, sizeof in);   /* write-combined: no reads */
+        if (s_seq_on) { const uint32_t *w = (const uint32_t *)in; unsigned q; for (q = 0; q < sizeof in / 4; q++) seq_vh = (seq_vh ^ w[q]) * 16777619u; }
         if (vrec) memcpy(vrec + (size_t)nv * 128, in, sizeof in);
         {   /* drawdbg_v.flag: print the first vertices of the batches that sample a movie texture (fmt 0x24) */
             static int dv = -1; static unsigned ndv;
@@ -2641,6 +2694,7 @@ static int hw_draw_program_batch(void)
 #undef HW_IDX
     ID3D11DeviceContext_Unmap(s_hw.ctx, (ID3D11Resource *)s_hw.ib, 0);
     ID3D11DeviceContext_Unmap(s_hw.ctx, (ID3D11Resource *)s_hw.vb, 0);
+    if (s_seq_on && s_seq_n) { s_seq_rec[s_seq_n - 1].vh = seq_vh; s_seq_rec[s_seq_n - 1].nvx = nv; }
     if (ni) {
         ID3D11DeviceContext_IASetIndexBuffer(s_hw.ctx, s_hw.ib, DXGI_FORMAT_R16_UINT, 0);
         hw_glow_dump_check(bound, 0);
@@ -3169,6 +3223,67 @@ static void hw_gamma_update(void)
     s_hw.lut_serial = ser;
 }
 
+/* Debug (pd-dfu): while the file seqdump.flag exists, save every completed frame at half size as
+ * dumps/seq_NNNNN.bmp (at most 900 per arming), for a frame-by-frame search for one-frame glitches.
+ * It stalls the GPU every frame. */
+static void hw_seq_dump(void)
+{
+    static ID3D11Texture2D *stage; static UINT sw, sh; static unsigned n, armed_n;
+    static int was;
+    D3D11_TEXTURE2D_DESC td; D3D11_MAPPED_SUBRESOURCE mp;
+    int now = GetFileAttributesA("seqdump.flag") != INVALID_FILE_ATTRIBUTES;
+    unsigned nrec = s_seq_n;
+    s_seq_n = 0; s_seq_on = now;
+    if (now && !was) armed_n = 0;
+    was = now;
+    if (!now || armed_n >= 900 || !s_hw.pres_tex) return;
+    {
+        char fn[64]; FILE *f; unsigned i;
+        CreateDirectoryA("dumps", NULL);
+        snprintf(fn, sizeof fn, "dumps/seq_%05u.txt", n);
+        f = fopen(fn, "w");
+        if (f) {
+            for (i = 0; i < nrec && i < 4096; i++) {
+                const HwDrawRec *r = &s_seq_rec[i];
+                fprintf(f, "%u n=%u surf=%08X prog=%08X gen=%u ch=%08X ah=%08X cm=%08X st=%u ops=%08X cull=%08X dm=%u bl=%u t0=%08X w=%X ps=%08X srv0=%08X vh=%08X nv=%u\n", i, r->n, r->surf, r->prog,
+                        r->gen, r->chash, r->ahash, r->cmask, r->sten, r->ops, r->cull, r->dm, r->blend, r->tex0, r->white, r->ps, r->srv0, r->vh, r->nvx);
+            }
+            fclose(f);
+        }
+    }
+    ID3D11Texture2D_GetDesc(s_hw.pres_tex, &td);
+    if (!stage || sw != td.Width || sh != td.Height) {
+        D3D11_TEXTURE2D_DESC sd = td;
+        if (stage) ID3D11Texture2D_Release(stage);
+        stage = NULL;
+        sd.Usage = D3D11_USAGE_STAGING; sd.BindFlags = 0; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ; sd.MiscFlags = 0;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_hw.dev, &sd, NULL, &stage))) return;
+        sw = td.Width; sh = td.Height;
+    }
+    ID3D11DeviceContext_CopyResource(s_hw.ctx, (ID3D11Resource *)stage, (ID3D11Resource *)s_hw.pres_tex);
+    if (FAILED(ID3D11DeviceContext_Map(s_hw.ctx, (ID3D11Resource *)stage, 0, D3D11_MAP_READ, 0, &mp))) return;
+    {
+        char fn[64]; FILE *f; uint32_t hd[13]; unsigned ow = sw / 2, oh = sh / 2, x, y, rb = (ow * 3 + 3) & ~3u;
+        uint8_t *line = (uint8_t *)calloc(rb, 1);
+        CreateDirectoryA("dumps", NULL);
+        snprintf(fn, sizeof fn, "dumps/seq_%05u.bmp", n++);
+        f = fopen(fn, "wb");
+        if (f && line) {
+            memset(hd, 0, sizeof hd); hd[0] = 54 + rb * oh; hd[2] = 54; hd[3] = 40; hd[4] = ow; hd[5] = oh; hd[6] = 1 | (24u << 16);
+            fwrite("BM", 1, 2, f); fwrite(hd, 4, 13, f);
+            for (y = 0; y < oh; y++) {
+                const uint8_t *row = (const uint8_t *)mp.pData + (size_t)(sh - 2 - 2 * y) * mp.RowPitch;
+                for (x = 0; x < ow; x++) { line[x * 3] = row[x * 8]; line[x * 3 + 1] = row[x * 8 + 1]; line[x * 3 + 2] = row[x * 8 + 2]; }
+                fwrite(line, 1, rb, f);
+            }
+        }
+        if (f) fclose(f);
+        free(line);
+        armed_n++;
+    }
+    ID3D11DeviceContext_Unmap(s_hw.ctx, (ID3D11Resource *)stage, 0);
+}
+
 /* RECOMP_HW_FLICKERDBG: after each completed frame is copied for presentation,
  * read it back, take its mean brightness, and report frames that differ sharply
  * from the median of the last few (and save the first few as BMPs under
@@ -3325,12 +3440,21 @@ static void hw_flip(void)
          * a 30 Hz or 144 Hz display must not change how often the title may flip.
          * Sleep most of the wait, spin the rest. */
         static LARGE_INTEGER pf, last;
+        static double movie_hz = -1.0;
         LARGE_INTEGER q;
+        double hz = s_hw.pace_hz;
         if (!pf.QuadPart) QueryPerformanceFrequency(&pf);
+        if (movie_hz < 0.0) { const char *e = getenv("RECOMP_HW_MOVIE_HZ"); movie_hz = e ? atof(e) : 30.0; }
+        /* pd-cab: the movie loop paces itself by one vblank per iteration here (60/s), but the game times
+         * subtitle lines in loop iterations at 30/s: subtitles ran at exactly twice the narration's speed.
+         * Frames that draw a movie picture flip at most 30 times a second (RECOMP_HW_MOVIE_HZ, 0 = off).
+         * Measured on v_opening_en: subtitle on-times then match the narration track within ~0.4 s.
+         * Why the loop runs at 60 here (and presumably 30 on the console) is not found yet. */
+        if (movie_hz > 0.0 && s_hw_mv.used_frame == s_hw.frame && movie_hz < hz) hz = movie_hz;
         for (;;) {
             double rem;
             QueryPerformanceCounter(&q);
-            rem = (double)(last.QuadPart + (LONGLONG)((double)pf.QuadPart / s_hw.pace_hz) - q.QuadPart) * 1000.0 / (double)pf.QuadPart;
+            rem = (double)(last.QuadPart + (LONGLONG)((double)pf.QuadPart / hz) - q.QuadPart) * 1000.0 / (double)pf.QuadPart;
             if (rem <= 0.0) break;
             if (rem > 2.5) Sleep((DWORD)(rem - 2.0)); else YieldProcessor();
         }
@@ -3467,6 +3591,7 @@ static void hw_flip(void)
                 s_hw.pres_valid = 1;
                 ip_disp = s_hw.biggest; ip_pw = td.Width; ip_ph = td.Height;
                 if (getenv("RECOMP_HW_FLICKERDBG")) hw_flicker_probe();
+                { static int sq = -1; if (sq < 0) sq = getenv("RECOMP_HW_SEQDUMP") != NULL; if (sq) hw_seq_dump(); }
             }
             s_hw.flip_prev_draws = clear_only ? 0 : d;
         }
