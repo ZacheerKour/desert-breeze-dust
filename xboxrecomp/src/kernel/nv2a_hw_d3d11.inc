@@ -1139,6 +1139,8 @@ static ID3D11ShaderResourceView *hw_self_shadow(const HwSurface *best)
  * player's machine from their run_user.err alone. */
 static struct { uint32_t used_frame, flips, flips_drawn, uploads, dark_uploads, lines; DWORD t0; } s_hw_mv;
 
+int nv2a_hw_movie_frame(void) { return s_hw_mv.used_frame == s_hw.frame; }   /* this frame drew a movie picture */
+
 static void hw_movie_stats_flip(void)
 {
     DWORD now = GetTickCount();
@@ -3245,6 +3247,14 @@ static void hw_gamma_update(void)
 /* Debug (pd-dfu): while the file seqdump.flag exists, save every completed frame at half size as
  * dumps/seq_NNNNN.bmp (at most 900 per arming), for a frame-by-frame search for one-frame glitches.
  * It stalls the GPU every frame. */
+extern void xbox_Nv2aAckPoll(void);   /* xbox_memory_layout.c: answers the PFB flush kick */
+static int getenv_vbsync(void)   /* RECOMP_HW_MOVIE_VBSYNC=1 (experiment): movie flips wait for the next vblank instead of 30 Hz */
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("RECOMP_HW_MOVIE_VBSYNC"); on = e && *e && *e != '0'; }
+    return on;
+}
+
 static void hw_seq_dump(void)
 {
     static ID3D11Texture2D *stage; static UINT sw, sh; static unsigned n, armed_n;
@@ -3463,13 +3473,21 @@ static void hw_flip(void)
         LARGE_INTEGER q;
         double hz = s_hw.pace_hz;
         if (!pf.QuadPart) QueryPerformanceFrequency(&pf);
-        if (movie_hz < 0.0) { const char *e = getenv("RECOMP_HW_MOVIE_HZ"); movie_hz = e ? atof(e) : 30.0; }
-        /* pd-cab: the movie loop paces itself by one vblank per iteration here (60/s), but the game times
-         * subtitle lines in loop iterations at 30/s: subtitles ran at exactly twice the narration's speed.
-         * Frames that draw a movie picture flip at most 30 times a second (RECOMP_HW_MOVIE_HZ, 0 = off).
-         * Measured on v_opening_en: subtitle on-times then match the narration track within ~0.4 s.
-         * Why the loop runs at 60 here (and presumably 30 on the console) is not found yet. */
-        if (movie_hz > 0.0 && s_hw_mv.used_frame == s_hw.frame && movie_hz < hz) hz = movie_hz;
+        if (movie_hz < 0.0) { const char *e = getenv("RECOMP_HW_MOVIE_HZ"); movie_hz = e ? atof(e) : 0.0; }
+        if (movie_hz > 0.0 && s_hw_mv.used_frame == s_hw.frame && getenv_vbsync()) {
+            /* pd-ukj: wait for the next vblank (at most ~20 ms), as the console's GPU does at a flip, instead of
+             * holding the executor until 33 ms after the previous flip: that long hold kept the game's movie
+             * loop blocked in D3D while its audio stream ran dry (37-88 ms gaps at packet ends). */
+            extern unsigned xbox_VblankCount(void);
+            unsigned v0 = xbox_VblankCount(); DWORD t0 = GetTickCount();
+            while (xbox_VblankCount() == v0 && GetTickCount() - t0 < 20) Sleep(1);
+            hz = s_hw.pace_hz;
+        }
+        /* RECOMP_HW_MOVIE_HZ=30: 0.1.6's subtitle fix, frames that draw a movie picture flip at most 30 times a
+         * second. Off by default since 0.1.7: at 30 passes a second the movie loop handed the movie's audio
+         * packets over a pass late at fixed points (30-100 ms dropouts, pd-ukj). The subtitles count loop passes
+         * and run early at 60; their clock is not found yet (pd-cab, see docs/RECOMP_ANALYSIS.md). */
+        if (movie_hz > 0.0 && s_hw_mv.used_frame == s_hw.frame && movie_hz < hz && !getenv_vbsync()) hz = movie_hz;
         for (;;) {
             double rem;
             QueryPerformanceCounter(&q);
@@ -3796,4 +3814,5 @@ void xbox_SetGammaRamp(const uint8_t *rgb768) { (void)rgb768; }
 static int  hw_method(uint32_t method, uint32_t param) { (void)method; (void)param; return 0; }
 void nv2a_hw_idle_present(void) {}
 int  nv2a_hw_readback(uint32_t *dst, uint32_t w, uint32_t h) { (void)dst; (void)w; (void)h; return 0; }
+int  nv2a_hw_movie_frame(void) { return 0; }
 #endif

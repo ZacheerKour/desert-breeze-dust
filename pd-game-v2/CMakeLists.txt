@@ -19,6 +19,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 add_compile_definitions(
     WIN32_LEAN_AND_MEAN
     NOMINMAX
+    RECOMP_ABI_CHECK      # per-call hook: debug console tools and the movie-loop pacing (pd-cab); release builds use it too
 )
 
 # ── xboxrecomp toolkit ──────────────────────────────────────────

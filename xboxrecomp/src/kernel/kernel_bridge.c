@@ -2508,7 +2508,8 @@ int xbox_VblankHoldActive(void)
     return q.QuadPart < g_vb_hold_until;
 }
 
-static unsigned g_vb_isr, g_vb_early, g_vb_noint;
+static volatile unsigned g_vb_isr, g_vb_early, g_vb_noint;
+unsigned xbox_VblankCount(void) { return g_vb_isr; }   /* vblanks delivered so far (hw_flip movie pacing) */
 static void kernel_vblank_tick(void)
 {
     static int enabled = -1;

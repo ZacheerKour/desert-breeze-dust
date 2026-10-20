@@ -100,8 +100,58 @@ static void fps60_vblank_callback(void)
     sub_000B08E0();
 }
 
+/* pd-cab diagnostics: RECOMP_ICALL_COUNT=<ms> counts indirect-call targets for that long once movie mode starts
+ * (bit 0x40 of [0x39E7C0]) and prints those called 20..400 times a second. */
+#include <stdlib.h>
+__declspec(dllimport) unsigned long __stdcall GetTickCount(void);
+static void icall_count_hit(uint32_t va)
+{
+    static int on = -1; static unsigned long win, t0; static uint32_t vas[512]; static unsigned cnt[512], n; static int done;
+    if (on < 0) { const char *e = getenv("RECOMP_ICALL_COUNT"); on = e != NULL; win = e ? (unsigned long)atoi(e) : 0; }
+    if (!on || done) return;
+    { extern int nv2a_hw_movie_frame(void); if (!t0 && !nv2a_hw_movie_frame()) return; }
+    if (!t0) t0 = GetTickCount();
+    if (GetTickCount() - t0 > 10000 && GetTickCount() - t0 < 10000 + win) {
+        unsigned i;
+        for (i = 0; i < n; i++) if (vas[i] == va) { cnt[i]++; return; }
+        if (n < 512) { vas[n] = va; cnt[n++] = 1; }
+    } else if (GetTickCount() - t0 >= 10000 + win) {
+        unsigned i; done = 1;
+        fprintf(stderr, "[ICNT] %u targets in %lu ms:", n, (unsigned long)win);
+        for (i = 0; i < n; i++) if (cnt[i] * 1000u / win >= 20u && cnt[i] * 1000u / win <= 400u) fprintf(stderr, " %06X=%u", vas[i], cnt[i]);
+        fprintf(stderr, "%c", 10);
+    }
+}
+
+/* pd-cab experiment: RECOMP_HALF_TASKS=<hex,...>: while a movie picture is drawn, the listed task updates called
+ * from the frame's task loop (sub_000B42A0, return address 0xB4324, no stack arguments) run every second time. */
+extern recomp_func_t recomp_lookup(uint32_t va);
+static uint32_t s_half_va; static unsigned s_half_n[16]; static uint32_t s_half_list[16]; static int s_half_cnt = -1;
+static void half_task_wrap(void)
+{
+    uint32_t va = s_half_va; int k;
+    for (k = 0; k < s_half_cnt; k++) if (s_half_list[k] == va) break;
+    if (k < s_half_cnt && (s_half_n[k]++ & 1)) { esp += 4; return; }   /* skipped: plain ret */
+    recomp_lookup(va)();
+}
+static recomp_func_t half_task_check(uint32_t va)
+{
+    int k;
+    if (s_half_cnt < 0) {
+        const char *e = getenv("RECOMP_HALF_TASKS"); char buf[512], *t, *ctx = NULL;
+        s_half_cnt = 0;
+        if (e) { snprintf(buf, sizeof buf, "%s", e); for (t = strtok_s(buf, ",", &ctx); t && s_half_cnt < 16; t = strtok_s(NULL, ",", &ctx)) s_half_list[s_half_cnt++] = (uint32_t)strtoul(t, NULL, 16); }
+    }
+    if (!s_half_cnt || MEM32(esp) != 0x000B4324u) return 0;
+    { extern int nv2a_hw_movie_frame(void); if (!nv2a_hw_movie_frame()) return 0; }
+    for (k = 0; k < s_half_cnt; k++) if (s_half_list[k] == va) { s_half_va = va; return half_task_wrap; }
+    return 0;
+}
+
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
 {
+    icall_count_hit(xbox_va);
+    { recomp_func_t h = half_task_check(xbox_va); if (h) return h; }
     if (g_fps60 && xbox_va == 0x000B08E0u)
         return fps60_vblank_callback;
     /*
