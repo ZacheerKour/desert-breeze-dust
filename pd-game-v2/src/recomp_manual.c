@@ -529,3 +529,38 @@ void pd_reg_hook(uint32_t va)
         g_esp = se; g_eax = sa; g_ecx = sc; g_edx = sd; g_ebx = sb; g_esi = ss; g_edi = sdi; g_ebp = sbp;
     }
 }
+
+/* pd-cab: movie subtitles ran at twice the narration's speed. The message system (sub_001A9F80, called each frame
+ * from sub_000AD370 with return address 0xAD38E) advances its lines per call, and the event script's waits assume
+ * the 30 Hz frame of the console. While the frame loop runs unlimited (bit 0x40 of [0x39E7C0]: movies, the title)
+ * it runs at 60 here, but the WMV decode held it near 30 on the console. So during that mode the update runs only
+ * when two vblanks ([0x39E700], 60 Hz) have passed since its last run; otherwise it returns as if it had run
+ * (ret 4). The rest of the loop keeps its rate, so the movie's audio stream is fed as before (slowing the whole
+ * loop starved it, 0.1.6). RECOMP_MSG_PACE=0 turns it off. */
+extern void sub_001A9F80_gen(void);
+void sub_001A9F80(void)
+{
+    static int on = -1;
+    static uint32_t base_vb, ticks, last_vb; static int have;
+    if (on < 0) { const char *e = getenv("RECOMP_MSG_PACE"); on = !(e && *e == '0'); }
+    if (on && MEM32(esp) == 0x000AD38Eu && (MEM8(0x39E7C0u) & 0x40)) {
+        /* A budget, not "two vblanks since the last run": the latter lost a fraction whenever a pass landed just
+         * after a vblank, so the script ran a little under 30 a second and the subtitles drifted late. Here the
+         * update runs (once per pass at most) while it has run fewer times than half the vblanks since this mode
+         * began; a gap of over a second (the mode ended in between) starts a new budget. */
+        /* Real time (QPC), not the title's vblank counter, which ran slightly slow here and let the subtitles
+         * drift about a second late by the end of a minute. */
+        static LARGE_INTEGER qf; LARGE_INTEGER qn; uint32_t vb;
+        if (!qf.QuadPart) QueryPerformanceFrequency(&qf);
+        QueryPerformanceCounter(&qn);
+        vb = (uint32_t)(qn.QuadPart * 60 / qf.QuadPart);       /* 60 Hz ticks of host time */
+        if (!have || (uint32_t)(vb - last_vb) > 60u) { base_vb = vb; ticks = 0; have = 1; }
+        last_vb = vb;
+        if (ticks >= (uint32_t)(vb - base_vb) / 2u + 1u) {
+            esp += 8;                     /* skipped: ret 4 (return address + one argument) */
+            return;
+        }
+        ticks++;
+    }
+    sub_001A9F80_gen();
+}

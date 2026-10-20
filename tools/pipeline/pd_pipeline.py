@@ -41,6 +41,7 @@ def input_stamp(xbe):
     files = [xbe, os.path.join(HERE, 'pd_extend_ends.py'), os.path.abspath(__file__)]
     proj = os.path.join(ROOT, 'pd-game-v2')
     files += [os.path.join(proj, n) for n in ('seed_functions.json', 'ghidra_funcs.json', 'manual_functions.json')]
+    files.append(os.path.join(proj, 'src', 'recomp_manual.c'))   # its sub_X / sub_X_gen definitions shape the generated code
     tk = os.path.join(ROOT, 'xboxrecomp')
     for d in ('xbe_parser', 'disasm', 'func_id', 'abi_analysis', 'recomp'):
         base = os.path.join(tk, 'tools', d)
@@ -96,7 +97,8 @@ def main():
     os.makedirs(scratch, exist_ok=True)
     run('recomp', [py, '-m', 'tools.recomp', xbe, '--all', '--split', '250', '--gen-dir', gen, '-o', scratch, '--disasm-dir', ext,
                    '--func-id-dir', os.path.join(W, 'func_id'), '--abi-dir', os.path.join(W, 'abi'), '--game-name', 'PhantomDust',
-                   '--manual-functions', manual], tk, L('recomp'))
+                   '--manual-functions', manual,
+                   '--exclude-manual', os.path.join(proj, 'src', 'recomp_manual.c')], tk, L('recomp'))
     rt = os.path.join(gen, 'recomp_types.h')
     if not os.path.exists(rt):
         shutil.copyfile(os.path.join(tk, 'templates', 'runtime', 'recomp_types.h'), rt)

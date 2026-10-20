@@ -218,7 +218,7 @@ void recomp_fn_watch_hit(uint32_t va)
                 k = 3999; while (k > 0 && cnt[i] > top_c[k - 1]) { top_c[k] = top_c[k - 1]; top_v[k] = top_v[k - 1]; k--; }
                 top_c[k] = cnt[i]; top_v[k] = (uint32_t)i << 2;
             }
-            fprintf(stderr, "[FNCOUNT] %lu ms, busiest:", (unsigned long)win);
+            fprintf(stderr, "[FNCOUNT] tick %lu %lu ms, busiest:", (unsigned long)GetTickCount(), (unsigned long)win);
             for (k = 0; k < 4000 && top_c[k]; k++) fprintf(stderr, " %06X=%u", (unsigned)top_v[k], (unsigned)top_c[k]);
             fprintf(stderr, "%c", 10);
             memset(cnt, 0, sizeof cnt); t0 = 0; g_fn_watch_on = 5;
@@ -409,6 +409,13 @@ static DWORD WINAPI pd_mem_live(LPVOID unused)
                     fprintf(stderr, "[MEM] peek %08X:", a);
                     for (k = 0; k < sz; k++) fprintf(stderr, " %08X", m[k]);
                     fprintf(stderr, "\n");
+                } else if (sscanf(line, "rscan %x %x", &a, &v) == 2) {
+                    /* pd-cab: dwords (aligned, guest RAM) whose value lies in [lo, hi): pointers into a buffer */
+                    const uint32_t *base = (const uint32_t *)((uint8_t *)g_xbox_mem_offset);
+                    unsigned i, shown = 0;
+                    fprintf(stderr, "[RSCAN] tick %lu %X..%X:", (unsigned long)GetTickCount(), a, v);
+                    for (i = 0x10000u / 4; i < 0x04000000u / 4; i++) if (base[i] >= a && base[i] < v && shown++ < 400) fprintf(stderr, " %X=%X", i * 4, base[i]);
+                    fprintf(stderr, "%c", 10);
                 } else if (sscanf(line, "fdiff %f %f", &fd[0], &fd[1]) == 2) {
                     /* pd-cab: like sdiff, for floats: dwords that read as finite floats both times and grew by [min, max] */
                     extern uint32_t *g_snapbuf;
