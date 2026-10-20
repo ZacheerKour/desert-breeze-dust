@@ -1151,7 +1151,7 @@ static void hw_movie_stats_flip(void)
     if (!mv_start) mv_start = now;
     {   /* [SUB]: subtitle overlay on/off times from the movie's first frame (a movie frame with subtitle text has more than one draw) */
         int on = fd > 1;
-        if (on != sub_on && s_hw_mv.lines < 3000) fprintf(stderr, "  [SUB] +%lu ms %s (draws %llu)\n", (unsigned long)(now - mv_start), on ? "on" : "off", fd);
+        if (on != sub_on && s_hw_mv.lines < 3000) fprintf(stderr, "  [SUB] tick %lu +%lu ms %s (draws %llu)\n", (unsigned long)now, (unsigned long)(now - mv_start), on ? "on" : "off", fd);
         sub_on = on;
     }
     if (!s_hw_mv.t0) { s_hw_mv.t0 = now; s_hw_mv.flips = s_hw_mv.flips_drawn = s_hw_mv.uploads = s_hw_mv.dark_uploads = 0; }
