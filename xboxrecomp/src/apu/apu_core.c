@@ -47,6 +47,17 @@ int g_dbg_voice_monitor = -1;
 uint64_t g_dbg_muted_voices[4] = { 0 };
 
 /* Global audio mute — disables all AWD/mixer sound playback */
+volatile long long g_apu_out_pos = 0;   /* samples produced so far (dump timeline) */
+void apu_ev(const char *what, unsigned v, int a, int b)
+{
+    static FILE *f; static int tried;
+    if (!tried) {
+        const char *p = getenv("RECOMP_AUDIO_DUMP");
+        tried = 1;
+        if (p) { char n[600]; snprintf(n, sizeof n, "%s.events.txt", p); f = fopen(n, "w"); }
+    }
+    if (f) { fprintf(f, "%lld %s 0x%X %d %d\n", g_apu_out_pos, what, v, a, b); fflush(f); }
+}
 volatile int g_audio_muted = 0;  /* 0 = audio enabled */
 
 /* ============================================================
@@ -439,6 +450,7 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         if (staged + n > buf_size) n = buf_size - staged;
         memcpy(&stage[staged][0], d->monitor.frame_buf, n * 2 * sizeof(int16_t));
         staged += n;
+        g_apu_out_pos += n;
         if (staged >= buf_size) {
             /* A full queue refuses the buffer; dropping it keeps the guest
              * clock, not the host's, in charge of pacing. */
@@ -447,14 +459,14 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
             static FILE *wav;
             static unsigned wav_bytes;
             int ok = xa2_submit_samples(&stage[0][0], buf_size);
-            if (ok) sub_ok++; else sub_drop++;
+            if (ok) sub_ok++; else { sub_drop++; apu_ev("DROP", 0, 0, 0); }
             produced += buf_size;
             if (!qf.QuadPart) { QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&q0); }
-            if (getenv("RECOMP_APU_WAV") && (!wav || wav_bytes < 48000u*4*60)) {
+            if ((getenv("RECOMP_AUDIO_DUMP") || getenv("RECOMP_APU_WAV")) && (!wav || wav_bytes < 48000u*4*1800)) {
                 if (!wav) {
                     unsigned char h[44] = {'R','I','F','F',0,0,0,0,'W','A','V','E','f','m','t',' ',16,0,0,0,1,0,2,0,
                         0x80,0xBB,0,0,0,0x70,0x02,0,4,0,16,0,'d','a','t','a',0,0,0,0};
-                    wav = fopen(getenv("RECOMP_APU_WAV"), "wb");
+                    wav = fopen(getenv("RECOMP_AUDIO_DUMP") ? getenv("RECOMP_AUDIO_DUMP") : getenv("RECOMP_APU_WAV"), "wb");
                     if (wav) fwrite(h, 1, 44, wav);
                 }
                 if (wav) { fwrite(stage, 4, buf_size, wav); wav_bytes += buf_size * 4; fflush(wav); }
@@ -631,16 +643,37 @@ static void *mcpx_apu_frame_thread(void *arg)
         int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                                 NV_PAPU_SECTL_XCNTMODE);
         uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
+        /* A trapped front end (FEMETHMODE_TRAPPED, raised for every idle voice
+         * by SE2FE_IDLE_VOICE until DirectSound's service routine unlinks it)
+         * only stops the FE from fetching methods. The voice processor and the
+         * mixdown keep running on hardware. Treating TRAPPED like HALTED sent
+         * the frame to the lightweight path below, which zeroes the monitor
+         * buffer: every voice that ended (about 1.3 per second in the hub, far
+         * more with the dialogue blips) cut the whole mix to digital silence
+         * for 288/544/800 samples (pd-ukj). RECOMP_APU_TRAP_SILENCE=1 restores
+         * the old behaviour. */
+        static int trap_silence = -1;
+        if (trap_silence < 0) { const char *e = getenv("RECOMP_APU_TRAP_SILENCE"); trap_silence = (e && *e && atoi(e)) ? 1 : 0; }
+        /* FEMETHMODE is a 3-bit field (HALTED 0x80, TRAPPED 0xE0): TRAPPED
+         * contains the HALTED bit, so the old `fectl & HALTED` test was true
+         * for TRAPPED as well. Compare the field. */
+        uint32_t femeth = fectl & NV_PAPU_FECTL_FEMETHMODE;
         bool apu_active = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
-                          !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
-                          !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
+                          (!trap_silence || femeth != NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
+                          femeth != NV_PAPU_FECTL_FEMETHMODE_HALTED;
 
+        {   static int prev_active = -1;
+            if (apu_active != prev_active) { apu_ev(apu_active ? "ACTIVE" : "LIGHT", (unsigned)xcntmode, (int)fectl, 0); prev_active = apu_active; }
+        }
         if (apu_active && !g_test_tone.active) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
             se_frame(d);
         } else {
             /* Lightweight: just monitor frame (test tone + software mixer) */
-            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+            /* Clear this frame's 32-sample slice only: the earlier slices of
+             * the period are already rendered and must not be thrown away. */
+            memset(d->monitor.frame_buf[(d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME], 0,
+                   NUM_SAMPLES_PER_FRAME * sizeof(d->monitor.frame_buf[0]));
             mcpx_apu_monitor_frame(d);
             d->ep_frame_div++;
         }

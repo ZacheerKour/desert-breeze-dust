@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include "apu_state.h"
 #include "fpconv.h"
+extern void apu_ev(const char *what, unsigned v, int a, int b);
 
 /* #define DEBUG_MCPX */
 
@@ -134,6 +135,7 @@ static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
 
 static void voice_off(MCPXAPUState *d, uint16_t v)
 {
+    apu_ev("OFF", v, 0, 0);
     voice_set_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 0);
 
@@ -289,6 +291,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                            NV_PAVS_VOICE_CUR_ECNT_EFCOUNT, hold_time * 16);
         }
 
+        apu_ev("ON", (unsigned)selected_handle, 0, 0);
         { static int vn; if (vn++ < 1500) fprintf(stderr, "[APU] voice 0x%04X ON (#%d)\n", (unsigned)selected_handle, vn); }
         voice_reset_filters(d, (uint16_t)selected_handle);
         voice_set_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_PAR_STATE,
@@ -476,6 +479,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_BASE);
         d->vp.ssl[current_voice].count[ssl] =
             (uint8_t)GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_COUNT);
+        apu_ev("SSL", (unsigned)current_voice, ssl, d->vp.ssl[current_voice].count[ssl]);
         break;
     }
     case NV1BA0_PIO_SET_VOICE_SSL_B: {
@@ -486,6 +490,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_BASE);
         d->vp.ssl[current_voice].count[ssl] =
             (uint8_t)GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_COUNT);
+        apu_ev("SSL", (unsigned)current_voice, ssl, d->vp.ssl[current_voice].count[ssl]);
         break;
     }
 
@@ -836,6 +841,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         { static unsigned dn; if (getenv("RECOMP_APU_DIAG") && dn++ < 60 && count == 0) fprintf(stderr, "[APU] vdbg count0 voice 0x%X ssl_index %d persist %d\n", (unsigned)v, ssl_index, (int)persist); }
 
         if (count == 0) {
+            apu_ev("EMPTY", v, persist, ssl_index);
             voice_set_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_OFFSET,
                            NV_PAVS_VOICE_PAR_OFFSET_CBO, 0);
             d->vp.ssl[v].ssl_seg = 0;
@@ -977,6 +983,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 d->vp.ssl[v].ssl_index = next_index;
                 d->vp.ssl[v].ssl_seg = 0;
         { static unsigned dn; if (getenv("RECOMP_APU_DIAG") && dn++ < 60) fprintf(stderr, "[APU] vdbg %s voice 0x%X ssl_index %d seg %d count %d persist %d\n", "list-done", (unsigned)v, d->vp.ssl[v].ssl_index, d->vp.ssl[v].ssl_seg, d->vp.ssl[v].count[d->vp.ssl[v].ssl_index], (int)persist); }
+                apu_ev("LISTDONE", v, ssl_index, d->vp.ssl[v].count[next_index]);
                 set_notify_status(d, v, MCPX_HW_NOTIFIER_SSLA_DONE + ssl_index,
                                   NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS);
             }
