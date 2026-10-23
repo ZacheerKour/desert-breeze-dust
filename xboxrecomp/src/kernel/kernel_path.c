@@ -177,6 +177,8 @@ const wchar_t *xbox_LastHostPath(void)
 static WCHAR s_game_dir[MAX_PATH];
 static WCHAR s_save_dir[MAX_PATH];
 static BOOL  s_initialized = FALSE;
+/* Debug switches, read once in xbox_path_init. */
+static BOOL  s_path_log = FALSE, s_xmv_klog = FALSE, s_fn_watch = FALSE;
 
 /*
  * The raw disk device, \Device\Harddisk0\Partition0.
@@ -273,6 +275,10 @@ static BOOL xbox_partition_device_path(const char *xbox_path, WCHAR *out, DWORD 
 void xbox_path_init(const char* game_dir, const char* save_dir)
 {
     WCHAR save_base[MAX_PATH];
+
+    s_path_log = getenv("RECOMP_PATH_LOG") != NULL;
+    s_xmv_klog = getenv("RECOMP_XMV_KLOG") != NULL;
+    s_fn_watch = getenv("RECOMP_FN_WATCH") != NULL;
 
     /* The fallbacks used to name Burnout 3 specifically, so any other title
      * that passed NULL silently pointed its game dir and its saves at another
@@ -380,6 +386,22 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%S, save=%S", s_game_dir, s_save_dir);
 }
 
+/* Host game directory, without a trailing separator. */
+const WCHAR *xbox_path_game_dir(void)
+{
+    if (!s_initialized)
+        xbox_path_init(NULL, NULL);
+    return s_game_dir;
+}
+
+/* Host save directory, absolute and without a trailing separator. */
+const WCHAR *xbox_path_save_dir(void)
+{
+    if (!s_initialized)
+        xbox_path_init(NULL, NULL);
+    return s_save_dir;
+}
+
 /* The host path the last translation produced.
  *
  * A caller that wants to act on the file a title just opened -- playing an FMV
@@ -416,8 +438,10 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     }
 
     if (xbox_partition_device_path(xbox_path, host_path_buf, buf_size)) {
-        fprintf(stderr, "  [PATH] %s -> partition image\n", xbox_path);
-        fflush(stderr);
+        if (s_path_log) {
+            fprintf(stderr, "  [PATH] %s -> partition image\n", xbox_path);
+            fflush(stderr);
+        }
         return TRUE;
     }
 
@@ -438,11 +462,13 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
 translate:
     if (g_xbox_path_hook)
         g_xbox_path_hook(xbox_path);
-    fprintf(stderr, "  [PATH] %s\n", xbox_path);
+    if (s_path_log)
+        fprintf(stderr, "  [PATH] %s\n", xbox_path);
     { extern void xbox_KernelLogWindow(int n);
-      if (getenv("RECOMP_XMV_KLOG") && strstr(xbox_path, ".xmv")) xbox_KernelLogWindow(12000);
-      { extern volatile int g_fn_watch_arm; if (getenv("RECOMP_FN_WATCH") && strstr(xbox_path, ".xmv")) g_fn_watch_arm = 1; } }
-    fflush(stderr);
+      if (s_xmv_klog && strstr(xbox_path, ".xmv")) xbox_KernelLogWindow(12000);
+      { extern volatile int g_fn_watch_arm; if (s_fn_watch && strstr(xbox_path, ".xmv")) g_fn_watch_arm = 1; } }
+    if (s_path_log)
+        fflush(stderr);
     {
         WCHAR remainder_wide[MAX_PATH];
         MultiByteToWideChar(CP_ACP, 0, remainder, -1, remainder_wide, MAX_PATH);
@@ -488,12 +514,14 @@ translate:
                         while (k && (nm[k - 1] == '\n' || nm[k - 1] == '\r' || nm[k - 1] == ' ')) nm[--k] = 0;
                         if (k > 4 && sl) {
                             swprintf_s(sl + 1, buf_size - (DWORD)(sl + 1 - host_path_buf), L"%S", nm);
-                            fprintf(stderr, "  [XMV] redirect %s -> %s\n", xbox_path, nm);
+                            if (s_path_log)
+                                fprintf(stderr, "  [XMV] redirect %s -> %s\n", xbox_path, nm);
                         }
                     }
                     fclose(rf);
                 }
-                fprintf(stderr, "  [XMV] open %S at tick %lu\n", host_path_buf, (unsigned long)GetTickCount());
+                if (s_path_log)
+                    fprintf(stderr, "  [XMV] open %S at tick %lu\n", host_path_buf, (unsigned long)GetTickCount());
             }
         }
         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %S", xbox_path, host_path_buf);

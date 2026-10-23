@@ -120,80 +120,10 @@ static uint32_t s_wfn_ring[16]; static unsigned s_wfn_rp;
  * recomp_manual.c so that the event comes every vblank). Needs the function-entry hook, which is on for mode 7. */
 uint32_t *g_snapbuf;   /* debug console snap/sdiff/fdiff */
 int g_fps60;
-/* pd-cab experiment (off unless RECOMP_MOVIE_CLOCKS / RECOMP_MOVIE_FCLOCKS name counters): the movie subtitle clock.
- * None of the counters tried so far (int 39E6FC 37E8A8 2E4518 253AF8, float 2DD4AC) moved the subtitles. */
-/* pd-cab / pd-ukj: the movie subtitle clock. While bit 0x40 of [0x39E7C0] is set (movie playback) the frame loop
- * sub_000B13D0 skips its 2-vblank limiter and runs as fast as it can, adding 1 to [0x39E6FC] after each pass
- * (sub_000B1110 runs the pass and reads it). The game times subtitle lines in that counter. On the console the WMV
- * decode made a pass take about 1/30 s; here the loop runs at 60, so subtitles came at twice the narration's
- * speed. Slowing the loop is not an option: at 30 passes a second the movie's audio packets were handed over a
- * pass late at fixed points (30-100 ms gaps, 0.1.6). So the loop keeps its rate and, at the start of each pass,
- * the counter is set to half the vblanks ([0x39E700], 60 Hz) since the movie started: what a 30 Hz loop counts.
- * The hook mode (8) is on only while the bit is set (pd_movie_pace_thread). RECOMP_MOVIE_PACE=0 = off. */
-static void pd_movie_pace(void)
-{
-    /* RECOMP_MOVIE_CLOCKS=<hex,hex,...> picks the counters (default below). */
-    static uint32_t addr[4]; static int naddr = -1;
-    static uint32_t base[4], last[4]; static int valid[4];
-    uint32_t vb = *(volatile uint32_t *)((uint8_t *)g_xbox_mem_offset + 0x39E700u);
-    int k;
-    if (naddr < 0) {
-        const char *e = getenv("RECOMP_MOVIE_CLOCKS");
-        char buf[128], *t, *ctx = NULL;
-        naddr = 0;
-        snprintf(buf, sizeof buf, "%s", e ? e : "");
-        for (t = strtok_s(buf, ",", &ctx); t && naddr < 4; t = strtok_s(NULL, ",", &ctx)) addr[naddr++] = (uint32_t)strtoul(t, NULL, 16);
-    }
-    {   /* float counters: RECOMP_MOVIE_FCLOCKS=<hex,...> */
-        static uint32_t faddr[4]; static int nf = -1; static float fbase_v[4], flast[4]; static uint32_t fbase_vb[4]; static int fvalid[4];
-        int j;
-        if (nf < 0) {
-            const char *e = getenv("RECOMP_MOVIE_FCLOCKS");
-            char buf[128], *t, *ctx = NULL;
-            nf = 0;
-            snprintf(buf, sizeof buf, "%s", e ? e : "");
-            for (t = strtok_s(buf, ",", &ctx); t && nf < 4; t = strtok_s(NULL, ",", &ctx)) faddr[nf++] = (uint32_t)strtoul(t, NULL, 16);
-        }
-        for (j = 0; j < nf; j++) {
-            volatile float *fc = (volatile float *)((uint8_t *)g_xbox_mem_offset + faddr[j]);
-            float c = *fc, want;
-            if (!fvalid[j] || c < flast[j] - 0.5f || c < 0.5f) { fbase_v[j] = c; fbase_vb[j] = vb; fvalid[j] = 1; }
-            want = fbase_v[j] + (float)(vb - fbase_vb[j]) * 0.5f;
-            *fc = want; flast[j] = want;
-            { static unsigned nl; if (nl < 4 || (nl % 600) == 0) fprintf(stderr, "[MPACE] f%X: %g -> %g (vblank %u)\n", faddr[j], c, want, vb); nl++; }
-        }
-    }
-    for (k = 0; k < naddr; k++) {
-        volatile uint32_t *cnt = (volatile uint32_t *)((uint8_t *)g_xbox_mem_offset + addr[k]);
-        uint32_t c = *cnt, want;
-        if (!valid[k] || c < last[k] || c == 0) { base[k] = vb - 2u * c; valid[k] = 1; }   /* the game reset the count */
-        want = (vb - base[k]) / 2u;
-        if (want < c && c - want > 1000u) { base[k] = vb - 2u * c; want = c; }
-        *cnt = want;
-        last[k] = want;
-        { static unsigned nlog; if (nlog < 4 || (nlog % 600) == 0) fprintf(stderr, "[MPACE] %X: count %u -> %u (vblank %u)\n", addr[k], c, want, vb); nlog++; }
-    }
-}
-static DWORD WINAPI pd_movie_pace_thread(LPVOID unused)
-{
-    (void)unused;
-    for (;;) {
-        int movie = (*(volatile uint8_t *)((uint8_t *)g_xbox_mem_offset + 0x39E7C0u) & 0x40) != 0;
-        if (movie && g_fn_watch_on == 0) { g_fn_watch_on = 8; fprintf(stderr, "[MPACE] movie mode on%c", 10); }
-        else if (movie && g_fn_watch_on != 8) { static int warned; if (!warned++) fprintf(stderr, "[MPACE] movie mode, but hook mode is %d%c", g_fn_watch_on, 10); }
-        else if (!movie && g_fn_watch_on == 8) g_fn_watch_on = 0;
-        Sleep(10);
-    }
-    return 0;
-}
 void recomp_fn_watch_hit(uint32_t va)
 {
     int i;
     static DWORD last;
-    if (g_fn_watch_on == 8) {
-        if (va == 0xB1110u) pd_movie_pace();
-        return;
-    }
     if (g_fps60 && va == 0xB0960u) {
         /* the original computes target = [esi+0x54] + 2. Make it max(last + 1, current count): one vblank per frame, and a
          * frame that ran late is not punished with the extra "resync" vblank wait of the original (it would turn a 17.5 ms
@@ -375,6 +305,8 @@ tick:
     }
 }
 
+/* guest addresses the console may touch: guest RAM above the low 64 KB, no wrap-around */
+static int mem_ok(uint32_t a, uint32_t bytes) { return a >= 0x10000 && a + bytes <= 0x04000000 && a + bytes >= a; }
 /* RECOMP_MEM_LIVE=<file>: a debug console on guest memory. Lines appended to the file:
  *   poke <hexaddr> <hexval> [1|2|4]   write guest memory (default 4 bytes)
  *   peek <hexaddr> [dwords]           print dwords (default 1) to stderr as [MEM]
@@ -397,15 +329,24 @@ static DWORD WINAPI pd_mem_live(LPVOID unused)
             while (fgets(line, sizeof line, f)) {
                 size_t n = strlen(line);
                 unsigned a = 0, v = 0; int sz = 4, k; float fd[3];
-                if (n == 0 || line[n - 1] != '\n') break;      /* incomplete line: read it next time */
+                if (n == 0 || line[n - 1] != '\n') {
+                    if (n == sizeof line - 1) {   /* longer than the buffer: discard the rest so it cannot wedge the console */
+                        int c; long rest = 0;
+                        while ((c = fgetc(f)) != EOF && c != '\n') rest++;
+                        if (c == '\n') { consumed += (long)n + rest + 1; continue; }
+                    }
+                    break;      /* incomplete line: read it next time */
+                }
                 consumed += (long)n;
                 if (sscanf(line, "poke %x %x %d", &a, &v, &sz) >= 2 && (sz == 1 || sz == 2 || sz == 4)) {
+                    if (!mem_ok(a, (uint32_t)sz)) { fprintf(stderr, "[MEM] bad addr %08X%c", a, 10); continue; }
                     uint8_t *m = (uint8_t *)g_xbox_mem_offset + a;
                     memcpy(m, &v, (size_t)sz);
                     fprintf(stderr, "[MEM] poke %08X <- %X (%d bytes)\n", a, v, sz);
                 } else if (sscanf(line, "peek %x %d", &a, &sz) >= 1) {
                     const uint32_t *m = (const uint32_t *)((uint8_t *)g_xbox_mem_offset + a);
                     if (sz < 1 || sz > 64) sz = 1;
+                    if (!mem_ok(a, 4u * (uint32_t)sz)) { fprintf(stderr, "[MEM] bad addr %08X%c", a, 10); continue; }
                     fprintf(stderr, "[MEM] peek %08X:", a);
                     for (k = 0; k < sz; k++) fprintf(stderr, " %08X", m[k]);
                     fprintf(stderr, "\n");
@@ -485,6 +426,7 @@ static DWORD WINAPI pd_mem_live(LPVOID unused)
                     fprintf(stderr, "[MEM] fn watch mode -> %d%c", sz, 10);
                 } else if (sscanf(line, "follow %x %x %f %f %f %d", &a, &v, &fd[0], &fd[1], &fd[2], &sz) == 6) {
                     extern volatile DWORD g_fo_until; extern volatile uint32_t g_fo_dst, g_fo_src; extern volatile float g_fo_d[3];
+                    if (!mem_ok(a, 4) || !mem_ok(v, 4)) { fprintf(stderr, "[MEM] bad addr %08X%c", !mem_ok(a, 4) ? a : v, 10); continue; }
                     g_fo_dst = a; g_fo_src = v; g_fo_d[0] = fd[0]; g_fo_d[1] = fd[1]; g_fo_d[2] = fd[2];
                     g_fo_until = GetTickCount() + (DWORD)sz; if (!g_fo_until) g_fo_until = 1;
                     fprintf(stderr, "[MEM] follow dst=%08X src=%08X d=%.1f,%.1f,%.1f for %d ms%c", a, v, fd[0], fd[1], fd[2], sz, 10);
@@ -493,6 +435,7 @@ static DWORD WINAPI pd_mem_live(LPVOID unused)
                     if (a == 0) g_fl_n = 0; else if (g_fl_n < 16) g_fl_va[g_fl_n++] = a;
                     fprintf(stderr, "[MEM] fnlog %08X (n=%d)%c", a, g_fl_n, 10);
                 } else if (sscanf(line, "wfn %x", &a) == 1 && g_wfn_n < 4) {
+                    if (!mem_ok(a, 4)) { fprintf(stderr, "[MEM] bad addr %08X%c", a, 10); continue; }
                     memcpy((void *)&g_wfn_last[g_wfn_n], (uint8_t *)g_xbox_mem_offset + a, 4);
                     g_wfn_va[g_wfn_n] = a; g_wfn_n++;
                     fprintf(stderr, "[MEM] wfn armed on %08X%c", a, 10);
@@ -520,6 +463,7 @@ static DWORD WINAPI pd_mem_live(LPVOID unused)
                     fprintf(stderr, "[MEM] stage request %d%c", sz, 10);
                 } else if (sscanf(line, "watch %x %d", &a, &sz) >= 1 && nw < 8) {
                     if (sz != 1 && sz != 2 && sz != 4) sz = 4;
+                    if (!mem_ok(a, (uint32_t)sz)) { fprintf(stderr, "[MEM] bad addr %08X%c", a, 10); continue; }
                     w[nw].va = a; w[nw].sz = sz; w[nw].last = 0xDEADBEEFu; nw++;
                 }
             }
@@ -1202,7 +1146,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     if (getenv("RECOMP_SAMPLE")) CreateThread(NULL, 0, pd_sampler, NULL, 0, NULL);
     if (getenv("RECOMP_MEM_LIVE")) CreateThread(NULL, 0, pd_mem_live, NULL, 0, NULL);
     if (getenv("RECOMP_KEYBOARD")) CreateThread(NULL, 0, pd_nameentry_thread, NULL, 0, NULL);
-    if (getenv("RECOMP_MOVIE_CLOCKS") || getenv("RECOMP_MOVIE_FCLOCKS")) CreateThread(NULL, 0, pd_movie_pace_thread, NULL, 0, NULL);   /* pd-cab experiment */
 
     /* Step 7: Call the recompiled entry point */
     printf("\nStarting game...\n");

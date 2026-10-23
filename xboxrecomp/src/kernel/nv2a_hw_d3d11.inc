@@ -1139,8 +1139,6 @@ static ID3D11ShaderResourceView *hw_self_shadow(const HwSurface *best)
  * player's machine from their run_user.err alone. */
 static struct { uint32_t used_frame, flips, flips_drawn, uploads, dark_uploads, lines; DWORD t0; } s_hw_mv;
 
-int nv2a_hw_movie_frame(void) { return s_hw_mv.used_frame == s_hw.frame; }   /* this frame drew a movie picture */
-
 static void hw_movie_stats_flip(void)
 {
     DWORD now = GetTickCount();
@@ -3185,10 +3183,17 @@ static void hw_present_locked(int vsync)
         }
         lastp = t0;
     }
-    if (s_hw.tearing)   /* never blocks on the host monitor; hw_flip paces to the console rate */
-        IDXGISwapChain_Present(s_hw.swap, 0, DXGI_PRESENT_ALLOW_TEARING);
-    else
-        IDXGISwapChain_Present(s_hw.swap, vsync && s_hw.vsync ? 1 : 0, 0);
+    {
+        HRESULT ph = s_hw.tearing   /* never blocks on the host monitor; hw_flip paces to the console rate */
+            ? IDXGISwapChain_Present(s_hw.swap, 0, DXGI_PRESENT_ALLOW_TEARING)
+            : IDXGISwapChain_Present(s_hw.swap, vsync && s_hw.vsync ? 1 : 0, 0);
+        if (ph == DXGI_ERROR_DEVICE_REMOVED || ph == DXGI_ERROR_DEVICE_RESET) {
+            HRESULT why = ID3D11Device_GetDeviceRemovedReason(s_hw.dev);
+            fprintf(stderr, "[GPU] Present failed 0x%08lX, device removed reason 0x%08lX%c", (unsigned long)ph, (unsigned long)why, 10);
+            MessageBoxA(NULL, "The graphics driver was reset. Please restart the game.", "Phantom Dust", MB_OK | MB_ICONERROR);
+            ExitProcess(1);
+        }
+    }
     QueryPerformanceCounter(&t1);
     s_hw.present_ticks += (uint64_t)(t1.QuadPart - t0.QuadPart);
 }
@@ -3814,5 +3819,4 @@ void xbox_SetGammaRamp(const uint8_t *rgb768) { (void)rgb768; }
 static int  hw_method(uint32_t method, uint32_t param) { (void)method; (void)param; return 0; }
 void nv2a_hw_idle_present(void) {}
 int  nv2a_hw_readback(uint32_t *dst, uint32_t w, uint32_t h) { (void)dst; (void)w; (void)h; return 0; }
-int  nv2a_hw_movie_frame(void) { return 0; }
 #endif

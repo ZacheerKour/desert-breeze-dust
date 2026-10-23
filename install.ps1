@@ -23,7 +23,7 @@ $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $Root
 # A release zip ships pd-game-v2\build\pd_recomp.exe and a PREBUILT.txt marker: then only the disc is extracted and
 # verified (no Python, no Visual Studio, no code generation, no build).
-$Prebuilt = (Test-Path (Join-Path $Root 'PREBUILT.txt')) -and (Test-Path (Join-Path $Root 'pd-game-v2\build\pd_recomp.exe'))
+$Prebuilt = (Test-Path -LiteralPath (Join-Path $Root 'PREBUILT.txt')) -and (Test-Path -LiteralPath (Join-Path $Root 'pd-game-v2\build\pd_recomp.exe'))
 
 # ---- pinned inputs ----------------------------------------------------------------------------------------------
 $Xdvdfs = @{
@@ -83,7 +83,7 @@ try {
     # Visual Studio 2022 C++ tools + CMake + Ninja
     $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
     $vsRoot = $null
-    if (Test-Path $vswhere) {
+    if (Test-Path -LiteralPath $vswhere) {
         $vsRoot = & $vswhere -latest -products * -version '[17.0,18.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
     }
     if ($Prebuilt) {
@@ -93,7 +93,7 @@ try {
         Write-Host "Visual Studio 2022: $vsRoot"
         $cmake = Join-Path $vsRoot 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
         $ninja = Join-Path $vsRoot 'Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe'
-        if (-not (Test-Path $cmake) -or -not (Test-Path $ninja)) {
+        if (-not (Test-Path -LiteralPath $cmake) -or -not (Test-Path -LiteralPath $ninja)) {
             $missing += "Visual Studio 2022 component 'C++ CMake tools for Windows' (provides CMake and Ninja). Open Visual Studio Installer > Modify > tick it."
         }
         $env:PD_VS_ROOT = $vsRoot
@@ -106,24 +106,24 @@ try {
         $missing | ForEach-Object { Write-Host "  - $_" -ForegroundColor Yellow }
         Fail 'prerequisites missing; install them and re-run install.ps1'
     }
-    $drive = (Get-Item $Root).PSDrive
+    $drive = (Get-Item -LiteralPath $Root).PSDrive
     if ($drive.Free -lt 20GB) { Write-Warning ("Only {0:N1} GB free on {1}: the install needs about 20 GB (disc image copy, extracted game, build)." -f ($drive.Free / 1GB), $drive.Name) }
 
     # ---------------------------------------------------------------------------------------------------------
     Step 'tools (xdvdfs)'
     $xdvdfsExe = Join-Path $Root 'tools\xdvdfs\xdvdfs.exe'
-    if ((Test-Path $xdvdfsExe) -and ((Sha256 $xdvdfsExe) -eq $Xdvdfs.ExeSha)) {
+    if ((Test-Path -LiteralPath $xdvdfsExe) -and ((Sha256 $xdvdfsExe) -eq $Xdvdfs.ExeSha)) {
         Write-Host "xdvdfs $($Xdvdfs.Version) already present and verified."
     } else {
         $dl = Join-Path $Root '_downloads'
         New-Item -ItemType Directory -Force $dl | Out-Null
         $zip = Join-Path $dl 'xdvdfs.zip'
-        if (-not (Test-Path $zip) -or (Sha256 $zip) -ne $Xdvdfs.ZipSha) {
+        if (-not (Test-Path -LiteralPath $zip) -or (Sha256 $zip) -ne $Xdvdfs.ZipSha) {
             Write-Host "Downloading xdvdfs $($Xdvdfs.Version) (MIT) from github.com/antangelo/xdvdfs ..."
             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
             Invoke-WebRequest -Uri $Xdvdfs.Url -OutFile $zip -UseBasicParsing
         }
-        if ((Sha256 $zip) -ne $Xdvdfs.ZipSha) { Remove-Item $zip -Force; Fail 'xdvdfs download failed its SHA-256 check (file deleted)' }
+        if ((Sha256 $zip) -ne $Xdvdfs.ZipSha) { Remove-Item -LiteralPath $zip -Force; Fail 'xdvdfs download failed its SHA-256 check (file deleted)' }
         New-Item -ItemType Directory -Force (Split-Path $xdvdfsExe) | Out-Null
         Expand-Archive -LiteralPath $zip -DestinationPath (Split-Path $xdvdfsExe) -Force
         if ((Sha256 $xdvdfsExe) -ne $Xdvdfs.ExeSha) { Fail 'extracted xdvdfs.exe does not match the pinned SHA-256' }
@@ -134,35 +134,43 @@ try {
     Step 'extract disc'
     $ext = Join-Path $Root 'extracted'
     $xbe = Join-Path $ext 'default.xbe'
-    $haveGood = (Test-Path $xbe) -and $KnownXbe.ContainsKey((Sha256 $xbe))
+    $marker = Join-Path $ext '.extract_ok'   # written only after a complete robocopy / xdvdfs unpack
+    $haveGood = (Test-Path -LiteralPath $xbe) -and $KnownXbe.ContainsKey((Sha256 $xbe)) -and (Test-Path -LiteralPath $marker)
     if ($haveGood) {
-        Write-Host 'extracted\default.xbe already present with a known SHA-256; skipping extraction.'
+        Write-Host 'extracted\default.xbe already present with a known SHA-256 and a completed-extraction marker; skipping extraction.'
     } else {
         if (-not $Source) { Fail 'no disc given. Run:  .\install.ps1 "<path to your Phantom Dust .iso / .7z / extracted folder>"' }
         if (-not (Test-Path -LiteralPath $Source)) { Fail "source not found: $Source" }
-        if ((Test-Path $xbe)) { Fail 'extracted\default.xbe exists but is not a known retail build; move extracted\ away (it is never overwritten) and re-run' }
+        if (Test-Path -LiteralPath $xbe) {
+            # A known retail default.xbe without the marker is an interrupted extraction: re-extract. Anything else is refused.
+            if (-not $KnownXbe.ContainsKey((Sha256 $xbe))) { Fail 'extracted\default.xbe exists but is not a known retail build; move extracted\ away (it is never overwritten) and re-run' }
+            if ((Resolve-Path -LiteralPath $Source).Path.TrimEnd('\') -ieq $ext) { Fail 'the disc source is the extracted\ folder itself; pass the original disc or a copy elsewhere' }
+            # Never delete extracted\: the game keeps its saves (UDATA) and custom soundtracks (TDATA) there.
+            Write-Host 'extracted\ has no completion marker (an interrupted or older extraction); extracting over it. Saves are kept.'
+        }
         $Source = (Resolve-Path -LiteralPath $Source).Path
         $tmp = $null
         $iso = $null
         if (Test-Path -LiteralPath $Source -PathType Container) {
-            if (-not (Test-Path (Join-Path $Source 'default.xbe'))) { Fail "folder has no default.xbe: $Source" }
+            if (-not (Test-Path -LiteralPath (Join-Path $Source 'default.xbe'))) { Fail "folder has no default.xbe: $Source" }
             Write-Host "Copying extracted game folder $Source -> extracted\ ..."
             New-Item -ItemType Directory -Force $ext | Out-Null
             Invoke-Native 'robocopy' { robocopy $Source $ext /E /NFL /NDL /NJH /NJS /NP | Out-Null; if ($LASTEXITCODE -lt 8) { $global:LASTEXITCODE = 0 } }
+            Set-Content -LiteralPath $marker -Value 'complete'
         } else {
             $extn = [IO.Path]::GetExtension($Source).ToLower()
             if ($extn -eq '.7z') {
                 $sz = $null
                 foreach ($c in @((Get-Command 7z -ErrorAction SilentlyContinue).Source, "$env:ProgramFiles\7-Zip\7z.exe", "${env:ProgramFiles(x86)}\7-Zip\7z.exe", (Join-Path $Root 'tools\7zr\7zr.exe'))) {
-                    if ($c -and (Test-Path $c)) { $sz = $c; break }
+                    if ($c -and (Test-Path -LiteralPath $c)) { $sz = $c; break }
                 }
                 if (-not $sz) { Fail 'your disc is a .7z but 7-Zip was not found. Install 7-Zip from https://www.7-zip.org/ and re-run (or extract the .7z yourself and pass the .iso)' }
                 $tmp = Join-Path $Root '_downloads\iso-tmp'
-                if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
+                if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Recurse -Force }
                 New-Item -ItemType Directory -Force $tmp | Out-Null
                 Write-Host "Unpacking $Source with $sz (about 4.3 GB; this takes a few minutes) ..."
                 Invoke-Native '7-Zip' { & $sz x -y "-o$tmp" -- $Source '*.iso' '*.xiso' | Out-Null }
-                $iso = Get-ChildItem -Path $tmp -Recurse -File | Where-Object { $_.Extension -in '.iso', '.xiso' } | Select-Object -First 1
+                $iso = Get-ChildItem -LiteralPath $tmp -Recurse -File | Where-Object { $_.Extension -in '.iso', '.xiso' } | Select-Object -First 1
                 if (-not $iso) { Fail 'no .iso found inside the 7z archive' }
                 $iso = $iso.FullName
             } elseif ($extn -in '.iso', '.xiso') {
@@ -173,13 +181,14 @@ try {
             Write-Host "Extracting $iso with xdvdfs -> extracted\ ..."
             New-Item -ItemType Directory -Force $ext | Out-Null
             Invoke-Native 'xdvdfs unpack' { & $xdvdfsExe unpack $iso $ext }
-            if ($tmp -and (Test-Path $tmp)) { Remove-Item -Recurse -Force $tmp }
+            Set-Content -LiteralPath $marker -Value 'complete'
+            if ($tmp -and (Test-Path -LiteralPath $tmp)) { Remove-Item -LiteralPath $tmp -Recurse -Force }
         }
     }
 
     # ---------------------------------------------------------------------------------------------------------
     Step 'verify default.xbe'
-    if (-not (Test-Path $xbe)) { Fail 'extracted\default.xbe is missing after extraction (is this really a Phantom Dust disc?)' }
+    if (-not (Test-Path -LiteralPath $xbe)) { Fail 'extracted\default.xbe is missing after extraction (is this really a Phantom Dust disc?)' }
     $h = Sha256 $xbe
     if ($KnownXbe.ContainsKey($h)) {
         Write-Host "default.xbe OK: $($KnownXbe[$h])  (sha256 $h)"
@@ -199,7 +208,7 @@ try {
     Step 'python venv'
     $venv = Join-Path $Root '.venv-recomp'
     $vpy = Join-Path $venv 'Scripts\python.exe'
-    if (-not (Test-Path $vpy)) {
+    if (-not (Test-Path -LiteralPath $vpy)) {
         Write-Host 'Creating .venv-recomp ...'
         $pyExe = $py[0]; $pyArgs = @(); if ($py.Count -gt 1) { $pyArgs = $py[1..($py.Count - 1)] }
         Invoke-Native 'venv creation' { & $pyExe @pyArgs -m venv $venv }
@@ -226,22 +235,22 @@ try {
     } else {
         $proj = Join-Path $Root 'pd-game-v2'
         $env:PD_JOBS = [string]$Jobs
-        if (-not (Test-Path (Join-Path $proj 'build\CMakeCache.txt'))) {
+        if (-not (Test-Path -LiteralPath (Join-Path $proj 'build\build.ninja'))) {
             Invoke-Native 'cmake configure' { cmd /c "`"$proj\build_env.bat`" configure" }
         }
         Write-Host "Building with up to $Jobs parallel jobs (the generated code is large: expect 10-30 minutes) ..."
         Invoke-Native 'cmake build' { cmd /c "`"$proj\build_env.bat`" build" }
         $exe = Join-Path $proj 'build\pd_recomp.exe'
-        if (-not (Test-Path $exe)) { Fail 'build finished but pd_recomp.exe was not produced' }
-        Write-Host ("Built {0} ({1:N1} MB)" -f $exe, ((Get-Item $exe).Length / 1MB))
+        if (-not (Test-Path -LiteralPath $exe)) { Fail 'build finished but pd_recomp.exe was not produced' }
+        Write-Host ("Built {0} ({1:N1} MB)" -f $exe, ((Get-Item -LiteralPath $exe).Length / 1MB))
     }
 
     # ---------------------------------------------------------------------------------------------------------
     Step 'finish'
     if (-not $SkipBuild) {
         Write-Host ''
-        Write-Host 'Install complete. Start the game with:  pd-game-v2\run_game.bat' -ForegroundColor Green
-        Write-Host 'Keys: Enter=Start, Z=A, X=B, arrow keys=D-pad (a gamepad also works).'
+        Write-Host 'Install complete. Start the game by double-clicking:  PLAY.bat' -ForegroundColor Green
+        Write-Host 'Keys (laptop layout): WASD move, Space jump, Tab lock on, 1-4 skills, Enter pause. A controller also works.'
     } else {
         Write-Host 'Generation done; build skipped.'
     }

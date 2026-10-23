@@ -51,7 +51,7 @@ def wname(s):
 
 
 def duration_ms(ffmpeg, path):
-    out = subprocess.run([ffmpeg, "-i", path], capture_output=True, text=True).stderr
+    out = subprocess.run([ffmpeg, "-i", path], capture_output=True, text=True, encoding="utf-8", errors="replace").stderr
     for line in out.splitlines():
         if "Duration:" in line:
             h, m, s = line.split("Duration:")[1].split(",")[0].strip().split(":")
@@ -80,20 +80,25 @@ def main():
     files = files[:84]
     tid = a.id & 0xFFFF
     outdir = os.path.join(MUSIC, "%04x" % tid)
-    shutil.rmtree(outdir, ignore_errors=True)
-    os.makedirs(outdir, exist_ok=True)
+    newdir = outdir + ".new"  # built here; swapped in only after every song converts
+    shutil.rmtree(newdir, ignore_errors=True)
+    os.makedirs(newdir, exist_ok=True)
 
     songs = []
     for i, f in enumerate(files):
         sid = (tid << 16) | (i + 1)
-        dst = os.path.join(outdir, "%08x.WMA" % sid)
+        dst = os.path.join(newdir, "%08x.WMA" % sid)
         src = os.path.join(a.folder, f)
         r = subprocess.run([ff, "-y", "-i", src, "-vn", "-c:a", "wmav2", "-ar", "44100", "-ac", "2",
-                            "-b:a", a.bitrate, dst], capture_output=True, text=True)
+                            "-b:a", a.bitrate, dst], capture_output=True, text=True, encoding="utf-8", errors="replace")
         if r.returncode != 0:
+            shutil.rmtree(newdir, ignore_errors=True)
             sys.exit("ffmpeg failed on %s:\n%s" % (f, r.stderr[-600:]))
         songs.append((sid, duration_ms(ff, dst), os.path.splitext(f)[0]))
         print("  %-40s -> %s (%d ms)" % (f, os.path.basename(dst), songs[-1][1]))
+
+    shutil.rmtree(outdir, ignore_errors=True)
+    os.replace(newdir, outdir)
 
     n = len(songs)
     groups = (n + 5) // 6

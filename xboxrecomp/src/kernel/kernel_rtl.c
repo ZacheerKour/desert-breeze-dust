@@ -246,7 +246,7 @@ static BOOL CALLBACK xbox_cs_single_init(PINIT_ONCE o, PVOID p, PVOID *c)
     return TRUE;
 }
 
-static CRITICAL_SECTION* xbox_cs_shadow(PRTL_CRITICAL_SECTION guest)
+CRITICAL_SECTION* xbox_cs_shadow(PRTL_CRITICAL_SECTION guest)
 {
     if (g_cs_single_mode < 0) {
         const char* mode = getenv("RECOMP_CS_MODE");
@@ -449,7 +449,7 @@ static void crt_lock_trace(const char *what, PRTL_CRITICAL_SECTION guest)
 
 extern RECOMP_TLS uint32_t g_xbox_kernel_caller;
 
-static void xbox_cs_note_owner(CRITICAL_SECTION* cs)
+void xbox_cs_note_owner(CRITICAL_SECTION* cs)
 {
     XBOX_CS_SLOT* slot = xbox_cs_slot_of(cs);
     if (!slot)

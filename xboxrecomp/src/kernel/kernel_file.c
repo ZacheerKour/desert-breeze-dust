@@ -139,6 +139,25 @@ static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
     return xbox_translate_path(xbox_path, win_path, buf_size);
 }
 
+const WCHAR *xbox_path_save_dir(void);   /* kernel_path.c */
+const WCHAR *xbox_path_game_dir(void);
+
+#ifndef STATUS_DIRECTORY_NOT_EMPTY
+#define STATUS_DIRECTORY_NOT_EMPTY ((NTSTATUS)0xC0000101L)
+#endif
+
+/* Win32 error from a file operation -> NTSTATUS. */
+static NTSTATUS xbox_win32_to_ntstatus(DWORD err)
+{
+    switch (err) {
+        case ERROR_FILE_NOT_FOUND: return STATUS_OBJECT_NAME_NOT_FOUND;
+        case ERROR_PATH_NOT_FOUND: return STATUS_OBJECT_PATH_NOT_FOUND;
+        case ERROR_ACCESS_DENIED:  return STATUS_ACCESS_DENIED;
+        case ERROR_DIR_NOT_EMPTY:  return STATUS_DIRECTORY_NOT_EMPTY;
+        default:                   return STATUS_UNSUCCESSFUL;
+    }
+}
+
 NTSTATUS __stdcall xbox_NtCreateFile(
     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
@@ -193,6 +212,32 @@ NTSTATUS __stdcall xbox_NtCreateFile(
             flags_and_attrs |= FILE_FLAG_NO_BUFFERING;
         if (FileAttributes & XBOX_FILE_ATTRIBUTE_READONLY)
             flags_and_attrs |= FILE_ATTRIBUTE_READONLY;
+        /* These dispositions truncate the file at open. Keep a copy of a save
+         * first, so a crash before the final write does not lose it. Saves are
+         * UserData/TitleData under the save dir, or UDATA under the game dir (where
+         * \Device\Harddisk0\Partition1\UDATA lands). The copy goes to a parallel
+         * <save>_backup tree, never next to the save, so the game's own
+         * directory scans never see it. */
+        if (CreateDisposition == XBOX_FILE_SUPERSEDE || CreateDisposition == XBOX_FILE_OVERWRITE ||
+            CreateDisposition == XBOX_FILE_OVERWRITE_IF) {
+            const WCHAR *save_dir = xbox_path_save_dir(), *game_dir = xbox_path_game_dir(), *rel = NULL;
+            size_t sl = wcslen(save_dir), gl = wcslen(game_dir);
+            DWORD attrs = GetFileAttributesW(win_path);
+            WCHAR bak[MAX_PATH];
+            if (_wcsnicmp(win_path, save_dir, sl) == 0 &&
+                (_wcsnicmp(win_path + sl, L"\\UserData\\", 10) == 0 || _wcsnicmp(win_path + sl, L"\\TitleData\\", 11) == 0))
+                rel = win_path + sl;   /* U: and T:, not the Z: cache, which is rewritten on every boot */
+            else if (_wcsnicmp(win_path, game_dir, gl) == 0 && _wcsnicmp(win_path + gl, L"\\UDATA\\", 7) == 0)
+                rel = win_path + gl;
+            if (rel && attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY) &&
+                swprintf_s(bak, MAX_PATH, L"%s_backup%s", save_dir, rel) > 0) {
+                WCHAR *p;
+                for (p = bak + sl + 7; (p = wcschr(p, L'\\')) != NULL; p++) {   /* +7: past "_backup"; make each parent dir */
+                    *p = 0; CreateDirectoryW(bak, NULL); *p = L'\\';
+                }
+                CopyFileW(win_path, bak, FALSE);   /* failure ignored: best effort */
+            }
+        }
         h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
             xbox_share_to_win32(ShareAccess), NULL,
             xbox_disposition_to_win32(CreateDisposition), flags_and_attrs, NULL);
@@ -327,8 +372,12 @@ NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
         return STATUS_OBJECT_PATH_NOT_FOUND;
     XBOX_TRACE(XBOX_LOG_FILE, "NtDeleteFile: %S", win_path);
     if (DeleteFileW(win_path))    return STATUS_SUCCESS;
+    /* DeleteFileW's error is the file case, RemoveDirectoryW's the directory
+     * case; ERROR_DIRECTORY from RemoveDirectoryW means it was a file. */
+    DWORD file_err = GetLastError(), dir_err;
     if (RemoveDirectoryW(win_path)) return STATUS_SUCCESS;
-    return STATUS_OBJECT_NAME_NOT_FOUND;
+    dir_err = GetLastError();
+    return xbox_win32_to_ntstatus(dir_err == ERROR_DIRECTORY ? file_err : dir_err);
 }
 
 NTSTATUS __stdcall xbox_NtQueryInformationFile(
@@ -475,9 +524,13 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             PXBOX_FILE_DISPOSITION_INFORMATION info = (PXBOX_FILE_DISPOSITION_INFORMATION)FileInformation;
             FILE_DISPOSITION_INFO fdi;
             fdi.DeleteFile = info->DeleteFile;
-            if (!SetFileInformationByHandle(FileHandle, FileDispositionInfo, &fdi, sizeof(fdi)))
+            if (!SetFileInformationByHandle(FileHandle, FileDispositionInfo, &fdi, sizeof(fdi))) {
+                DWORD err = GetLastError();
                 xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
-                         "SetFileDispositionInfo failed: err=%u", GetLastError());
+                         "SetFileDispositionInfo failed: err=%u", err);
+                IoStatusBlock->Status = xbox_win32_to_ntstatus(err);
+                return IoStatusBlock->Status;
+            }
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
         }

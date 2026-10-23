@@ -620,7 +620,14 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
         int i;
         xbox_set_game_thread(th);
         for (i = 0; i < BRIDGE_THREAD_OBJS; i++)
-            if (!s_thread_objs[i].h) { s_thread_objs[i].h = th; s_thread_objs[i].eth = eth; break; }
+            /* Claim, then fill: no reader has th until this function returns, so
+             * eth is in place before any lookup. A duplicated handle is a
+             * different HANDLE value and never matched here. */
+            if (!s_thread_objs[i].h &&
+                InterlockedCompareExchangePointer((PVOID volatile *)&s_thread_objs[i].h, th, NULL) == NULL) {
+                s_thread_objs[i].eth = eth;
+                break;
+            }
     }
     return th;
 }
@@ -780,6 +787,17 @@ static void bridge_NtClose(void)
 #ifdef _WIN32
             xbox_dir_context_drop(h);
 #endif
+            {
+                /* Free the thread-object slot so 64 spawns don't exhaust it.
+                 * shortcut: the ETHREAD block is not freed (the thread may still
+                 * write it in bridge_thread_finish), so it leaks 0x200 bytes per thread. */
+                int i;
+                for (i = 0; i < BRIDGE_THREAD_OBJS; i++)
+                    if (s_thread_objs[i].h == h) {
+                        InterlockedCompareExchangePointer((PVOID volatile *)&s_thread_objs[i].h, NULL, h);
+                        break;
+                    }
+            }
             CloseHandle(h);
         }
     }
@@ -2855,7 +2873,18 @@ typedef struct {
 } XboxTimer;
 static XboxTimer g_timers[XBOX_MAX_TIMERS];
 static CRITICAL_SECTION g_timer_lock;
-static int g_timer_started;
+static volatile int g_timer_started;
+static INIT_ONCE g_timer_once = INIT_ONCE_STATIC_INIT;
+static DWORD WINAPI kernel_timer_thread(LPVOID unused);
+
+static BOOL CALLBACK kernel_timer_init_once(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    (void)once; (void)param; (void)ctx;
+    InitializeCriticalSection(&g_timer_lock);
+    g_timer_started = 1;
+    CloseHandle(CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL));
+    return TRUE;
+}
 
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 {
@@ -2959,10 +2988,14 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
     int i, free_slot = -1;
     uint32_t was_set = 0;
 
-    if (!g_timer_started) {
-        InitializeCriticalSection(&g_timer_lock);
-        g_timer_started = 1;
-        CloseHandle(CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL));
+    InitOnceExecuteOnce(&g_timer_once, kernel_timer_init_once, NULL, NULL);
+
+    /* A freshly set timer starts unsignaled, like the real KeSetTimer. Before the
+     * entry is published, or a fast fire could be wiped by this reset. */
+    {
+        HANDLE ev = ke_shadow_lookup(timer_va);
+        if (ev)
+            ResetEvent(ev);
     }
 
     EnterCriticalSection(&g_timer_lock);
@@ -2978,12 +3011,6 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
     }
     LeaveCriticalSection(&g_timer_lock);
 
-    /* A freshly set timer starts unsignaled, like the real KeSetTimer. */
-    {
-        HANDLE ev = ke_shadow_lookup(timer_va);
-        if (ev)
-            ResetEvent(ev);
-    }
     g_eax = was_set;
 }
 
@@ -4874,9 +4901,15 @@ static void bridge_KeWaitForMultipleObjects(void)
     }
     if (count > BRIDGE_MAXIMUM_WAIT_OBJECTS)
         count = BRIDGE_MAXIMUM_WAIT_OBJECTS;
-    for (i = 0; i < count; i++)
-        handles[i] = bridge_resolve_handle(
-            objects_va ? BRIDGE_MEM32(objects_va + i * 4) : 0);
+    for (i = 0; i < count; i++) {   /* same lookup order as the single-object wait */
+        uint32_t va = objects_va ? BRIDGE_MEM32(objects_va + i * 4) : 0;
+        HANDLE h = va ? ke_shadow_lookup(va) : NULL;
+        if (!h)
+            h = bridge_resolve_handle(va);
+        if (!h && va)
+            h = XBOX_TO_NATIVE(va);
+        handles[i] = h;
+    }
 
     g_eax = (uint32_t)xbox_KeWaitForMultipleObjects(
         count, (PVOID *)handles, wait_type,
@@ -6343,61 +6376,11 @@ static void bridge_RtlUshortByteSwap(void)
 
 /* ── Rtl Critical sections (ordinals 278, 295, 306) ─────────
  * 277/294 (plain Enter/Leave) are routed via the xbox_Rtl* wrappers already.
- *
- * TryEnter cannot reuse xbox_cs_shadow (it is private to kernel_rtl.c), so it
- * keeps its own keyed host-lock table: guest critical-section address -> host
- * CRITICAL_SECTION, created and probed under a guard.  Only the try path uses
- * it, so entering with Try and leaving with LeaveCriticalSection are both
- * routed at the shadow level and stay consistent on the host side. */
+ */
 
-#define BRIDGE_TRY_CS_SLOTS 512
-
-typedef struct {
-    uint32_t key;             /* guest critical section; 0 means free */
-    int      ready;
-    CRITICAL_SECTION cs;
-} BRIDGE_TRY_CS_SLOT;
-
-static BRIDGE_TRY_CS_SLOT g_try_cs[BRIDGE_TRY_CS_SLOTS];
-static CRITICAL_SECTION g_try_cs_guard;
-static int g_try_cs_guard_ready;
-
-static void bridge_try_cs_init_guard(void)
-{
-    /* First call in practice comes from the title's main thread during setup;
-     * a second InitializeCriticalSection on the same object is benign. */
-    if (!g_try_cs_guard_ready) {
-        InitializeCriticalSection(&g_try_cs_guard);
-        g_try_cs_guard_ready = 1;
-    }
-}
-
-static CRITICAL_SECTION *bridge_try_cs_shadow(uint32_t guest)
-{
-    size_t home, i;
-
-    bridge_try_cs_init_guard();
-    EnterCriticalSection(&g_try_cs_guard);
-    home = (size_t)((guest >> 4) % BRIDGE_TRY_CS_SLOTS);
-    for (i = 0; i < BRIDGE_TRY_CS_SLOTS; i++) {
-        BRIDGE_TRY_CS_SLOT *slot = &g_try_cs[(home + i) % BRIDGE_TRY_CS_SLOTS];
-        if (slot->key == guest) {
-            LeaveCriticalSection(&g_try_cs_guard);
-            return &slot->cs;
-        }
-        if (slot->key == 0) {
-            if (!slot->ready) {
-                InitializeCriticalSection(&slot->cs);
-                slot->ready = 1;
-            }
-            slot->key = guest;
-            LeaveCriticalSection(&g_try_cs_guard);
-            return &slot->cs;
-        }
-    }
-    LeaveCriticalSection(&g_try_cs_guard);
-    return NULL;
-}
+/* Shadow table and owner tracking live in kernel_rtl.c; Try shares them with Enter/Leave. */
+CRITICAL_SECTION *xbox_cs_shadow(PRTL_CRITICAL_SECTION guest);
+void xbox_cs_note_owner(CRITICAL_SECTION *cs);
 
 /* 278: VOID RtlEnterCriticalSectionAndRegion(PRTL_CRITICAL_SECTION) */
 static void bridge_RtlEnterCriticalSectionAndRegion(void)
@@ -6416,9 +6399,10 @@ static void bridge_RtlLeaveCriticalSectionAndRegion(void)
 /* 306: BOOLEAN RtlTryEnterCriticalSection(PRTL_CRITICAL_SECTION) */
 static void bridge_RtlTryEnterCriticalSection(void)
 {
-    CRITICAL_SECTION *cs = bridge_try_cs_shadow(STACK_ARG(0));
+    CRITICAL_SECTION *cs = xbox_cs_shadow((PRTL_CRITICAL_SECTION)XBOX_TO_NATIVE(STACK_ARG(0)));
     if (!cs) { g_eax = 0; return; }
     g_eax = TryEnterCriticalSection(cs) ? 1 : 0;
+    if (g_eax) xbox_cs_note_owner(cs);
 }
 
 /* ── Rtl Misc stubs (ordinals 288, 297, 319, 321) ─────────── */

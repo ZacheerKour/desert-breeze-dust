@@ -2827,15 +2827,15 @@ void xbox_ProtectMirrorsForDebug(void)
 
 void xbox_MemoryLayoutShutdown(void)
 {
-    if (g_kernel_memory) {
-        VirtualFree(g_kernel_memory, 0, MEM_RELEASE);
-        g_kernel_memory = NULL;
-    }
     if (g_nv2a_ack_thread) {
         InterlockedExchange(&g_nv2a_ack_stop, 1);
         WaitForSingleObject(g_nv2a_ack_thread, 1000);
         CloseHandle(g_nv2a_ack_thread);
         g_nv2a_ack_thread = NULL;
+    }
+    if (g_kernel_memory) {
+        VirtualFree(g_kernel_memory, 0, MEM_RELEASE);
+        g_kernel_memory = NULL;
     }
     if (g_nv2a_memory) {
         VirtualFree(g_nv2a_memory, 0, MEM_RELEASE);
@@ -3052,7 +3052,7 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 #define XBOX_THREAD_STACK_SIZE  (512 * 1024)
 #define XBOX_MAX_THREAD_STACKS  8
 
-static int g_thread_stacks_used = 0;
+static volatile LONG g_thread_stacks_used = 0;
 
 /* A TIB and TLS block for a newly spawned guest thread.
  *
@@ -3106,7 +3106,9 @@ uint32_t xbox_AllocThreadStack(void)
 {
     uint32_t base;
 
-    if (g_thread_stacks_used >= XBOX_MAX_THREAD_STACKS) {
+    /* Reserve a slot first so racing spawns can't overshoot the cap. */
+    if (InterlockedIncrement(&g_thread_stacks_used) > XBOX_MAX_THREAD_STACKS) {
+        InterlockedDecrement(&g_thread_stacks_used);
         return 0;
     }
 
@@ -3125,9 +3127,10 @@ uint32_t xbox_AllocThreadStack(void)
      * for small ones.
      */
     base = xbox_HeapAlloc(XBOX_THREAD_STACK_SIZE, 4096);
-    if (!base)
+    if (!base) {
+        InterlockedDecrement(&g_thread_stacks_used);
         return 0;
-    g_thread_stacks_used++;
+    }
 
     /* Top of the slice, 16-byte aligned, growing down. */
     return base + XBOX_THREAD_STACK_SIZE - 16;
@@ -3152,8 +3155,7 @@ void xbox_FreeThreadStack(uint32_t stack_top)
     if (!stack_top)
         return;
     xbox_HeapFree(stack_top + 16 - XBOX_THREAD_STACK_SIZE);
-    if (g_thread_stacks_used > 0)
-        g_thread_stacks_used--;
+    InterlockedDecrement(&g_thread_stacks_used);
 }
 
 /* Bump allocator over the contiguous window mapped at XBOX_CONTIG_BASE.
