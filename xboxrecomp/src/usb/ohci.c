@@ -975,7 +975,7 @@ static int ohci_call_isr(OhciController *hc)
     g_esp -= 4; *(uint32_t *)(mem + g_esp) = kinterrupt;   /* arg 1 */
     g_esp -= 4; *(uint32_t *)(mem + g_esp) = 0xDEADBEEFu;  /* return address */
 
-    { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
+    { int _irql; xbox_IsrLock(kinterrupt); _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); xbox_IsrUnlock(kinterrupt); }
 
     xbox_worker_stack_free(slot);
     return (int)(g_eax & 1u);

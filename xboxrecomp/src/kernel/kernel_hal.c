@@ -419,6 +419,47 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
  *
  * They also run the routine at the level it expects -- DISPATCH_LEVEL for a
  * DPC, the device level for an ISR -- and code checks: see irql_publish. */
+/* The interrupt spinlock: each connected interrupt (keyed by its KINTERRUPT's
+ * guest address) has its own lock, held around its ISR and around
+ * KeSynchronizeExecution on that interrupt, so a driver's synchronize routine
+ * (DSOUND's, against the APU ISR) cannot run while that ISR does. One lock per
+ * interrupt, not one for all: a shared one made the vblank ISR wait behind the
+ * APU ISR and cost 2-6 fps at the title. Recursive, so an ISR that synchronizes
+ * on its own interrupt still works. RECOMP_ISR_LOCK=0 turns it off. */
+#define ISR_LOCKS 8
+static struct { volatile LONG key; CRITICAL_SECTION cs; } g_isr_locks[ISR_LOCKS];
+static INIT_ONCE g_isr_once = INIT_ONCE_STATIC_INIT;
+static int g_isr_lock_on = -1;
+static BOOL CALLBACK isr_cs_init(PINIT_ONCE o, PVOID p, PVOID *c)
+{
+    int i;
+    const char *e = getenv("RECOMP_ISR_LOCK");
+    (void)o; (void)p; (void)c;
+    for (i = 0; i < ISR_LOCKS; i++)
+        InitializeCriticalSection(&g_isr_locks[i].cs);
+    g_isr_lock_on = !(e && *e == '0');
+    return TRUE;
+}
+static CRITICAL_SECTION *isr_lock_for(uint32_t kint)
+{
+    int i;
+    InitOnceExecuteOnce(&g_isr_once, isr_cs_init, NULL, NULL);
+    if (!g_isr_lock_on || !kint)
+        return NULL;
+    for (i = 0; i < ISR_LOCKS; i++) {   /* claim a slot for a new interrupt object */
+        LONG k = g_isr_locks[i].key;
+        if (k == (LONG)kint)
+            return &g_isr_locks[i].cs;
+        if (k == 0 && InterlockedCompareExchange(&g_isr_locks[i].key, (LONG)kint, 0) == 0)
+            return &g_isr_locks[i].cs;
+        if (g_isr_locks[i].key == (LONG)kint)   /* another thread claimed it for the same object */
+            return &g_isr_locks[i].cs;
+    }
+    return NULL;   /* more than ISR_LOCKS interrupts: unlocked, as before */
+}
+void xbox_IsrLock(uint32_t kint)   { CRITICAL_SECTION *cs = isr_lock_for(kint); if (cs) EnterCriticalSection(cs); }
+void xbox_IsrUnlock(uint32_t kint) { CRITICAL_SECTION *cs = isr_lock_for(kint); if (cs) LeaveCriticalSection(cs); }
+
 int xbox_IrqlEnterInterrupt(int level)
 {
     int saved = (int)g_current_irql;

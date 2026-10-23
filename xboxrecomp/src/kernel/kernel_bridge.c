@@ -505,6 +505,8 @@ static uint32_t bridge_thread_obj_for(HANDLE h)
 }
 
 static void spawn_gate_release_self(void);
+static int  guest_cpu_enter_callback(void);
+static void guest_cpu_leave_callback(int saved);
 static void bridge_thread_finish(uint32_t status)
 {
     spawn_gate_release_self();
@@ -688,7 +690,14 @@ static void bridge_PsCreateSystemThreadEx(void)
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-                fn();
+                /* The title's main thread runs inside this kernel call, which let the guest
+                 * CPU go (RECOMP_GUEST_LOCK): take it back for the thread's whole life, or
+                 * the main thread runs unlocked against every worker. As upstream xboxrecomp. */
+                {
+                    int saved = guest_cpu_enter_callback();
+                    fn();
+                    guest_cpu_leave_callback(saved);
+                }
                 g_esp += 12;
                 fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: main thread returned (g_eax=0x%08X)\n", g_eax);
                 fflush(stderr);
@@ -2351,6 +2360,7 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
  */
 static void bridge_KeSynchronizeExecution(void)
 {
+    uint32_t kint    = STACK_ARG(0);   /* PKINTERRUPT: whose ISR lock to hold */
     uint32_t routine = STACK_ARG(1);
     uint32_t context = STACK_ARG(2);
     recomp_func_t fn;
@@ -2369,7 +2379,12 @@ static void bridge_KeSynchronizeExecution(void)
      * the dummy return address and the argument, so g_esp needs no fixup. */
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    fn();
+    {   /* at the ISR's level, holding the ISR lock, as on the console */
+        int _irql;
+        xbox_IsrLock(kint); _irql = xbox_IrqlEnterInterrupt(16);
+        fn();
+        xbox_IrqlLeaveInterrupt(_irql); xbox_IsrUnlock(kint);
+    }
     /* g_eax is whatever the routine returned, which is this call's result. */
 }
 
@@ -2517,7 +2532,7 @@ static int kernel_raise_interrupt(uint32_t vector)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = kint;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
+    { int _irql; xbox_IsrLock(kint); _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); xbox_IsrUnlock(kint); }
     return (int)(g_eax & 1u);
 }
 
@@ -9817,6 +9832,29 @@ static int guest_cpu_enabled(void)
             fprintf(stderr, "  [KERNEL] guest CPU lock on: one guest thread runs at a time\n");
     }
     return g_guest_cpu_on;
+}
+
+/* Guest code a bridge runs from inside a kernel call (the title's main thread):
+ * look like outermost guest code again, so the lock is held while it runs and
+ * its own kernel calls let go and retake it as usual. */
+static int guest_cpu_enter_callback(void)
+{
+    int saved = t_dispatch_depth;
+    t_dispatch_depth = 0;
+    if (t_guest_thread && guest_cpu_enabled() && !t_guest_held) {
+        EnterCriticalSection(&g_guest_cpu);
+        t_guest_held = 1;
+    }
+    return saved;
+}
+
+static void guest_cpu_leave_callback(int saved)
+{
+    if (t_guest_held) {
+        t_guest_held = 0;
+        LeaveCriticalSection(&g_guest_cpu);
+    }
+    t_dispatch_depth = saved;
 }
 
 /* Called once on each host thread that runs a guest thread, before its first

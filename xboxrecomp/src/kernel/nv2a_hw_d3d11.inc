@@ -1450,8 +1450,9 @@ static ID3D11BlendState *hw_blend_state(void)
     bd.RenderTarget[0].SrcBlendAlpha = hw_blend_factor(s_gpu.blend_sfactor, 1);
     bd.RenderTarget[0].DestBlendAlpha = hw_blend_factor(s_gpu.blend_dfactor, 1);
     switch (s_gpu.blend_equation) {
-    case 0x800A: bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_REV_SUBTRACT; break;
-    case 0x800B: bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_SUBTRACT; break;
+    case 0x800A: bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_SUBTRACT; break;       /* src - dst, as the CPU path (nv2a_pb_exec.c) */
+    case 0x800B: bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_REV_SUBTRACT; break;   /* dst - src */
+    case 0xF005: bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_REV_SUBTRACT; break;   /* NV2A REVERSE_SUBTRACT_SIGNED, unsigned approximation */
     case 0x8007: bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_MIN; break;
     case 0x8008: bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_MAX; break;
     default:     bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD; break;
@@ -3184,7 +3185,9 @@ static void hw_present_locked(int vsync)
         lastp = t0;
     }
     {
-        HRESULT ph = s_hw.tearing   /* never blocks on the host monitor; hw_flip paces to the console rate */
+        /* Tearing only when vsync is off (settings.ini vsync=0): with it on, a tearing-capable flip chain
+         * still waits for the monitor refresh, so vsync=1 is honoured on every PC. */
+        HRESULT ph = (s_hw.tearing && !(vsync && s_hw.vsync))
             ? IDXGISwapChain_Present(s_hw.swap, 0, DXGI_PRESENT_ALLOW_TEARING)
             : IDXGISwapChain_Present(s_hw.swap, vsync && s_hw.vsync ? 1 : 0, 0);
         if (ph == DXGI_ERROR_DEVICE_REMOVED || ph == DXGI_ERROR_DEVICE_RESET) {

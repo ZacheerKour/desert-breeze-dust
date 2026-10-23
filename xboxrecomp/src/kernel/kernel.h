@@ -796,6 +796,8 @@ int     xbox_IrqlBlocksInterrupts(void);
 int     xbox_IrqlRaisedCount(void);
 int     xbox_IrqlEnterInterrupt(int level);     /* around host-run ISRs and DPCs */
 void    xbox_IrqlLeaveInterrupt(int saved);
+void    xbox_IsrLock(uint32_t kint);            /* per interrupt: held around its ISR and KeSynchronizeExecution */
+void    xbox_IsrUnlock(uint32_t kint);
 /* pd-ojl: exclusive ISR delivery. TryBegin returns 0 while a guest thread is raised (unless force); guest raises wait
  * while an ISR between TryBegin and End is running. */
 int     xbox_IrqlTryBeginIsr(int force);

@@ -380,6 +380,8 @@ typedef struct MCPXAPUVoiceFilter {
     uint16_t voice;
     float resample_buf[NUM_SAMPLES_PER_FRAME * 2];
     SRC_STATE *resampler;
+    float rs_last[2], rs_next[2], rs_pos;   /* voice_resample's linear-interpolation state */
+    int   rs_have;
     sv_filter svf[2];
     HrtfFilter hrtf;
 } MCPXAPUVoiceFilter;

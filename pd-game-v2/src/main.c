@@ -1011,6 +1011,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     (void)lpCmdLine;
     (void)nCmdShow;
 
+    {   /* DPI aware, so window= sizes are real pixels and full screen is native on a scaled desktop (125%, 150%) */
+        typedef BOOL (WINAPI *SetCtx)(HANDLE);
+        SetCtx f = (SetCtx)(void *)GetProcAddress(GetModuleHandleA("user32.dll"), "SetProcessDpiAwarenessContext");
+        if (!f || !f((HANDLE)(INT_PTR)-4))   /* DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 (Windows 10 1703+) */
+            SetProcessDPIAware();
+    }
     pd_cpu_setup();
     pd_load_settings();
     {   /* restarted by the "Go to Xbox Live" hand-off (kernel_bridge.c): wait for the old process to be gone first */

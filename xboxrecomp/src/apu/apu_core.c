@@ -134,6 +134,7 @@ extern uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
 extern uint32_t xbox_AllocThreadTib(void);
 extern int xbox_IrqlBlocksInterrupts(void);
 extern int xbox_IrqlEnterInterrupt(int level);
+extern void xbox_IsrLock(uint32_t kint), xbox_IsrUnlock(uint32_t kint);
 extern void xbox_IrqlLeaveInterrupt(int saved);
 #if defined(_MSC_VER)
 #  define APU_TLS __declspec(thread)
@@ -187,7 +188,7 @@ static void apu_deliver_irq(MCPXAPUState *d)
     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = context;
     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = kint;
     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = 0xDEADBEEFu;
-    { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
+    { int _irql; xbox_IsrLock(kint); _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); xbox_IsrUnlock(kint); }
     xbox_worker_stack_free(slot);
     qemu_mutex_lock(&d->lock);
 
