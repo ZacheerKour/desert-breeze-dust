@@ -18,6 +18,7 @@
 #include "kernel.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #if !defined(_WIN32)
 #include <fcntl.h>
@@ -158,6 +159,240 @@ static NTSTATUS xbox_win32_to_ntstatus(DWORD err)
     }
 }
 
+/* Save guard.
+ *
+ * A console title rewrites a save in place: open, truncate, write, close. On a
+ * PC a kill or crash between the truncate and the last write leaves a short or
+ * empty save under the right name, which the title then calls damaged. So a
+ * save opened for writing is really <name>.~new (a copy of <name> unless the
+ * open truncates); the last close flushes it, renames it to <name>.~pend (whole
+ * and finished) and then over <name>. A crash leaves the old save intact: the
+ * next start deletes a stray .~new and finishes a .~pend. Readers see the old
+ * save until the rename; the host shares with FILE_SHARE_DELETE, so the rename
+ * succeeds over their open handles.
+ *
+ * Saves are UserData/TitleData under the save dir, or UDATA/TDATA under the
+ * game dir (where \Device\Harddisk0\Partition1\UDATA lands). Before the first
+ * write in a session a copy goes to <save>_backup\<rel>.<session stamp>, the
+ * newest SAVE_BACKUP_KEEP per file kept; never next to the save, so the
+ * title's directory scans do not see it. */
+#define SAVE_GUARD_SLOTS 16
+#define SAVE_BACKUP_KEEP 5
+static struct { HANDLE h; WCHAR path[MAX_PATH]; } s_guard[SAVE_GUARD_SLOTS];
+static SRWLOCK s_guard_lock = SRWLOCK_INIT;
+static volatile LONG s_guard_open_count;
+static INIT_ONCE s_guard_once = INIT_ONCE_STATIC_INIT;
+static WCHAR s_session_stamp[16];   /* YYYYMMDD-HHMMSS */
+
+static BOOL save_guard_temp_name(const WCHAR *name)
+{
+    size_t n = wcslen(name);
+    return (n > 5 && _wcsicmp(name + n - 5, L".~new") == 0) ||
+           (n > 6 && _wcsicmp(name + n - 6, L".~pend") == 0);
+}
+
+/* Finish or drop what a killed run left behind, under one save root. */
+static void save_guard_sweep(WCHAR *dir, size_t len)
+{
+    WIN32_FIND_DATAW fd;
+    HANDLE f;
+    if (_snwprintf_s(dir + len, MAX_PATH - len, _TRUNCATE, L"\\*") < 0) return;
+    f = FindFirstFileW(dir, &fd);
+    if (f == INVALID_HANDLE_VALUE) return;
+    do {
+        size_t n = wcslen(fd.cFileName);
+        if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..") ||
+            _snwprintf_s(dir + len, MAX_PATH - len, _TRUNCATE, L"\\%s", fd.cFileName) < 0)
+            continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            save_guard_sweep(dir, len + 1 + n);
+        } else if (n > 5 && _wcsicmp(fd.cFileName + n - 5, L".~new") == 0) {
+            xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE, "save guard: dropping unfinished %S", dir);
+            DeleteFileW(dir);
+        } else if (n > 6 && _wcsicmp(fd.cFileName + n - 6, L".~pend") == 0) {
+            WCHAR final_path[MAX_PATH];
+            wcscpy_s(final_path, MAX_PATH, dir);
+            final_path[wcslen(final_path) - 6] = 0;
+            xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE, "save guard: finishing %S", final_path);
+            MoveFileExW(dir, final_path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+        }
+    } while (FindNextFileW(f, &fd));
+    FindClose(f);
+    dir[len] = 0;
+}
+
+static BOOL CALLBACK save_guard_init(PINIT_ONCE o, PVOID p, PVOID *c)
+{
+    static const WCHAR *const save_sub[] = { L"\\UserData", L"\\TitleData" };
+    static const WCHAR *const game_sub[] = { L"\\UDATA", L"\\TDATA" };
+    WCHAR dir[MAX_PATH];
+    SYSTEMTIME t;
+    int i, n;
+    (void)o; (void)p; (void)c;
+    GetLocalTime(&t);
+    swprintf_s(s_session_stamp, 16, L"%04u%02u%02u-%02u%02u%02u",
+               t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    for (i = 0; i < 4; i++) {
+        n = _snwprintf_s(dir, MAX_PATH, _TRUNCATE, L"%s%s",
+                         i < 2 ? xbox_path_save_dir() : xbox_path_game_dir(),
+                         i < 2 ? save_sub[i] : game_sub[i - 2]);
+        if (n > 0) save_guard_sweep(dir, (size_t)n);
+    }
+    return TRUE;
+}
+
+/* The part of a save's path below its root ("\UDATA\..."), or NULL if it is not a save.
+ * Not the Z: cache, which is rewritten on every boot. */
+static const WCHAR *save_rel(const WCHAR *win_path)
+{
+    const WCHAR *save_dir = xbox_path_save_dir(), *game_dir = xbox_path_game_dir();
+    size_t sl = wcslen(save_dir), gl = wcslen(game_dir);
+    InitOnceExecuteOnce(&s_guard_once, save_guard_init, NULL, NULL);
+    if (_wcsnicmp(win_path, save_dir, sl) == 0 &&
+        (_wcsnicmp(win_path + sl, L"\\UserData\\", 10) == 0 || _wcsnicmp(win_path + sl, L"\\TitleData\\", 11) == 0))
+        return win_path + sl;
+    if (_wcsnicmp(win_path, game_dir, gl) == 0 &&
+        (_wcsnicmp(win_path + gl, L"\\UDATA\\", 7) == 0 || _wcsnicmp(win_path + gl, L"\\TDATA\\", 7) == 0))
+        return win_path + gl;
+    return NULL;
+}
+
+static int save_backup_cmp(const void *a, const void *b)
+{
+    return wcscmp((const WCHAR *)a, (const WCHAR *)b);
+}
+
+/* One dated copy per file per session; failures are ignored (best effort). */
+static void save_backup(const WCHAR *win_path, const WCHAR *rel)
+{
+    static WCHAR names[64][MAX_PATH];   /* only under s_guard_lock */
+    const WCHAR *save_dir = xbox_path_save_dir();
+    WCHAR bak[MAX_PATH], *p, *base;
+    WIN32_FIND_DATAW fd;
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    HANDLE f;
+    size_t sl = wcslen(save_dir), bl;
+    int n = 0, i;
+    if (!GetFileAttributesExW(win_path, GetFileExInfoStandard, &a) ||
+        (a.nFileSizeLow == 0 && a.nFileSizeHigh == 0))   /* an empty file is nothing to keep */
+        return;
+    if (_snwprintf_s(bak, MAX_PATH, _TRUNCATE, L"%s_backup%s.%s", save_dir, rel, s_session_stamp) < 0)
+        return;
+    for (p = bak + sl + 7; (p = wcschr(p, L'\\')) != NULL; p++) {   /* +7: past "_backup"; make each parent dir */
+        *p = 0; CreateDirectoryW(bak, NULL); *p = L'\\';
+    }
+    if (!CopyFileW(win_path, bak, TRUE))   /* TRUE: this session's copy already exists */
+        return;
+    /* Prune: stamps sort by time, so drop the lowest names past SAVE_BACKUP_KEEP. */
+    bl = wcslen(bak) - 15;   /* the stamp's length */
+    wcscpy_s(bak + bl, MAX_PATH - bl, L"????????-??????");
+    base = wcsrchr(bak, L'\\') + 1;
+    AcquireSRWLockExclusive(&s_guard_lock);
+    f = FindFirstFileW(bak, &fd);
+    if (f != INVALID_HANDLE_VALUE) {
+        do {
+            if (wcslen(fd.cFileName) == wcslen(base) && n < 64)
+                wcscpy_s(names[n++], MAX_PATH, fd.cFileName);
+        } while (FindNextFileW(f, &fd));
+        FindClose(f);
+    }
+    qsort(names, (size_t)n, sizeof(names[0]), save_backup_cmp);
+    for (i = 0; i < n - SAVE_BACKUP_KEEP; i++) {
+        wcscpy_s(base, MAX_PATH - (size_t)(base - bak), names[i]);
+        DeleteFileW(bak);
+    }
+    ReleaseSRWLockExclusive(&s_guard_lock);
+}
+
+/* Open a save for writing through a temp copy. INVALID_HANDLE_VALUE means the
+ * caller opens the real file instead: the disposition fails on it anyway (the
+ * real open reports the miss or the collision), or the guard could not engage. */
+static HANDLE save_guard_open(const WCHAR *win_path, const WCHAR *rel, DWORD access,
+                              DWORD share, ULONG disposition, DWORD flags)
+{
+    WCHAR tmp[MAX_PATH];
+    DWORD attrs = GetFileAttributesW(win_path);
+    BOOL exists = attrs != INVALID_FILE_ATTRIBUTES;
+    BOOL truncate = disposition == XBOX_FILE_SUPERSEDE || disposition == XBOX_FILE_OVERWRITE ||
+                    disposition == XBOX_FILE_OVERWRITE_IF;
+    HANDLE h;
+    int i;
+    if ((exists && (attrs & FILE_ATTRIBUTE_DIRECTORY)) ||
+        (exists ? disposition == XBOX_FILE_CREATE
+                : (disposition == XBOX_FILE_OPEN || disposition == XBOX_FILE_OVERWRITE)) ||
+        _snwprintf_s(tmp, MAX_PATH, _TRUNCATE, L"%s.~new", win_path) < 0)
+        return INVALID_HANDLE_VALUE;
+    AcquireSRWLockShared(&s_guard_lock);
+    for (i = 0; i < SAVE_GUARD_SLOTS && !(s_guard[i].h && _wcsicmp(s_guard[i].path, win_path) == 0); i++) {}
+    ReleaseSRWLockShared(&s_guard_lock);
+    if (i < SAVE_GUARD_SLOTS) {   /* a second writer would share the first one's .~new */
+        xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE, "save guard: %S already open for writing, writing in place", win_path);
+        return INVALID_HANDLE_VALUE;
+    }
+    if (exists)
+        save_backup(win_path, rel);
+    if (exists && !truncate && !CopyFileW(win_path, tmp, FALSE))
+        return INVALID_HANDLE_VALUE;
+    h = CreateFileW(tmp, access, share, NULL, exists && !truncate ? OPEN_EXISTING : CREATE_ALWAYS,
+                    flags, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE, "save guard: %S unavailable (err=%u), writing in place",
+                 tmp, GetLastError());
+        if (exists && !truncate) DeleteFileW(tmp);
+        return INVALID_HANDLE_VALUE;
+    }
+    AcquireSRWLockExclusive(&s_guard_lock);
+    for (i = 0; i < SAVE_GUARD_SLOTS && s_guard[i].h; i++) {}
+    if (i < SAVE_GUARD_SLOTS) {
+        s_guard[i].h = h;
+        wcscpy_s(s_guard[i].path, MAX_PATH, win_path);
+        InterlockedIncrement(&s_guard_open_count);
+    }
+    ReleaseSRWLockExclusive(&s_guard_lock);
+    if (i == SAVE_GUARD_SLOTS) {
+        xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE, "save guard: no free slot, writing %S in place", win_path);
+        CloseHandle(h);
+        DeleteFileW(tmp);
+        return INVALID_HANDLE_VALUE;
+    }
+    return h;
+}
+
+/* FALSE: not a guarded handle, the caller closes it. */
+static BOOL save_guard_close(HANDLE h)
+{
+    WCHAR final_path[MAX_PATH], tmp[MAX_PATH], pend[MAX_PATH];
+    int i;
+    if (!s_guard_open_count) return FALSE;
+    AcquireSRWLockExclusive(&s_guard_lock);
+    for (i = 0; i < SAVE_GUARD_SLOTS && s_guard[i].h != h; i++) {}
+    if (i < SAVE_GUARD_SLOTS) {
+        wcscpy_s(final_path, MAX_PATH, s_guard[i].path);
+        s_guard[i].h = NULL;
+        InterlockedDecrement(&s_guard_open_count);
+    }
+    ReleaseSRWLockExclusive(&s_guard_lock);
+    if (i == SAVE_GUARD_SLOTS) return FALSE;
+
+    FlushFileBuffers(h);
+    CloseHandle(h);
+    swprintf_s(tmp, MAX_PATH, L"%s.~new", final_path);   /* fit when it opened */
+    if (_snwprintf_s(pend, MAX_PATH, _TRUNCATE, L"%s.~pend", final_path) < 0 ||
+        !MoveFileExW(tmp, pend, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        xbox_log(XBOX_LOG_ERROR, XBOX_LOG_FILE, "save guard: %S not committed (err=%u), old save kept",
+                 final_path, GetLastError());
+        return TRUE;
+    }
+    for (i = 0; i < 25; i++) {   /* a scanner or indexer can hold the old file for a moment */
+        if (MoveFileExW(pend, final_path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+            return TRUE;
+        Sleep(20);
+    }
+    xbox_log(XBOX_LOG_ERROR, XBOX_LOG_FILE, "save guard: %S kept as .~pend (err=%u), finished at next start",
+             final_path, GetLastError());
+    return TRUE;
+}
+
 NTSTATUS __stdcall xbox_NtCreateFile(
     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
@@ -212,35 +447,14 @@ NTSTATUS __stdcall xbox_NtCreateFile(
             flags_and_attrs |= FILE_FLAG_NO_BUFFERING;
         if (FileAttributes & XBOX_FILE_ATTRIBUTE_READONLY)
             flags_and_attrs |= FILE_ATTRIBUTE_READONLY;
-        /* These dispositions truncate the file at open. Keep a copy of a save
-         * first, so a crash before the final write does not lose it. Saves are
-         * UserData/TitleData under the save dir, or UDATA under the game dir (where
-         * \Device\Harddisk0\Partition1\UDATA lands). The copy goes to a parallel
-         * <save>_backup tree, never next to the save, so the game's own
-         * directory scans never see it. */
-        if (CreateDisposition == XBOX_FILE_SUPERSEDE || CreateDisposition == XBOX_FILE_OVERWRITE ||
-            CreateDisposition == XBOX_FILE_OVERWRITE_IF) {
-            const WCHAR *save_dir = xbox_path_save_dir(), *game_dir = xbox_path_game_dir(), *rel = NULL;
-            size_t sl = wcslen(save_dir), gl = wcslen(game_dir);
-            DWORD attrs = GetFileAttributesW(win_path);
-            WCHAR bak[MAX_PATH];
-            if (_wcsnicmp(win_path, save_dir, sl) == 0 &&
-                (_wcsnicmp(win_path + sl, L"\\UserData\\", 10) == 0 || _wcsnicmp(win_path + sl, L"\\TitleData\\", 11) == 0))
-                rel = win_path + sl;   /* U: and T:, not the Z: cache, which is rewritten on every boot */
-            else if (_wcsnicmp(win_path, game_dir, gl) == 0 && _wcsnicmp(win_path + gl, L"\\UDATA\\", 7) == 0)
-                rel = win_path + gl;
-            if (rel && attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY) &&
-                swprintf_s(bak, MAX_PATH, L"%s_backup%s", save_dir, rel) > 0) {
-                WCHAR *p;
-                for (p = bak + sl + 7; (p = wcschr(p, L'\\')) != NULL; p++) {   /* +7: past "_backup"; make each parent dir */
-                    *p = 0; CreateDirectoryW(bak, NULL); *p = L'\\';
-                }
-                CopyFileW(win_path, bak, FALSE);   /* failure ignored: best effort */
-            }
-        }
-        h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
-            xbox_share_to_win32(ShareAccess), NULL,
-            xbox_disposition_to_win32(CreateDisposition), flags_and_attrs, NULL);
+        DWORD access = xbox_access_to_win32(DesiredAccess), share = xbox_share_to_win32(ShareAccess);
+        const WCHAR *rel = save_rel(win_path);
+        h = INVALID_HANDLE_VALUE;
+        if (rel && (access & (GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA | FILE_APPEND_DATA)))
+            h = save_guard_open(win_path, rel, access, share, CreateDisposition, flags_and_attrs);
+        if (h == INVALID_HANDLE_VALUE)
+            h = CreateFileW(win_path, access, share, NULL,
+                xbox_disposition_to_win32(CreateDisposition), flags_and_attrs, NULL);
     }
 
     if (h == INVALID_HANDLE_VALUE) {
@@ -359,7 +573,8 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
         xbox_dir_context_drop(Handle);
-        CloseHandle(Handle);
+        if (!save_guard_close(Handle))
+            CloseHandle(Handle);
         return STATUS_SUCCESS;
     }
     return STATUS_INVALID_HANDLE;
@@ -796,9 +1011,10 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         }
     }
 
-    /* FATX enumeration never exposes the host's dot directories. */
+    /* FATX enumeration never exposes the host's dot directories, nor the save guard's temp files. */
     while (!wcscmp(ctx->find_data.cFileName, L".") ||
-           !wcscmp(ctx->find_data.cFileName, L"..")) {
+           !wcscmp(ctx->find_data.cFileName, L"..") ||
+           save_guard_temp_name(ctx->find_data.cFileName)) {
         if (!FindNextFileW(ctx->find_handle, &ctx->find_data)) {
             dir_context_release(ctx);
             IoStatusBlock->Status = STATUS_NO_MORE_FILES;

@@ -11,6 +11,7 @@ extern RECOMP_TLS uint32_t g_eax, g_esp;
 extern ptrdiff_t g_xbox_mem_offset;
 void *recomp_lookup(ULONG a) { (void)a; abort(); }
 void *recomp_lookup_manual(ULONG a) { (void)a; abort(); }
+volatile int g_fn_watch_arm;   /* the game defines it; kernel_path.c references it */
 static uint8_t *mem;
 static guest_fn query, close_guest, map_status;
 static unsigned active_searches(void) {

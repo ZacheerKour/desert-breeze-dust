@@ -793,9 +793,6 @@ static void bridge_NtClose(void)
     if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u) {
         HANDLE h = bridge_take_handle(raw_handle);
         if (h && h != INVALID_HANDLE_VALUE) {
-#ifdef _WIN32
-            xbox_dir_context_drop(h);
-#endif
             {
                 /* Free the thread-object slot so 64 spawns don't exhaust it.
                  * shortcut: the ETHREAD block is not freed (the thread may still
@@ -807,7 +804,7 @@ static void bridge_NtClose(void)
                         break;
                     }
             }
-            CloseHandle(h);
+            xbox_NtClose(h);   /* drops a directory search, commits a guarded save */
         }
     }
     g_eax = 0; /* STATUS_SUCCESS */
