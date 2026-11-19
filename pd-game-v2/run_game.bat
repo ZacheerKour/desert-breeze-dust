@@ -11,7 +11,8 @@ set RECOMP_FB_WINDOW=1
 set RECOMP_TRACE_BUDGET=0
 set RECOMP_APU_DSP_ACK=0x83050810
 set RECOMP_USB=1
-set RECOMP_USB_PADS=1
+rem Pads follow the controllers plugged in (split screen needs a second one).
+rem set RECOMP_USB_PADS=2  :: force a count instead
 set RECOMP_KEYBOARD=1
 set RECOMP_HW=1
 rem glow now works (self-sample shadow copy); RECOMP_HW_NOGLOW=1 skips it

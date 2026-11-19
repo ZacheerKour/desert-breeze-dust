@@ -80,25 +80,25 @@ try {
         }
     }
     if (-not $py -and -not $Prebuilt) { $missing +="Python 3.10 or newer (python.org installer; tick 'Add python.exe to PATH', or install the 'py' launcher)." }
-    # Visual Studio 2022 C++ tools + CMake + Ninja
+    # Visual Studio 2022+ C++ tools + CMake + Ninja
     $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
     $vsRoot = $null
     if (Test-Path -LiteralPath $vswhere) {
-        $vsRoot = & $vswhere -latest -products * -version '[17.0,18.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+        $vsRoot = & $vswhere -latest -products * -version '[17.0,19.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
     }
     if ($Prebuilt) {
         # nothing to build
     } elseif ($vsRoot) {
         $vsRoot = ($vsRoot | Select-Object -First 1)
-        Write-Host "Visual Studio 2022: $vsRoot"
+        Write-Host "Visual Studio: $vsRoot"
         $cmake = Join-Path $vsRoot 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
         $ninja = Join-Path $vsRoot 'Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe'
         if (-not (Test-Path -LiteralPath $cmake) -or -not (Test-Path -LiteralPath $ninja)) {
-            $missing += "Visual Studio 2022 component 'C++ CMake tools for Windows' (provides CMake and Ninja). Open Visual Studio Installer > Modify > tick it."
+            $missing += "Visual Studio component 'C++ CMake tools for Windows' (provides CMake and Ninja). Open Visual Studio Installer > Modify > tick it."
         }
         $env:PD_VS_ROOT = $vsRoot
     } else {
-        $missing += "Visual Studio 2022 or Build Tools 2022 with the 'Desktop development with C++' workload and the 'C++ CMake tools for Windows' component (https://visualstudio.microsoft.com/downloads/ > Tools for Visual Studio > Build Tools)."
+        $missing += "Visual Studio 2022 or newer (or its Build Tools) with the 'Desktop development with C++' workload and the 'C++ CMake tools for Windows' component (https://visualstudio.microsoft.com/downloads/ > Tools for Visual Studio > Build Tools)."
     }
     # a Windows SDK ships with that workload; xdvdfs/7-Zip are checked in the steps that need them
     if ($missing.Count -gt 0) {

@@ -10,7 +10,10 @@ set RECOMP_FB_WINDOW=1
 set RECOMP_TRACE_BUDGET=0
 set RECOMP_APU_DSP_ACK=0x83050810
 set RECOMP_USB=1
-set RECOMP_USB_PADS=1
+rem Controllers on the USB bus follow what is plugged in, so split screen gets a
+rem Player 2 pad and a pad plugged in later is picked up. Uncomment to force a
+rem count instead, e.g. 2 with only one controller connected.
+rem set RECOMP_USB_PADS=2
 set RECOMP_KEYBOARD=1
 rem MMO layout for keyboards without a numpad: WASD move, Q/E R/F camera, Space jump (left stick click), Shift = left trigger, Tab or right mouse = lock on,
 rem 1-4 = A B X Y (skills; 1 or left mouse also confirms), Enter/Esc = Start, Backspace = back, arrows = menus.

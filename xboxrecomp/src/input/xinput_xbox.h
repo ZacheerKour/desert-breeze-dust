@@ -109,6 +109,16 @@ BOOL xbox_InputIsConnected(DWORD dwPort);
  */
 DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps);
 
+/**
+ * How many gamepads the host reports right now (0-4).
+ *
+ * Real pads only: the keyboard that stands in for port 0 is not one, so a
+ * machine with no controller answers 0 and the caller decides what to do
+ * with that. Used to present one emulated controller per pad plugged in, so
+ * a title's second player slot can actually be signed in.
+ */
+int xbox_HostPadCount(void);
+
 #ifdef __cplusplus
 }
 #endif

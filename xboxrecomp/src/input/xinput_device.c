@@ -320,6 +320,25 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
     return ERROR_SUCCESS;
 }
 
+/* How many pads are plugged into the PC.
+ *
+ * An empty XInput slot is the normal case for slots 1-3, and XInputGetState
+ * is the only way to tell an empty slot from a pad at rest. Called from the
+ * USB model, which presents one emulated controller per real one: a second
+ * pad on the bus is what a title's Player 2 slot signs in on. */
+int xbox_HostPadCount(void)
+{
+    int n = 0;
+    DWORD i;
+
+    for (i = 0; i < XBOX_MAX_CONTROLLERS; i++) {
+        XINPUT_STATE state;
+        if (XInputGetState(i, &state) == ERROR_SUCCESS)
+            n++;
+    }
+    return n;
+}
+
 /* ======================================================================== */
 #else /* !_WIN32 */
 /* ====================  SDL2 GameController backend  ===================== */
@@ -446,6 +465,23 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
     pCaps->SubType = 1;   /* XINPUT_DEVSUBTYPE_GAMEPAD */
     pCaps->Flags   = 0;
     return ERROR_SUCCESS;
+}
+
+/* How many pads are attached. Picks up a controller added since the last
+ * call, which is what makes hotplug work for the USB model here too. */
+int xbox_HostPadCount(void)
+{
+    int n = 0, i;
+
+    /* Called during init, before xbox_InputInit has brought SDL up. */
+    if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER))
+        return 0;
+    SDL_GameControllerUpdate();
+    open_controllers();
+    for (i = 0; i < XBOX_MAX_CONTROLLERS; i++)
+        if (g_pads[i] && SDL_GameControllerGetAttached(g_pads[i]))
+            n++;
+    return n;
 }
 
 #endif /* _WIN32 */
