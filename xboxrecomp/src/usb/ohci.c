@@ -11,6 +11,7 @@
 #include "../kernel/xbox_memory_layout.h"
 #include "../kernel/kernel.h"
 #include "usb_gamepad.h"
+#include "../input/xinput_xbox.h"    /* xbox_HostPadCount: pads on the PC */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -168,7 +169,10 @@ static int s_device_hc;
  * MCPX's own hubs have; RECOMP_USB_NDP exists because which slot XAPI gives a
  * pad is decided somewhere in here and the mapping is worth measuring. */
 static unsigned s_ndp = OHCI_PORTS;
-static int s_npads = 1;          /* RECOMP_USB_PADS */
+static volatile int s_npads = 1; /* RECOMP_USB_PADS, else the host's pads */
+/* Set when RECOMP_USB_PADS did not: the count follows the controllers plugged
+ * into the PC, including one that arrives while the title runs. */
+static int s_pads_auto;
 static int s_enabled;
 static int s_trace;
 
@@ -1201,6 +1205,36 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             fflush(stderr);
         }
 
+        /* A controller plugged into the PC after the title started.
+         *
+         * Split screen is where this matters: Player 2's slot cannot sign in
+         * until the title's own XAPI has a second pad on the bus, and a pad
+         * that was never enumerated is one no amount of pressing Start will
+         * reach. XAPI rescans the root hub on a connect change, so the same
+         * arriving-pad path that runs at boot works here; the count only has
+         * to go up and the loop below presents it.
+         *
+         * It never goes down. Taking the device away under a running session
+         * would remove a player's slot mid-battle, while a pad that has gone
+         * already reports every button at rest and does no harm. Polled
+         * slowly because each XInput query is a device enumeration. */
+        if (s_pads_auto) {
+            static unsigned long last_poll;
+            unsigned long nowpoll = (unsigned long)GetTickCount();
+            if (!last_poll || nowpoll - last_poll >= 500ul) {
+                int n = xbox_HostPadCount();
+                last_poll = nowpoll;
+                if (n > (int)s_ndp)
+                    n = (int)s_ndp;
+                if (n > s_npads) {
+                    fprintf(stderr, "  [OHCI0] %d controller(s) on the host; "
+                                    "presenting pad %d%c", n, s_npads + 1, 10);
+                    fflush(stderr);
+                    s_npads = n;
+                }
+            }
+        }
+
         /* More pads, one at a time: each arrives after the previous one is
          * configured, on the next port, so the driver enumerates them in
          * turn and there is only ever one device at the default address.
@@ -1405,9 +1439,26 @@ void xbox_OhciInit(void)
             int n = atoi(ndpspec);
             if (n >= 1 && n <= 4) s_ndp = (unsigned)n;
         }
-        if (padspec) {
+        if (padspec && *padspec) {
             int n = atoi(padspec);
             if (n >= 1 && n <= USB_GAMEPAD_MAX) s_npads = n;
+        } else {
+            /* Not set: one emulated controller per pad plugged into the PC.
+             *
+             * The default used to be a single pad, and that is what broke
+             * split screen: Player 2's entry cannot sign in without a second
+             * controller on the bus, so Player 1 waited at "Please wait..."
+             * for good however many controllers were plugged in. A machine
+             * with none still gets one, because the keyboard answers for
+             * port 0. */
+            int n = xbox_HostPadCount();
+            if (n < 1) n = 1;
+            if (n > (int)s_ndp) n = (int)s_ndp;
+            s_npads = n;
+            s_pads_auto = 1;
+            fprintf(stderr, "  [OHCI0] %d pad(s) from the host%c",
+                    (int)s_npads, 10);
+            fflush(stderr);
         }
         if ((unsigned)s_npads > s_ndp)
             s_ndp = (unsigned)s_npads;      /* a port for every pad */

@@ -90,7 +90,7 @@ To update, unzip a new release over the old folder, or into a new folder and cop
 - With the experimental 60 FPS mode on (`interpolation=1`), cutscenes can go black (the audio carries on) and the camera can shake on fast PCs. It is off by default since 0.1.4. If you see black cutscenes with it off, please report it with `pd-game-v2\run_user.err`.
 - Skipping the opening movie and then also the second movie can leave that second movie black and silent until it ends. Waiting it out or skipping again continues the game.
 - The busiest hub areas run at about 50 FPS instead of 60.
-- Split Screen: Player 1 waits at "Please wait..." until a second controller signs in.
+- Split Screen needs a controller per player. Player 1 sits at "Please wait..." until Player 2 signs in with the second pad, as on the console; a pad plugged in while the game runs is picked up too, and two pads can also be forced with `set RECOMP_USB_PADS=2`.
 - Xbox Live and System Link have no servers. "Go to Xbox Live" restarts the game.
 - One custom soundtrack at a time.
 
